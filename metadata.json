@@ -1,0 +1,8 @@
+{
+  "name": "Savour Foods Voice Kiosk",
+  "description": "A natural-toned voice kiosk interface for Savour Foods with menu and cart views.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
