@@ -1,30 +1,13 @@
 /**
  * geminiTools.ts  — AI tool declarations for the Savour Foods voice agent.
- *
- * The agent interacts exclusively with the /api/v1/agent/* adapter layer.
- * Integer dish/option IDs are NEVER sent to or from the AI.
- *
- * Tool surface exposed to Gemini:
- *   1. add_item        — customer orders something (fuzzy, natural language)
- *   2. remove_item     — customer wants to cancel a line item
- *   3. clear_cart      — customer wants to start over
- *   4. confirm_order   — customer is done, submit to kitchen
  */
 
 import { Type, FunctionDeclaration } from "@google/genai";
 
-// ─────────────────────────────────────────────────────────────
-// Session ID
-// One UUID per browser/kiosk session. Generated once and reused
-// for all tool calls so the server can track the cart.
-// ─────────────────────────────────────────────────────────────
 export function generateSessionId(): string {
   return crypto.randomUUID();
 }
 
-// ─────────────────────────────────────────────────────────────
-// Tool: add_item
-// ─────────────────────────────────────────────────────────────
 export const add_item: FunctionDeclaration = {
   name: "add_item",
   description: `Add a dish to the customer's order.
@@ -51,7 +34,7 @@ export const add_item: FunctionDeclaration = {
       modifiers: {
         type: Type.ARRAY,
         items: { type: Type.STRING },
-        description: "ALL customisations mentioned: piece type, packaging, drink brand, size, add-ons, etc. E.g. ['leg piece', 'boxed', 'cola next'].",
+        description: "ALL customisations mentioned: piece type, packaging, drink brand, size, add-ons, etc.",
       },
       quantity: {
         type: Type.INTEGER,
@@ -59,16 +42,13 @@ export const add_item: FunctionDeclaration = {
       },
       notes: {
         type: Type.STRING,
-        description: "Any special instructions for this item. E.g. 'extra raita', 'no sauce'.",
+        description: "Any special instructions for this item.",
       },
     },
     required: ["session_id", "dish_query"],
   },
 };
 
-// ─────────────────────────────────────────────────────────────
-// Tool: remove_item
-// ─────────────────────────────────────────────────────────────
 export const remove_item: FunctionDeclaration = {
   name: "remove_item",
   description:
@@ -86,9 +66,6 @@ export const remove_item: FunctionDeclaration = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────
-// Tool: clear_cart
-// ─────────────────────────────────────────────────────────────
 export const clear_cart: FunctionDeclaration = {
   name: "clear_cart",
   description: "Remove ALL items from the cart and start the order fresh.",
@@ -101,9 +78,6 @@ export const clear_cart: FunctionDeclaration = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────
-// Tool: confirm_order
-// ─────────────────────────────────────────────────────────────
 export const confirm_order: FunctionDeclaration = {
   name: "confirm_order",
   description: `Finalise and submit the order after the customer explicitly confirms they are done.
@@ -137,15 +111,8 @@ export const confirm_order: FunctionDeclaration = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────
-// All tools exported together
-// ─────────────────────────────────────────────────────────────
 export const allTools = [add_item, remove_item, clear_cart, confirm_order];
 
-
-// ─────────────────────────────────────────────────────────────
-// Helper: fetch menu context (call once at session start)
-// ─────────────────────────────────────────────────────────────
 const MENU_CACHE_KEY = 'savour_menu_context_v1';
 
 export async function fetchMenuContext(): Promise<string> {
@@ -155,7 +122,6 @@ export async function fetchMenuContext(): Promise<string> {
       const res = await fetch("/api/agent/menu-context");
       if (!res.ok) throw new Error(`status ${res.status}`);
       const text = await res.text();
-      // Backend returning an error JSON (e.g. {"detail":"[Errno 11]..."}) instead of menu markdown
       if (text.trimStart().startsWith('{')) throw new Error('backend returned error JSON');
       localStorage.setItem(MENU_CACHE_KEY, text);
       return text;
@@ -166,17 +132,13 @@ export async function fetchMenuContext(): Promise<string> {
   }
   const cached = localStorage.getItem(MENU_CACHE_KEY);
   if (cached) {
-    console.warn('fetchMenuContext: all attempts failed, using cached menu context');
+    console.warn('fetchMenuContext: using cached menu context');
     return cached;
   }
   console.error("fetchMenuContext: all attempts exhausted, no cache");
   return "";
 }
 
-
-// ─────────────────────────────────────────────────────────────
-// System instruction builder (injected with live menu context)
-// ─────────────────────────────────────────────────────────────
 export function buildSystemInstruction(menuContext: string): string {
   return `You are the voice-ordering assistant for a Savour Foods kiosk in Islamabad.
 Your ONLY role is to help customers place their order using the official menu below.
