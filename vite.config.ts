@@ -4,12 +4,12 @@ import path from 'path';
 import {defineConfig, loadEnv} from 'vite';
 
 export default defineConfig(({mode}) => {
-  const env = loadEnv(mode, '.', '');
+  // env is still loaded so other plugins can reference it if needed;
+  // GEMINI_API_KEY is intentionally NOT injected here — it is fetched at
+  // runtime from /api/config so it never ends up in the compiled bundle.
+  loadEnv(mode, '.', '');
   return {
     plugins: [react(), tailwindcss()],
-    define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

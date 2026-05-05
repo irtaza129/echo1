@@ -1,171 +1,192 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
-import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const IS_DEV = process.env.NODE_ENV !== 'production';
+const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
+
+const backendClient = axios.create({ timeout: 15000 });
+
+// ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+const proxyGet = async (backendPath: string, req: Request, res: Response, maxAttempts = 1) => {
+  const url = new URL(BACKEND_URL + backendPath);
+  Object.entries(req.query as Record<string, string>).forEach(([k, v]) =>
+    url.searchParams.set(k, v)
+  );
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt === 1) console.log(`[PROXY] GET ${url.pathname}`);
+    else console.warn(`[PROXY] GET ${url.pathname} retry ${attempt}/${maxAttempts}`);
+    try {
+      const response = await backendClient.get(url.toString());
+      const ct = String(response.headers['content-type'] || '');
+      if (ct.includes('text/plain') || typeof response.data === 'string') {
+        res.type('text/plain').send(response.data);
+      } else {
+        res.status(response.status).json(response.data);
+      }
+      return;
+    } catch (err: unknown) {
+      lastErr = err;
+      const status = axios.isAxiosError(err) ? (err.response?.status ?? 0) : 0;
+      const isTransient = status === 0 || status >= 500;
+      if (!isTransient || attempt === maxAttempts) break;
+      await new Promise(r => setTimeout(r, attempt * 2000));
+    }
+  }
+
+  if (axios.isAxiosError(lastErr)) {
+    console.error(`[PROXY] GET ${backendPath} error:`, lastErr.response?.data ?? lastErr.message);
+    res.status(lastErr.response?.status ?? 500).json(lastErr.response?.data ?? { error: lastErr.message });
+  } else {
+    console.error(`[PROXY] GET ${backendPath} unexpected error:`, lastErr);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+const proxyPost = async (
+  backendPath: string,
+  req: Request,
+  res: Response,
+  successStatus = 200
+) => {
+  if (IS_DEV) console.log(`[PROXY] POST ${backendPath}`, req.body);
+  try {
+    const response = await backendClient.post(BACKEND_URL + backendPath, req.body);
+    if (IS_DEV) console.log(`[PROXY] <- ${response.status} ${backendPath}`);
+    res.status(successStatus).json(response.data);
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(`[PROXY] POST ${backendPath} error:`, err.response?.data ?? err.message);
+      res.status(err.response?.status ?? 500).json(err.response?.data ?? { error: err.message });
+    } else {
+      console.error(`[PROXY] POST ${backendPath} unexpected error:`, err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+};
+
+const proxyPatch = async (backendPath: string, req: Request, res: Response) => {
+  if (IS_DEV) console.log(`[PROXY] PATCH ${backendPath}`, req.body);
+  try {
+    const response = await backendClient.patch(BACKEND_URL + backendPath, req.body);
+    res.status(response.status).json(response.data);
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(`[PROXY] PATCH ${backendPath} error:`, err.response?.data ?? err.message);
+      res.status(err.response?.status ?? 500).json(err.response?.data ?? { error: err.message });
+    } else {
+      console.error(`[PROXY] PATCH ${backendPath} unexpected error:`, err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+};
+
+// ── Server bootstrap ──────────────────────────────────────────────────────────
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  // Trust one reverse-proxy hop (Render / Vercel) so req.ip reflects the real client IP
+  app.set('trust proxy', 1);
+  app.use(express.json({ limit: '100kb' }));
 
-  // Supabase Client Initialization (Lazy/Resilient)
-  const getSupabase = () => {
-    const url = (process.env.SUPABASE_URL || '').trim();
-    const key = (process.env.SUPABASE_KEY || '').trim();
-    
-    if (!url || !key) {
-      console.error('❌ Supabase Env Missing: URL length:', url.length, 'Key length:', key.length);
-      return null;
-    }
-    
-    // Log masked keys for debugging
-    console.log(`📡 Connecting to Supabase: ${url.substring(0, 15)}...`);
-    console.log(`🔑 Using Key starting with: ${key.substring(0, 10)}...`);
-    
-    return createClient(url, key);
-  };
-
-  const supabase = getSupabase();
-
-  // External API Config — AI adapter backend
-  const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
-
-  // Axios instance with timeout so cold Render starts fail fast instead of hanging
-  const backendClient = axios.create({ timeout: 15000 });
-
-  // Ping on server start to wake Render from sleep before the first user request
-  backendClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
-    console.warn('[WARMUP] Render backend is cold-starting — first requests may be slow')
-  );
-
-  // ── Generic agent proxy helper ──────────────────────────────
-  const proxyGet = async (path: string, req: any, res: any) => {
-    try {
-      const url = new URL(BACKEND_URL + path);
-      Object.entries(req.query as Record<string, string>).forEach(([k, v]) => url.searchParams.set(k, v));
-      console.log(`\n[AGENT] → GET  ${url.toString()}`);
-      const response = await backendClient.get(url.toString());
-      const ct = String(response.headers['content-type'] || '');
-      console.log(`[AGENT] ← ${response.status} ${url.pathname}`);
-      if (ct.includes('text/plain') || typeof response.data === 'string') {
-        res.type('text/plain').send(response.data);
-      } else {
-        res.json(response.data);
-      }
-    } catch (err: any) {
-      console.error(`[AGENT] ✗ GET ${path} error:`, err.response?.data || err.message);
-      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
-    }
-  };
-
-  const proxyPost = async (path: string, req: any, res: any, successStatus = 200) => {
-    const fullUrl = BACKEND_URL + path;
-    console.log(`\n[AGENT] → POST ${fullUrl}`);
-    console.log(`[AGENT]   payload:`, JSON.stringify(req.body, null, 2));
-    try {
-      const response = await backendClient.post(fullUrl, req.body);
-      console.log(`[AGENT] ← ${response.status} ${path}`);
-      console.log(`[AGENT]   response:`, JSON.stringify(response.data, null, 2));
-      res.status(successStatus).json(response.data);
-    } catch (err: any) {
-      console.error(`[AGENT] ✗ POST ${path} error:`, err.response?.data || err.message);
-      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
-    }
-  };
-  
-  const proxyPatch = async (path: string, req: any, res: any) => {
-    const fullUrl = BACKEND_URL + path;
-    console.log(`\n[ORDERS] → PATCH ${fullUrl}`);
-    console.log(`[ORDERS]   payload:`, JSON.stringify(req.body, null, 2));
-    try {
-      const response = await backendClient.patch(fullUrl, req.body);
-      console.log(`[ORDERS] ← ${response.status} ${path}`);
-      console.log(`[ORDERS]   response:`, JSON.stringify(response.data, null, 2));
-      res.json(response.data);
-    } catch (err: any) {
-      console.error(`[ORDERS] ✗ PATCH ${path} error:`, err.response?.data || err.message);
-      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
-    }
-  };
-
-  // ── Agent routes (used by Gemini tool call handlers) ─────────
-
-  // Full menu as Markdown — called once at session start and injected into system prompt
-  app.get('/api/agent/menu-context', (req, res) => proxyGet('/api/v1/agent/menu-context', req, res));
-
-  // Resolve a dish + modifiers → validate required options → add to server-side cart
-  app.post('/api/agent/resolve-item', (req, res) => proxyPost('/api/v1/agent/resolve-item', req, res));
-
-  // Remove a cart item by cart_item_id
-  app.post('/api/agent/remove-item', (req, res) => proxyPost('/api/v1/agent/remove-item', req, res));
-
-  // Clear entire session cart
-  app.post('/api/agent/clear-cart', (req, res) => proxyPost('/api/v1/agent/clear-cart', req, res));
-
-  // View current cart (used by the UI to display cart state)
-  app.get('/api/agent/cart/:sessionId', (req, res) => proxyGet(`/api/v1/agent/cart/${req.params.sessionId}`, req, res));
-
-  // Submit finalised order to the database
-  app.post('/api/agent/submit-order', (req, res) => proxyPost('/api/v1/agent/submit-order', req, res, 201));
-
-  // ── Legacy menu read (kept for the menu display grid in the UI) ─
-  app.get('/api/menu', (req, res) => proxyGet('/api/v1/menu', req, res));
-
-  // ── Orders dashboard routes ───────────────────────────────────
-  app.get('/api/orders', (req, res) => proxyGet('/api/v1/orders', req, res));
-  app.patch('/api/orders/:orderId/status', (req, res) => proxyPatch(`/api/v1/orders/${req.params.orderId}/status`, req, res));
-
-  // Health check endpoint
-  app.get('/api/health', (req, res) => {
-    const url = (process.env.SUPABASE_URL || '').trim();
-    const key = (process.env.SUPABASE_KEY || '').trim();
-    
-    // Safety check for quotes (common mistake)
-    const hasQuotes = (key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"));
-    
-    // Deeper inspection: Try to extract project ref from URL and Key
-    const urlMatches = url.match(/https:\/\/(.*?)\.supabase\.co/);
-    const urlProjectRef = urlMatches ? urlMatches[1] : null;
-    
-    let keyProjectRef = null;
-    try {
-      const parts = key.split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        keyProjectRef = payload.ref || payload.project || null;
-      }
-    } catch (e) {
-      // Ignore parsing errors
-    }
-    
-    res.json({ 
-      status: 'ok', 
-      supabaseConfigured: !!url && !!key,
-      url: {
-        prefix: url.substring(0, 15),
-        length: url.length,
-        projectRef: urlProjectRef
-      },
-      key: {
-        prefix: key.substring(0, 10),
-        suffix: key.substring(key.length - 5),
-        length: key.length,
-        hasQuotes: hasQuotes,
-        segmentCount: key.split('.').length,
-        projectRefFromKey: keyProjectRef
-      },
-      mismatch: !!urlProjectRef && !!keyProjectRef && urlProjectRef !== keyProjectRef,
-      nodeEnv: process.env.NODE_ENV || 'development'
-    });
+  // Rate limiting — applied before any route so even 404s are counted
+  const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' },
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Tighter budget for cart mutation routes (Gemini tool calls)
+  const agentLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' },
+  });
+
+  app.use('/api/', generalLimiter);
+  app.use('/api/agent/', agentLimiter);
+
+  // Warm-up pings — wake Render from sleep before the first user request
+  backendClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
+    console.warn('[WARMUP] Render backend cold-starting — first request may be slow')
+  );
+  backendClient.get(`${BACKEND_URL}/api/v1/agent/menu-context`).catch(() =>
+    console.warn('[WARMUP] menu-context cold-starting')
+  );
+
+  // ── Config endpoint ───────────────────────────────────────────────────────
+  // Returns the Gemini API key at runtime so it is never baked into the static bundle.
+  app.get('/api/config', (_req: Request, res: Response) => {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      console.error('[CONFIG] GEMINI_API_KEY is not set');
+      res.status(500).json({ error: 'Server configuration error' });
+      return;
+    }
+    res.json({ geminiApiKey });
+  });
+
+  // ── Agent routes (Gemini tool call handlers) ──────────────────────────────
+  app.get('/api/agent/menu-context', (req: Request, res: Response) =>
+    proxyGet('/api/v1/agent/menu-context', req, res, 4)
+  );
+  app.post('/api/agent/resolve-item', (req: Request, res: Response) =>
+    proxyPost('/api/v1/agent/resolve-item', req, res)
+  );
+  app.post('/api/agent/remove-item', (req: Request, res: Response) =>
+    proxyPost('/api/v1/agent/remove-item', req, res)
+  );
+  app.post('/api/agent/clear-cart', (req: Request, res: Response) =>
+    proxyPost('/api/v1/agent/clear-cart', req, res)
+  );
+  app.get('/api/agent/cart/:sessionId', (req: Request, res: Response) => {
+    if (!UUID_RE.test(req.params.sessionId)) {
+      res.status(400).json({ error: 'Invalid session ID format' });
+      return;
+    }
+    proxyGet(`/api/v1/agent/cart/${req.params.sessionId}`, req, res);
+  });
+  app.post('/api/agent/submit-order', (req: Request, res: Response) =>
+    proxyPost('/api/v1/agent/submit-order', req, res, 201)
+  );
+
+  // ── Create order (direct payload, used by confirm_order tool and manual button) ─
+  app.post('/api/orders', (req: Request, res: Response) =>
+    proxyPost('/api/v1/orders', req, res, 201)
+  );
+
+  // ── Menu + Orders routes ──────────────────────────────────────────────────
+  app.get('/api/menu', (req: Request, res: Response) =>
+    proxyGet('/api/v1/menu', req, res)
+  );
+  app.get('/api/orders', (req: Request, res: Response) =>
+    proxyGet('/api/v1/orders', req, res)
+  );
+  app.patch('/api/orders/:orderId/status', (req: Request, res: Response) => {
+    if (!UUID_RE.test(req.params.orderId)) {
+      res.status(400).json({ error: 'Invalid order ID format' });
+      return;
+    }
+    proxyPatch(`/api/v1/orders/${req.params.orderId}/status`, req, res);
+  });
+
+  // ── Static / SPA ──────────────────────────────────────────────────────────
+  if (IS_DEV) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -174,7 +195,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

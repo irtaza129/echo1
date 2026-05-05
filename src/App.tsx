@@ -13,12 +13,67 @@ import {
   buildSystemInstruction,
 } from './lib/geminiTools';
 
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 type CartItem = {
   cart_item_id: string;
+  dish_id: number;
   summary: string;
   quantity: number;
   unit_price: number;
+  notes?: string;
+  selected_options: { option_id: number; sub_option_id: number }[];
 };
+
+interface MenuItem {
+  id: string;
+  name: string;
+  description?: string;
+  price?: number;
+  base_price?: number;
+  display_price?: number;
+  tag?: string;
+  category: string;
+}
+
+interface MenuCategory {
+  name: string;
+  sub_categories: { dishes: Omit<MenuItem, 'category'>[] }[];
+}
+
+interface ResolveItemResponse {
+  status: 'ok' | 'requires_input';
+  summary?: string;
+  unit_price?: number;
+  cart_item_id?: string;
+  dish_id?: number;
+  selected_options?: { option_id: number; sub_option_id: number }[];
+  ai_instruction?: string;
+}
+
+interface SubmitOrderResponse {
+  id?: number;
+  order_id?: string;
+  order_number?: string | number;
+  summary?: string;
+  total?: number;
+  error?: string;
+}
+
+// Structural interface covering only the session methods this component calls.
+// The full SDK type is not exported — using a structural type avoids `any` here.
+interface GeminiLiveSession {
+  sendRealtimeInput(input: {
+    audio?: { data: string; mimeType: string };
+    audioStreamEnd?: boolean;
+  }): void;
+  sendClientContent(input: {
+    turns: { role: string; parts: { text: string }[] }[];
+    turnComplete: boolean;
+  }): void;
+  sendToolResponse(response: { functionResponses: unknown[] }): void;
+  close(): void;
+}
 
 type AppStatus =
   | 'IDLE'
@@ -30,39 +85,44 @@ type AppStatus =
   | string;
 
 const STATUS_LABEL: Record<string, string> = {
-  IDLE:          'Tap the mic to speak your order',
-  CONNECTING:    'Connecting to AI...',
-  RECORDING:     'Recording — tap to stop',
-  SPEAKING:      'Responding...',
+  IDLE:            'Tap the mic to speak your order',
+  CONNECTING:      'Connecting to AI...',
+  RECORDING:       'Recording — tap to stop',
+  SPEAKING:        'Responding...',
   ORDER_CONFIRMED: 'Order confirmed!',
-  SUBMITTING:    'Submitting order...',
+  SUBMITTING:      'Submitting order...',
 };
 
 function getStatusLabel(status: AppStatus): string {
   return STATUS_LABEL[status] ?? status;
 }
 
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?: () => void }) {
   const [cart, setCart] = useState<CartItem[]>([]);
-  const [menu, setMenu] = useState<any[]>([]);
+  const [menu, setMenu] = useState<MenuItem[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('');
   const [status, setStatus] = useState<AppStatus>('IDLE');
   const [isConnected, setIsConnected] = useState(false);
 
-  const sessionIdRef   = useRef<string>(generateSessionId());
-  const menuContextRef = useRef<string>('');
-  const aiRef          = useRef<GoogleGenAI | null>(null);
-  const sessionRef     = useRef<any>(null);
-  const recorderRef    = useRef<AudioRecorder | null>(null);
-  const playerRef      = useRef<AudioPlayer | null>(null);
+  const sessionIdRef    = useRef<string>(generateSessionId());
+  const menuContextRef  = useRef<string>('');
+  const aiRef           = useRef<GoogleGenAI | null>(null);
+  const sessionRef      = useRef<GeminiLiveSession | null>(null);
+  const recorderRef     = useRef<AudioRecorder | null>(null);
+  const playerRef       = useRef<AudioPlayer | null>(null);
   const isRecordingRef  = useRef(false);
   const isSpeakingRef   = useRef(false);
   const isConnectingRef = useRef(false);
+  const cartRef         = useRef<CartItem[]>([]);
 
   const isRecording = status === 'RECORDING';
 
+  // Keep cartRef in sync so the confirm_order closure always sees current cart
+  useEffect(() => { cartRef.current = cart; }, [cart]);
+
   useEffect(() => {
-    aiRef.current      = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     recorderRef.current = new AudioRecorder();
     playerRef.current   = new AudioPlayer();
 
@@ -71,14 +131,28 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       setStatus('IDLE');
     };
 
+    // Fetch Gemini API key at runtime — never baked into the bundle
+    fetch('/api/config')
+      .then(r => {
+        if (!r.ok) throw new Error(`config ${r.status}`);
+        return r.json() as Promise<{ geminiApiKey: string }>;
+      })
+      .then(({ geminiApiKey }) => {
+        aiRef.current = new GoogleGenAI({ apiKey: geminiApiKey });
+      })
+      .catch(err => {
+        console.error('[INIT] Failed to load config:', err);
+        setStatus('Setup error — refresh page');
+      });
+
     // Pre-load menu context for AI (non-blocking)
     fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
 
-    // Structured menu for UI grid
+    // Structured menu for the UI grid
     fetch('/api/menu')
-      .then(res => res.json())
-      .then((data: any[]) => {
-        const dishes: any[] = [];
+      .then(r => r.json())
+      .then((data: MenuCategory[]) => {
+        const dishes: MenuItem[] = [];
         for (const cat of (Array.isArray(data) ? data : [])) {
           for (const sub of (cat.sub_categories || [])) {
             for (const dish of (sub.dishes || [])) {
@@ -87,13 +161,12 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           }
         }
         setMenu(dishes);
-        // Auto-select first category (handles back-navigation remount correctly)
-        const cats = [...new Set(dishes.map((d: any) => d.category))] as string[];
+        const cats = [...new Set(dishes.map(d => d.category))];
         if (cats.length > 0) {
           setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
         }
       })
-      .catch(err => console.error('Menu fetch error:', err));
+      .catch(err => console.error('[MENU] Fetch error:', err));
 
     return () => {
       recorderRef.current?.destroy();
@@ -103,7 +176,10 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   }, []);
 
   const connectToGemini = useCallback(async () => {
-    if (!aiRef.current) return;
+    if (!aiRef.current) {
+      setStatus('Setup error — refresh page');
+      return;
+    }
     setStatus('CONNECTING');
 
     if (!menuContextRef.current) {
@@ -112,7 +188,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     const sysInstruction = buildSystemInstruction(menuContextRef.current);
 
     await new Promise<void>((resolve, reject) => {
-      let pendingSession: any = null;
+      let pendingSession: GeminiLiveSession | null = null;
       let wsOpen = false;
 
       const tryResolve = () => {
@@ -139,7 +215,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             tryResolve();
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Audio response
+            // Audio response chunks
             if (message.serverContent?.modelTurn) {
               for (const part of (message.serverContent.modelTurn.parts || [])) {
                 if (part.inlineData?.data) {
@@ -155,94 +231,144 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               setStatus('IDLE');
             }
 
-            // Model finished its turn — if no audio queued, unlock the mic
-            if ((message.serverContent as any)?.turnComplete && !isSpeakingRef.current) {
+            // Model finished turn — if no audio queued, unlock the mic
+            if ((message.serverContent as { turnComplete?: boolean } | undefined)?.turnComplete
+                && !isSpeakingRef.current) {
               setStatus('IDLE');
             }
 
-            // Tool calls — all handled in parallel so response returns to Gemini ASAP
+            // Tool calls — dispatch all in parallel, always send a response
             if (message.toolCall && sessionRef.current) {
               const sid = sessionIdRef.current;
 
               const functionResponses = await Promise.all(
                 (message.toolCall.functionCalls || []).map(async (call) => {
-                  const args = call.args as any;
+                  const args = call.args as Record<string, unknown>;
 
                   if (call.name === 'add_item') {
-                    const res = await fetch('/api/agent/resolve-item', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        session_id: sid,
-                        dish_query: args.dish_query,
-                        modifiers: args.modifiers || [],
-                        quantity: args.quantity || 1,
-                        notes: args.notes || null,
-                      }),
-                    }).then(r => r.json());
+                    try {
+                      const res = await fetch('/api/agent/resolve-item', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          session_id: sid,
+                          dish_query: args.dish_query,
+                          modifiers:  args.modifiers  || [],
+                          quantity:   args.quantity   || 1,
+                          notes:      args.notes      || null,
+                        }),
+                      }).then(r => r.json() as Promise<ResolveItemResponse>);
 
-                    if (res.status === 'ok') {
-                      setCart(prev => [...prev, {
-                        cart_item_id: res.cart_item_id,
-                        summary: res.summary,
-                        quantity: args.quantity || 1,
-                        unit_price: res.unit_price,
-                      }]);
-                      return { id: call.id, name: call.name, response: { result: res.summary, cart_item_id: res.cart_item_id } };
+                      if (res.status === 'ok') {
+                        setCart((prev: CartItem[]) => [...prev, {
+                          cart_item_id:     res.cart_item_id!,
+                          dish_id:          res.dish_id ?? 0,
+                          summary:          res.summary!,
+                          quantity:         (args.quantity as number) || 1,
+                          unit_price:       res.unit_price!,
+                          notes:            (args.notes as string) || undefined,
+                          selected_options: res.selected_options ?? [],
+                        }]);
+                        return {
+                          id: call.id, name: call.name,
+                          response: { result: res.summary, cart_item_id: res.cart_item_id },
+                        };
+                      }
+                      return {
+                        id: call.id, name: call.name,
+                        response: { status: res.status, ai_instruction: res.ai_instruction },
+                      };
+                    } catch {
+                      return { id: call.id, name: call.name, response: { error: 'add_item failed' } };
                     }
-                    return { id: call.id, name: call.name, response: { status: res.status, ai_instruction: res.ai_instruction } };
 
                   } else if (call.name === 'remove_item') {
-                    await fetch('/api/agent/remove-item', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
-                    });
-                    setCart(prev => prev.filter(i => i.cart_item_id !== args.cart_item_id));
+                    try {
+                      await fetch('/api/agent/remove-item', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
+                      });
+                      setCart((prev: CartItem[]) => prev.filter((i: CartItem) => i.cart_item_id !== args.cart_item_id));
+                    } catch {
+                      // Cart state stays in sync even if network call fails
+                    }
                     return { id: call.id, name: call.name, response: { result: 'Item removed.' } };
 
                   } else if (call.name === 'clear_cart') {
-                    await fetch('/api/agent/clear-cart', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ session_id: sid }),
-                    });
-                    setCart([]);
+                    try {
+                      await fetch('/api/agent/clear-cart', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sid }),
+                      });
+                      setCart([]);
+                    } catch {
+                      setCart([]);
+                    }
                     return { id: call.id, name: call.name, response: { result: 'Cart cleared.' } };
 
                   } else if (call.name === 'confirm_order') {
-                    const res = await fetch('/api/agent/submit-order', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        session_id: sid,
-                        customer_name: args.customer_name || 'Guest',
-                        customer_phone: args.customer_phone || '0000000000',
-                        order_type: args.order_type || 'dine_in',
-                        notes: args.notes || null,
-                      }),
-                    }).then(r => r.json());
+                    try {
+                      const currentCart = cartRef.current;
+                      if (currentCart.length === 0) {
+                        return { id: call.id, name: call.name, response: { error: 'Cart is empty.' } };
+                      }
+                      const sub  = currentCart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
+                      const gst  = Math.round(sub * 0.15);
+                      const tot  = sub + gst;
 
-                    if (res.order_id) {
-                      setCart([]);
-                      setStatus('ORDER_CONFIRMED');
-                      setTimeout(() => setStatus('IDLE'), 4000);
-                      return { id: call.id, name: call.name, response: { result: res.summary } };
+                      const raw = await fetch('/api/agent/submit-order', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          session_id:     sid,
+                          customer_name:  args.customer_name  || 'Guest',
+                          customer_phone: args.customer_phone || '0000000000',
+                          order_type:     args.order_type     || 'dine_in',
+                          payment_method: 'cash',
+                          delivery_fee:   0,
+                          discount:       0,
+                          instructions:   (args.instructions as string) || null,
+                          notes:          (args.notes as string)        || null,
+                        }),
+                      });
+                      const res = await raw.json() as SubmitOrderResponse;
+                      console.log('[AGENT] submit-order response', raw.status, res);
+
+                      const orderId = res.id ?? res.order_id ?? res.order_number;
+                      if (orderId) {
+                        const lines = currentCart.map(i =>
+                          `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`
+                        ).join(', ');
+                        const confirmMsg =
+                          `Order confirmed! Order number ${orderId}. ${lines}. ` +
+                          `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${tot}. Shukriya!`;
+                        setCart([]);
+                        setStatus('ORDER_CONFIRMED');
+                        setTimeout(() => setStatus('IDLE'), 5000);
+                        return { id: call.id, name: call.name, response: { result: confirmMsg } };
+                      }
+                      const errMsg = res.error || `submit-order returned HTTP ${raw.status} with no order ID`;
+                      console.error('[AGENT] confirm_order failed:', errMsg, res);
+                      return { id: call.id, name: call.name, response: { error: errMsg } };
+                    } catch (err) {
+                      console.error('[AGENT] confirm_order exception:', err);
+                      return { id: call.id, name: call.name, response: { error: 'Order submission failed.' } };
                     }
-                    return { id: call.id, name: call.name, response: { error: 'Order submission failed.' } };
                   }
 
-                  return null;
+                  return { id: call.id, name: call.name, response: { error: 'Unknown tool.' } };
                 })
               );
 
-              const validResponses = functionResponses.filter(Boolean);
-              if (validResponses.length > 0 && sessionRef.current) {
-                sessionRef.current.sendToolResponse({ functionResponses: validResponses });
+              // Always send tool responses — a missing response stalls the Gemini turn
+              if (functionResponses.length > 0 && sessionRef.current) {
+                sessionRef.current.sendToolResponse({ functionResponses });
               }
             }
           },
-          onerror: (e: any) => {
+          onerror: (e: unknown) => {
             setStatus('Connection error — tap to retry');
             reject(e);
           },
@@ -255,8 +381,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             }
           },
         },
-      }).then(session => {
-        pendingSession = session;
+      }).then((session: unknown) => {
+        pendingSession = session as GeminiLiveSession;
         tryResolve();
       }).catch(reject);
     });
@@ -265,14 +391,12 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   const handleToggleRecording = async () => {
     if (isConnectingRef.current) return;
 
-    // Stop speaking if active
     if (isSpeakingRef.current) {
       playerRef.current?.stop();
       isSpeakingRef.current = false;
     }
 
     if (isRecordingRef.current) {
-      // Stop recording — go straight to IDLE so mic is immediately available
       isRecordingRef.current = false;
       recorderRef.current?.stop();
       setStatus('IDLE');
@@ -280,13 +404,12 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         try {
           sessionRef.current.sendRealtimeInput({ audioStreamEnd: true });
         } catch (e) {
-          console.error('audioStreamEnd error', e);
+          console.error('[AUDIO] audioStreamEnd error', e);
         }
       }
       return;
     }
 
-    // Connect if needed
     if (!sessionRef.current) {
       isConnectingRef.current = true;
       const MAX_ATTEMPTS = 3;
@@ -312,7 +435,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       if (!connected) return;
     }
 
-    // Start recording
     isRecordingRef.current = true;
     setStatus('RECORDING');
 
@@ -329,28 +451,46 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     if (cart.length === 0) return;
     setStatus('SUBMITTING');
     try {
-      const res = await fetch('/api/agent/submit-order', {
+      const sub = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
+      const gst = Math.round(sub * 0.15);
+
+      const raw = await fetch('/api/agent/submit-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: sessionIdRef.current,
-          customer_name: 'Guest',
+          session_id:     sessionIdRef.current,
+          customer_name:  'Guest',
           customer_phone: '0000000000',
-          order_type: 'dine_in',
+          order_type:     'dine_in',
+          payment_method: 'cash',
+          delivery_fee:   0,
+          discount:       0,
         }),
-      }).then(r => r.json());
+      });
+      const res = await raw.json() as SubmitOrderResponse;
+      console.log('[AGENT] manual submit-order response', raw.status, res);
 
-      if (res.order_id) {
+      const orderId = res.id ?? res.order_id ?? res.order_number;
+      if (orderId) {
+        const lines = cart.map(i => `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`).join(', ');
+        const confirmMsg =
+          `Order confirmed! Order number ${orderId}. ${lines}. ` +
+          `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${sub + gst}. Shukriya!`;
         setCart([]);
         setStatus('ORDER_CONFIRMED');
-        setTimeout(() => setStatus('IDLE'), 4000);
+        setTimeout(() => setStatus('IDLE'), 5000);
+        sessionRef.current?.sendClientContent({
+          turns: [{ role: 'user', parts: [{ text: `[System] Order was placed manually. Read this confirmation aloud word-for-word: "${confirmMsg}"` }] }],
+          turnComplete: true,
+        });
       } else {
-        setStatus('Submit failed — try again');
+        console.error('[AGENT] manual submit-order: no order ID in response', res);
+        setStatus(res.error || `Submit failed (HTTP ${raw.status}) — try again`);
       }
-    } catch {
+    } catch (err) {
+      console.error('[AGENT] manual submit-order exception:', err);
       setStatus('Submit failed — try again');
     }
-    sessionRef.current?.close();
   };
 
   const clearCart = () => {
@@ -359,9 +499,9 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     sessionRef.current?.close();
   };
 
-  const categories = [...new Set(menu.map((m: any) => m.category))] as string[];
-  const filteredItems = menu.filter(item => item.category === selectedCategory);
-  const subtotal = cart.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
+  const categories = [...new Set(menu.map((m: MenuItem) => m.category))];
+  const filteredItems = menu.filter((item: MenuItem) => item.category === selectedCategory);
+  const subtotal = cart.reduce((sum: number, item: CartItem) => sum + item.unit_price * item.quantity, 0);
   const gst   = Math.round(subtotal * 0.15);
   const total = subtotal + gst;
 
@@ -400,7 +540,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               >
                 <p className="font-semibold text-sm text-[#3D3D33]">{cat}</p>
                 <p className="text-[10px] opacity-45 uppercase tracking-wide mt-0.5">
-                  {menu.filter((m: any) => m.category === cat).length} items
+                  {menu.filter((m: MenuItem) => m.category === cat).length} items
                 </p>
               </div>
             ))
@@ -465,7 +605,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               </div>
             ) : (
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                {filteredItems.map(item => (
+                {filteredItems.map((item: MenuItem) => (
                   <div
                     key={item.id}
                     className="p-4 bg-white/50 rounded-xl border border-white/60 hover:border-[#A39171]/30 hover:bg-white/70 transition-all"
@@ -495,7 +635,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           </div>
         </div>
 
-        {/* Voice Order section — separate panel */}
+        {/* Voice Order section */}
         <div className="glass-panel shrink-0 p-4 lg:p-5">
           <div className="flex items-center gap-5">
 
@@ -519,7 +659,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 `}
               >
                 {isRecording ? (
-                  /* Stop icon */
                   <div className="flex items-end gap-[3px] h-5">
                     <div className="wave-bar" />
                     <div className="wave-bar" />
@@ -528,7 +667,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                     <div className="wave-bar" />
                   </div>
                 ) : (
-                  /* Mic icon */
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#F8F7F2" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                     <rect x="9" y="2" width="6" height="11" rx="3" />
                     <path d="M5 10a7 7 0 0 0 14 0" />

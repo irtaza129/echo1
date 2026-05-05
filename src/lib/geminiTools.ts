@@ -85,7 +85,7 @@ export const confirm_order: FunctionDeclaration = {
   Always read back the full order summary and total BEFORE calling this.
   Only call this once the customer says something like "haan", "yes", "confirm", "theek hai".
 
-  The server will write the order to the database and return a confirmation message to read back.`,
+  After the tool returns, read the result message back to the customer word-for-word — it contains their order summary and total.`,
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -102,9 +102,13 @@ export const confirm_order: FunctionDeclaration = {
         type: Type.STRING,
         description: "One of: dine_in, pickup, delivery. Default: dine_in.",
       },
+      instructions: {
+        type: Type.STRING,
+        description: "Special cooking or dietary instructions for the entire order (e.g. 'extra spicy', 'no onions', 'allergy to nuts').",
+      },
       notes: {
         type: Type.STRING,
-        description: "Any overall order notes, e.g. table number.",
+        description: "Any other order notes, e.g. table number.",
       },
     },
     required: ["session_id"],
@@ -113,7 +117,36 @@ export const confirm_order: FunctionDeclaration = {
 
 export const allTools = [add_item, remove_item, clear_cart, confirm_order];
 
+// ── Menu context cache ────────────────────────────────────────────────────────
+
 const MENU_CACHE_KEY = 'savour_menu_context_v1';
+const MENU_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+interface MenuCacheEntry {
+  text: string;
+  cached_at: number;
+}
+
+function readCache(): string | null {
+  try {
+    const raw = localStorage.getItem(MENU_CACHE_KEY);
+    if (!raw) return null;
+    const entry: MenuCacheEntry = JSON.parse(raw);
+    if (Date.now() - entry.cached_at > MENU_CACHE_TTL_MS) return null;
+    return entry.text;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(text: string): void {
+  try {
+    const entry: MenuCacheEntry = { text, cached_at: Date.now() };
+    localStorage.setItem(MENU_CACHE_KEY, JSON.stringify(entry));
+  } catch {
+    // localStorage may be unavailable (private mode, storage quota exceeded)
+  }
+}
 
 export async function fetchMenuContext(): Promise<string> {
   const MAX_ATTEMPTS = 4;
@@ -123,19 +156,19 @@ export async function fetchMenuContext(): Promise<string> {
       if (!res.ok) throw new Error(`status ${res.status}`);
       const text = await res.text();
       if (text.trimStart().startsWith('{')) throw new Error('backend returned error JSON');
-      localStorage.setItem(MENU_CACHE_KEY, text);
+      writeCache(text);
       return text;
     } catch (err) {
-      console.warn(`fetchMenuContext attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
+      console.warn(`[MENU] fetchMenuContext attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
       if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
     }
   }
-  const cached = localStorage.getItem(MENU_CACHE_KEY);
+  const cached = readCache();
   if (cached) {
-    console.warn('fetchMenuContext: using cached menu context');
+    console.warn('[MENU] fetchMenuContext: using cached menu context (all attempts failed)');
     return cached;
   }
-  console.error("fetchMenuContext: all attempts exhausted, no cache");
+  console.error('[MENU] fetchMenuContext: all attempts exhausted, no cache available');
   return "";
 }
 
