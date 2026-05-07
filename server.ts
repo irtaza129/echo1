@@ -134,6 +134,13 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  if (!process.env.SESSION_SECRET) {
+    console.warn(
+      '[AUTH] SESSION_SECRET is not set — sessions will be lost on every server restart.\n' +
+      '       Set SESSION_SECRET in .env (local) and in Vercel environment variables (production).'
+    );
+  }
+
   // Trust one reverse-proxy hop (Render / Vercel) so req.ip reflects the real client IP
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '100kb' }));
