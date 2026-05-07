@@ -4,12 +4,50 @@ import path from 'path';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
 
 dotenv.config();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const IS_DEV = process.env.NODE_ENV !== 'production';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+// SHA-256 of the password so the plaintext never lives in the process.
+// Override with AUTH_PASSWORD_HASH in .env to rotate without touching code.
+const AUTH_USERNAME      = 'agent1101';
+const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH
+  ?? 'a3046da0d15a27e89f2afe639b25748a7ad4d9290af3e7b1b6c1a5533c8f0a8c';
+// Random per boot by default; set SESSION_SECRET in .env to survive restarts.
+const SESSION_SECRET = process.env.SESSION_SECRET
+  ?? crypto.randomBytes(32).toString('hex');
+const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+function issueToken(username: string): string {
+  const payload = JSON.stringify({ sub: username, exp: Date.now() + TOKEN_TTL_MS });
+  const b64 = Buffer.from(payload).toString('base64');
+  const sig  = crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('hex');
+  return `${b64}.${sig}`;
+}
+
+function verifyToken(token: string): boolean {
+  try {
+    const dot = token.lastIndexOf('.');
+    if (dot < 0) return false;
+    const b64 = token.slice(0, dot);
+    const sig  = token.slice(dot + 1);
+    const expected = crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('hex');
+    // Timing-safe comparison — both must be the same byte length
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.byteLength !== expBuf.byteLength) return false;
+    if (!crypto.timingSafeEqual(sigBuf, expBuf)) return false;
+    const { exp } = JSON.parse(Buffer.from(b64, 'base64').toString()) as { exp: number };
+    return exp > Date.now();
+  } catch {
+    return false;
+  }
+}
 
 const backendClient = axios.create({ timeout: 15000 });
 
@@ -118,8 +156,18 @@ async function startServer() {
     message: { error: 'Too many requests, please try again later.' },
   });
 
+  // Strict limit on auth endpoints to prevent brute force
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many login attempts, please try again later.' },
+  });
+
   app.use('/api/', generalLimiter);
   app.use('/api/agent/', agentLimiter);
+  app.use('/api/auth/', authLimiter);
 
   // Warm-up pings — wake Render from sleep before the first user request
   backendClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
@@ -139,6 +187,30 @@ async function startServer() {
       return;
     }
     res.json({ geminiApiKey });
+  });
+
+  // ── Auth endpoints ────────────────────────────────────────────────────────
+  app.post('/api/auth/login', (req: Request, res: Response) => {
+    const { username, password } = req.body as { username?: string; password?: string };
+    if (typeof username !== 'string' || typeof password !== 'string') {
+      res.status(400).json({ error: 'Invalid request' });
+      return;
+    }
+    const hash = crypto.createHash('sha256').update(password).digest('hex');
+    if (username !== AUTH_USERNAME || hash !== AUTH_PASSWORD_HASH) {
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+    res.json({ token: issueToken(username) });
+  });
+
+  app.post('/api/auth/verify', (req: Request, res: Response) => {
+    const { token } = req.body as { token?: string };
+    if (typeof token !== 'string' || !verifyToken(token)) {
+      res.status(401).json({ error: 'Invalid or expired token' });
+      return;
+    }
+    res.json({ ok: true });
   });
 
   // ── Agent routes (Gemini tool call handlers) ──────────────────────────────

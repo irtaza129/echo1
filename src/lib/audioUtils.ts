@@ -108,7 +108,12 @@ export class AudioRecorder {
 
     this.onData = onData;
     this.stream?.getTracks().forEach(t => t.stop());
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      this.onData = null;
+      throw err;
+    }
     
     // Only set up nodes if we haven't already
     if (!this.processor) {

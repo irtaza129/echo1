@@ -70,7 +70,7 @@ function OrderCard({
   onAdvance,
 }: {
   order: Order;
-  onAdvance: (id: string, currentStatus: string, targetStatus: string) => Promise<void>;
+  onAdvance: (id: string, currentStatus: string) => Promise<void>;
 }) {
   const [loading, setLoading] = useState(false);
   const target = TARGET_STATUS[order.status];
@@ -78,7 +78,7 @@ function OrderCard({
 
   const handleAdvance = async () => {
     setLoading(true);
-    await onAdvance(order.id, order.status, target);
+    await onAdvance(order.id, order.status);
     setLoading(false);
   };
 
@@ -222,9 +222,11 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
     return () => clearInterval(interval);
   }, [fetchOrders]);
 
-  const advanceStatus = async (orderId: string, currentStatus: string, targetStatus: string) => {
-    const key   = `${currentStatus}→${targetStatus}`;
-    const steps = TRANSITION_STEPS[key] ?? [targetStatus];
+  const advanceStatus = async (orderId: string, currentStatus: string) => {
+    const target = TARGET_STATUS[currentStatus];
+    if (!target) return;
+    const key   = `${currentStatus}→${target}`;
+    const steps = TRANSITION_STEPS[key] ?? [target];
     try {
       for (const step of steps) {
         const r = await fetch(`/api/orders/${orderId}/status`, {

@@ -148,25 +148,36 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     // Pre-load menu context for AI (non-blocking)
     fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
 
-    // Structured menu for the UI grid
-    fetch('/api/menu')
-      .then(r => r.json())
-      .then((data: MenuCategory[]) => {
-        const dishes: MenuItem[] = [];
-        for (const cat of (Array.isArray(data) ? data : [])) {
-          for (const sub of (cat.sub_categories || [])) {
-            for (const dish of (sub.dishes || [])) {
-              dishes.push({ ...dish, category: cat.name });
+    // Structured menu for the UI grid — 3 attempts with backoff
+    const fetchMenuData = async () => {
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const r = await fetch('/api/menu');
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const data = await r.json() as MenuCategory[];
+          const dishes: MenuItem[] = [];
+          for (const cat of (Array.isArray(data) ? data : [])) {
+            for (const sub of (cat.sub_categories || [])) {
+              for (const dish of (sub.dishes || [])) {
+                dishes.push({ ...dish, category: cat.name });
+              }
             }
           }
+          setMenu(dishes);
+          const cats = [...new Set(dishes.map(d => d.category))];
+          if (cats.length > 0) {
+            setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
+          }
+          return;
+        } catch (err) {
+          console.warn(`[MENU] fetch attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
+          if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
         }
-        setMenu(dishes);
-        const cats = [...new Set(dishes.map(d => d.category))];
-        if (cats.length > 0) {
-          setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
-        }
-      })
-      .catch(err => console.error('[MENU] Fetch error:', err));
+      }
+      console.error('[MENU] Failed to load menu after all attempts');
+    };
+    fetchMenuData();
 
     return () => {
       recorderRef.current?.destroy();
@@ -240,127 +251,135 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             // Tool calls — dispatch all in parallel, always send a response
             if (message.toolCall && sessionRef.current) {
               const sid = sessionIdRef.current;
+              const calls = message.toolCall.functionCalls || [];
 
-              const functionResponses = await Promise.all(
-                (message.toolCall.functionCalls || []).map(async (call) => {
-                  const args = call.args as Record<string, unknown>;
+              let functionResponses: unknown[];
+              try {
+                functionResponses = await Promise.all(
+                  calls.map(async (call) => {
+                    const args = call.args as Record<string, unknown>;
 
-                  if (call.name === 'add_item') {
-                    try {
-                      const res = await fetch('/api/agent/resolve-item', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          session_id: sid,
-                          dish_query: args.dish_query,
-                          modifiers:  args.modifiers  || [],
-                          quantity:   args.quantity   || 1,
-                          notes:      args.notes      || null,
-                        }),
-                      }).then(r => r.json() as Promise<ResolveItemResponse>);
+                    if (call.name === 'add_item') {
+                      try {
+                        const res = await fetch('/api/agent/resolve-item', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            session_id: sid,
+                            dish_query: args.dish_query,
+                            modifiers:  args.modifiers  || [],
+                            quantity:   args.quantity   || 1,
+                            notes:      args.notes      || null,
+                          }),
+                        }).then(r => r.json() as Promise<ResolveItemResponse>);
 
-                      if (res.status === 'ok') {
-                        setCart((prev: CartItem[]) => [...prev, {
-                          cart_item_id:     res.cart_item_id!,
-                          dish_id:          res.dish_id ?? 0,
-                          summary:          res.summary!,
-                          quantity:         (args.quantity as number) || 1,
-                          unit_price:       res.unit_price!,
-                          notes:            (args.notes as string) || undefined,
-                          selected_options: res.selected_options ?? [],
-                        }]);
+                        if (res.status === 'ok') {
+                          setCart((prev: CartItem[]) => [...prev, {
+                            cart_item_id:     res.cart_item_id!,
+                            dish_id:          res.dish_id ?? 0,
+                            summary:          res.summary!,
+                            quantity:         (args.quantity as number) || 1,
+                            unit_price:       res.unit_price!,
+                            notes:            (args.notes as string) || undefined,
+                            selected_options: res.selected_options ?? [],
+                          }]);
+                          return {
+                            id: call.id, name: call.name,
+                            response: { result: res.summary, cart_item_id: res.cart_item_id },
+                          };
+                        }
                         return {
                           id: call.id, name: call.name,
-                          response: { result: res.summary, cart_item_id: res.cart_item_id },
+                          response: { status: res.status, ai_instruction: res.ai_instruction },
                         };
+                      } catch {
+                        return { id: call.id, name: call.name, response: { error: 'add_item failed' } };
                       }
-                      return {
-                        id: call.id, name: call.name,
-                        response: { status: res.status, ai_instruction: res.ai_instruction },
-                      };
-                    } catch {
-                      return { id: call.id, name: call.name, response: { error: 'add_item failed' } };
-                    }
 
-                  } else if (call.name === 'remove_item') {
-                    try {
-                      await fetch('/api/agent/remove-item', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
-                      });
-                      setCart((prev: CartItem[]) => prev.filter((i: CartItem) => i.cart_item_id !== args.cart_item_id));
-                    } catch {
-                      // Cart state stays in sync even if network call fails
-                    }
-                    return { id: call.id, name: call.name, response: { result: 'Item removed.' } };
-
-                  } else if (call.name === 'clear_cart') {
-                    try {
-                      await fetch('/api/agent/clear-cart', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ session_id: sid }),
-                      });
-                      setCart([]);
-                    } catch {
-                      setCart([]);
-                    }
-                    return { id: call.id, name: call.name, response: { result: 'Cart cleared.' } };
-
-                  } else if (call.name === 'confirm_order') {
-                    try {
-                      const currentCart = cartRef.current;
-                      if (currentCart.length === 0) {
-                        return { id: call.id, name: call.name, response: { error: 'Cart is empty.' } };
+                    } else if (call.name === 'remove_item') {
+                      try {
+                        await fetch('/api/agent/remove-item', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
+                        });
+                        setCart((prev: CartItem[]) => prev.filter((i: CartItem) => i.cart_item_id !== args.cart_item_id));
+                      } catch {
+                        // Cart state stays in sync even if network call fails
                       }
-                      const sub  = currentCart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
-                      const gst  = Math.round(sub * 0.15);
-                      const tot  = sub + gst;
+                      return { id: call.id, name: call.name, response: { result: 'Item removed.' } };
 
-                      const raw = await fetch('/api/agent/submit-order', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          session_id:     sid,
-                          customer_name:  args.customer_name  || 'Guest',
-                          customer_phone: args.customer_phone || '0000000000',
-                          order_type:     args.order_type     || 'dine_in',
-                          payment_method: 'cash',
-                          delivery_fee:   0,
-                          discount:       0,
-                          instructions:   (args.instructions as string) || null,
-                          notes:          (args.notes as string)        || null,
-                        }),
-                      });
-                      const res = await raw.json() as SubmitOrderResponse;
-                      console.log('[AGENT] submit-order response', raw.status, res);
-
-                      const orderId = res.id ?? res.order_id ?? res.order_number;
-                      if (orderId) {
-                        const lines = currentCart.map(i =>
-                          `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`
-                        ).join(', ');
-                        const confirmMsg =
-                          `Order confirmed! Order number ${orderId}. ${lines}. ` +
-                          `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${tot}. Shukriya!`;
+                    } else if (call.name === 'clear_cart') {
+                      try {
+                        await fetch('/api/agent/clear-cart', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ session_id: sid }),
+                        });
                         setCart([]);
-                        setStatus('ORDER_CONFIRMED');
-                        setTimeout(() => setStatus('IDLE'), 5000);
-                        return { id: call.id, name: call.name, response: { result: confirmMsg } };
+                      } catch {
+                        setCart([]);
                       }
-                      const errMsg = res.error || `submit-order returned HTTP ${raw.status} with no order ID`;
-                      console.error('[AGENT] confirm_order failed:', errMsg, res);
-                      return { id: call.id, name: call.name, response: { error: errMsg } };
-                    } catch (err) {
-                      console.error('[AGENT] confirm_order exception:', err);
-                      return { id: call.id, name: call.name, response: { error: 'Order submission failed.' } };
-                    }
-                  }
+                      return { id: call.id, name: call.name, response: { result: 'Cart cleared.' } };
 
-                  return { id: call.id, name: call.name, response: { error: 'Unknown tool.' } };
-                })
-              );
+                    } else if (call.name === 'confirm_order') {
+                      try {
+                        const currentCart = cartRef.current;
+                        if (currentCart.length === 0) {
+                          return { id: call.id, name: call.name, response: { error: 'Cart is empty.' } };
+                        }
+                        const sub  = currentCart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
+                        const gst  = Math.round(sub * 0.15);
+                        const tot  = sub + gst;
+
+                        const raw = await fetch('/api/agent/submit-order', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            session_id:     sid,
+                            customer_name:  args.customer_name  || 'Guest',
+                            customer_phone: args.customer_phone || '0000000000',
+                            order_type:     args.order_type     || 'dine_in',
+                            payment_method: 'cash',
+                            delivery_fee:   0,
+                            discount:       0,
+                            instructions:   (args.instructions as string) || null,
+                            notes:          (args.notes as string)        || null,
+                          }),
+                        });
+                        const res = await raw.json() as SubmitOrderResponse;
+                        const orderId = res.id ?? res.order_id ?? res.order_number;
+                        if (orderId) {
+                          const lines = currentCart.map(i =>
+                            `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`
+                          ).join(', ');
+                          const confirmMsg =
+                            `Order confirmed! Order number ${orderId}. ${lines}. ` +
+                            `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${tot}. Shukriya!`;
+                          setCart([]);
+                          setStatus('ORDER_CONFIRMED');
+                          setTimeout(() => setStatus('IDLE'), 5000);
+                          return { id: call.id, name: call.name, response: { result: confirmMsg } };
+                        }
+                        const errMsg = res.error || `submit-order returned HTTP ${raw.status} with no order ID`;
+                        console.error('[AGENT] confirm_order failed:', errMsg, res);
+                        return { id: call.id, name: call.name, response: { error: errMsg } };
+                      } catch (err) {
+                        console.error('[AGENT] confirm_order exception:', err);
+                        return { id: call.id, name: call.name, response: { error: 'Order submission failed.' } };
+                      }
+                    }
+
+                    return { id: call.id, name: call.name, response: { error: 'Unknown tool.' } };
+                  })
+                );
+              } catch {
+                // Safety net: each handler has its own try/catch, but if Promise.all itself
+                // rejects, send error responses to unblock the Gemini turn
+                functionResponses = calls.map(call => ({
+                  id: call.id, name: call.name, response: { error: 'dispatch failed' },
+                }));
+              }
 
               // Always send tool responses — a missing response stalls the Gemini turn
               if (functionResponses.length > 0 && sessionRef.current) {
@@ -438,13 +457,19 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     isRecordingRef.current = true;
     setStatus('RECORDING');
 
-    await recorderRef.current?.start((base64: string) => {
-      if (isRecordingRef.current && sessionRef.current) {
-        sessionRef.current.sendRealtimeInput({
-          audio: { data: base64, mimeType: 'audio/pcm;rate=16000' },
-        });
-      }
-    });
+    try {
+      await recorderRef.current?.start((base64: string) => {
+        if (isRecordingRef.current && sessionRef.current) {
+          sessionRef.current.sendRealtimeInput({
+            audio: { data: base64, mimeType: 'audio/pcm;rate=16000' },
+          });
+        }
+      });
+    } catch (err) {
+      console.error('[AUDIO] Microphone access denied or unavailable:', err);
+      isRecordingRef.current = false;
+      setStatus('Microphone denied — check browser permissions');
+    }
   };
 
   const submitOrder = async () => {
@@ -468,8 +493,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         }),
       });
       const res = await raw.json() as SubmitOrderResponse;
-      console.log('[AGENT] manual submit-order response', raw.status, res);
-
       const orderId = res.id ?? res.order_id ?? res.order_number;
       if (orderId) {
         const lines = cart.map(i => `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`).join(', ');
