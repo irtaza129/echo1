@@ -105,6 +105,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   const [selectedCategory, setSelectedCategory] = useState('');
   const [status, setStatus] = useState<AppStatus>('IDLE');
   const [isConnected, setIsConnected] = useState(false);
+  const [showMobileCart, setShowMobileCart] = useState(false);
 
   const sessionIdRef    = useRef<string>(generateSessionId());
   const menuContextRef  = useRef<string>('');
@@ -529,10 +530,64 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   const total = subtotal + gst;
 
   return (
-    <div className="flex h-full overflow-hidden select-none bg-[#F8F7F2]">
+    <div className="flex flex-col lg:flex-row h-full overflow-hidden select-none bg-[#F8F7F2]">
+
+      {/* ── Mobile top bar ── */}
+      <div className="lg:hidden flex items-center justify-between px-4 py-3 border-b border-[#5A5A40]/10 shrink-0">
+        <div>
+          <h1 className="text-base font-serif font-bold text-[#5A5A40] leading-tight">SAVOUR FOODS</h1>
+          <p className="text-[9px] tracking-widest uppercase opacity-50">Islamabad / Blue Area</p>
+        </div>
+        <div className="flex items-center gap-3">
+          {onNavigateToDashboard && (
+            <button
+              onClick={onNavigateToDashboard}
+              className="text-xs font-semibold text-[#5A5A40] opacity-60 hover:opacity-100 uppercase tracking-widest cursor-pointer"
+            >
+              Orders
+            </button>
+          )}
+          <button
+            onClick={() => setShowMobileCart(true)}
+            className="relative p-2.5 glass-panel rounded-xl cursor-pointer"
+            aria-label="Open cart"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[#5A5A40]">
+              <circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/>
+              <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/>
+            </svg>
+            {cart.length > 0 && (
+              <span className="absolute -top-1 -right-1 w-4 h-4 bg-[#A39171] rounded-full text-[9px] text-white flex items-center justify-center font-bold leading-none">
+                {cart.length}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Mobile category scroll ── */}
+      <div className="lg:hidden flex gap-2 px-3 py-2 overflow-x-auto shrink-0 border-b border-[#5A5A40]/10">
+        {categories.length === 0 ? (
+          <span className="text-xs opacity-30 px-1">Loading menu...</span>
+        ) : (
+          categories.map(cat => (
+            <button
+              key={cat}
+              onClick={() => setSelectedCategory(cat)}
+              className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                selectedCategory === cat
+                  ? 'bg-[#5A5A40] text-[#F8F7F2]'
+                  : 'bg-white/70 text-[#5A5A40] border border-[#5A5A40]/20'
+              }`}
+            >
+              {cat}
+            </button>
+          ))
+        )}
+      </div>
 
       {/* ── Left sidebar: branding + category nav ── */}
-      <aside className="w-52 lg:w-60 shrink-0 flex flex-col overflow-hidden border-r border-[#5A5A40]/10">
+      <aside className="hidden lg:flex lg:w-60 shrink-0 flex-col overflow-hidden border-r border-[#5A5A40]/10">
         {/* Logo */}
         <div className="px-5 pt-6 pb-4 shrink-0">
           <h1 className="text-xl lg:text-2xl font-serif font-bold text-[#5A5A40] leading-tight">
@@ -601,11 +656,11 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       </aside>
 
       {/* ── Main: menu grid + voice section ── */}
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden p-4 lg:p-5 gap-4">
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden p-3 lg:p-5 gap-3 lg:gap-4">
 
         {/* Menu panel */}
         <div className="glass-panel flex-1 flex flex-col min-h-0 overflow-hidden">
-          <div className="px-5 py-4 border-b border-[#5A5A40]/8 shrink-0 flex items-center justify-between">
+          <div className="px-4 lg:px-5 py-3 lg:py-4 border-b border-[#5A5A40]/8 shrink-0 flex items-center justify-between">
             <div>
               <h2 className="text-base lg:text-lg font-serif font-bold text-[#5A5A40]">
                 {selectedCategory || 'Menu'}
@@ -617,7 +672,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           </div>
 
           {/* Items grid — own scrollbar */}
-          <div className="flex-1 overflow-y-auto min-h-0 p-4 lg:p-5">
+          <div className="flex-1 overflow-y-auto min-h-0 p-3 lg:p-5">
             {menu.length === 0 ? (
               <div className="flex items-center justify-center h-24 opacity-35 text-sm">
                 Loading menu...
@@ -627,11 +682,11 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 No items in this category.
               </div>
             ) : (
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {filteredItems.map((item: MenuItem) => (
                   <div
                     key={item.id}
-                    className="p-4 bg-white/50 rounded-xl border border-white/60 hover:border-[#A39171]/30 hover:bg-white/70 transition-all"
+                    className="p-3 lg:p-4 bg-white/50 rounded-xl border border-white/60 hover:border-[#A39171]/30 hover:bg-white/70 transition-all"
                   >
                     <div className="flex justify-between items-start gap-2 mb-1.5">
                       <h4 className="font-bold text-sm text-[#5A5A40] leading-snug">
@@ -659,8 +714,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         </div>
 
         {/* Voice Order section */}
-        <div className="glass-panel shrink-0 p-4 lg:p-5">
-          <div className="flex items-center gap-5">
+        <div className="glass-panel shrink-0 p-3 lg:p-5">
+          <div className="flex items-center gap-4 lg:gap-5">
 
             {/* Mic button */}
             <div className="relative shrink-0">
@@ -670,7 +725,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 disabled={status === 'CONNECTING'}
                 aria-label={isRecording ? 'Stop recording' : 'Start recording'}
                 className={`
-                  relative w-[60px] h-[60px] rounded-full flex items-center justify-center
+                  relative w-14 h-14 lg:w-[60px] lg:h-[60px] rounded-full flex items-center justify-center
                   transition-all duration-200 focus:outline-none focus-visible:ring-2
                   focus-visible:ring-[#5A5A40] focus-visible:ring-offset-2 shadow-md
                   ${isRecording
@@ -701,7 +756,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             </div>
 
             {/* Status text */}
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="text-[10px] uppercase tracking-widest opacity-45 font-semibold mb-1">
                 Voice Order
               </p>
@@ -713,7 +768,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 {getStatusLabel(status)}
               </p>
               {isRecording && (
-                <p className="text-[11px] opacity-50 mt-0.5">
+                <p className="text-[11px] opacity-50 mt-0.5 hidden sm:block">
                   Click the button again to stop
                 </p>
               )}
@@ -739,8 +794,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         </div>
       </main>
 
-      {/* ── Right sidebar: cart ── */}
-      <aside className="w-64 lg:w-72 shrink-0 flex flex-col overflow-hidden border-l border-[#5A5A40]/10">
+      {/* ── Right sidebar: cart (desktop only) ── */}
+      <aside className="hidden lg:flex lg:w-72 shrink-0 flex-col overflow-hidden border-l border-[#5A5A40]/10">
         <div className="flex flex-col h-full overflow-hidden">
 
           {/* Cart header */}
@@ -815,6 +870,100 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           </div>
         </div>
       </aside>
+
+      {/* ── Mobile cart drawer ── */}
+      {showMobileCart && (
+        <div className="lg:hidden fixed inset-0 z-50 flex flex-col justify-end">
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={() => setShowMobileCart(false)}
+          />
+          <div className="relative bg-[#F8F7F2] rounded-t-3xl max-h-[85vh] flex flex-col overflow-hidden shadow-2xl">
+            {/* Handle */}
+            <div className="flex justify-center pt-3 pb-1 shrink-0">
+              <div className="w-10 h-1 bg-[#5A5A40]/20 rounded-full" />
+            </div>
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-3 shrink-0 border-b border-[#5A5A40]/10">
+              <div>
+                <h3 className="text-base font-bold text-[#5A5A40]">Current Order</h3>
+                <p className="text-[10px] uppercase tracking-widest opacity-45 mt-0.5">
+                  {cart.length} item{cart.length !== 1 ? 's' : ''}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowMobileCart(false)}
+                className="text-[#5A5A40] opacity-50 hover:opacity-100 p-1 cursor-pointer"
+                aria-label="Close cart"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M18 6 6 18M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+            {/* Items */}
+            <div className="flex-1 overflow-y-auto px-5 py-2 flex flex-col gap-2 min-h-0">
+              {cart.length === 0 ? (
+                <p className="text-xs opacity-40 italic text-center pt-10 leading-relaxed">
+                  Your cart is empty.<br />
+                  Speak your order to add items.
+                </p>
+              ) : (
+                cart.map((item, idx) => (
+                  <div
+                    key={idx}
+                    className="flex justify-between items-start py-2.5 border-b border-[#5A5A40]/8 last:border-0"
+                  >
+                    <div className="flex-1 pr-2 min-w-0">
+                      <p className="text-sm font-semibold text-[#3D3D33] leading-snug">
+                        {item.summary}
+                      </p>
+                      {item.quantity > 1 && (
+                        <p className="text-[11px] opacity-45 mt-0.5">×{item.quantity}</p>
+                      )}
+                    </div>
+                    <span className="font-mono text-sm text-[#5A5A40] whitespace-nowrap shrink-0 font-semibold">
+                      PKR {Math.round(item.unit_price * item.quantity)}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+            {/* Totals + actions */}
+            <div className="mx-3 mb-3 bg-[#5A5A40] text-[#F8F7F2] rounded-2xl p-4 shrink-0">
+              <div className="flex justify-between mb-2 opacity-75">
+                <span className="text-sm">Subtotal</span>
+                <span className="text-sm font-mono">PKR {subtotal}</span>
+              </div>
+              <div className="flex justify-between mb-3 opacity-75">
+                <span className="text-sm">GST (15%)</span>
+                <span className="text-sm font-mono">PKR {gst}</span>
+              </div>
+              <div className="flex justify-between items-end border-t border-white/20 pt-3 mb-4">
+                <span className="text-base font-serif">Total</span>
+                <span className="text-xl font-bold font-mono">PKR {total}</span>
+              </div>
+              <button
+                onClick={() => { submitOrder(); setShowMobileCart(false); }}
+                disabled={cart.length === 0}
+                className={`w-full py-2.5 rounded-xl font-bold uppercase tracking-widest text-xs transition-all mb-2 ${
+                  cart.length > 0
+                    ? 'bg-[#A39171] text-white cursor-pointer hover:bg-[#928263] active:scale-95'
+                    : 'bg-white/15 text-white/35 cursor-not-allowed'
+                }`}
+              >
+                Confirm Order
+              </button>
+              <button
+                onClick={() => { clearCart(); setShowMobileCart(false); }}
+                className="w-full py-2 border border-white/20 rounded-xl text-xs opacity-60 hover:opacity-90 cursor-pointer hover:bg-white/10 transition-all"
+              >
+                Clear All Items
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

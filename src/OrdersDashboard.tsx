@@ -247,11 +247,11 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <div className="flex flex-col h-full overflow-hidden select-none bg-[#F8F7F2] p-5 lg:p-7 gap-5">
+    <div className="flex flex-col h-full overflow-hidden select-none bg-[#F8F7F2] p-3 md:p-5 lg:p-7 gap-3 md:gap-5">
 
       {/* Header */}
-      <div className="flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-2 md:gap-4">
           <button
             onClick={onBack}
             className="text-xs uppercase tracking-widest opacity-50 hover:opacity-100 cursor-pointer transition-opacity font-semibold"
@@ -260,10 +260,10 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
           </button>
           <div className="w-px h-6 bg-[#5A5A40]/20" />
           <div>
-            <h1 className="text-xl lg:text-2xl font-serif font-bold text-[#5A5A40]">
+            <h1 className="text-lg md:text-xl lg:text-2xl font-serif font-bold text-[#5A5A40]">
               Live Orders
             </h1>
-            <p className="text-[10px] opacity-40 uppercase tracking-widest mt-0.5">
+            <p className="text-[10px] opacity-40 uppercase tracking-widest mt-0.5 hidden sm:block">
               {lastUpdated
                 ? `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every 60s`
                 : 'Loading...'}
@@ -285,19 +285,19 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
         </div>
       )}
 
-      {/* 3-column order board */}
-      <div className="flex-1 grid grid-cols-3 gap-5 min-h-0">
+      {/* Order board — stacks vertically on mobile, 3 columns on md+ */}
+      <div className="flex-1 flex flex-col gap-4 overflow-y-auto md:grid md:grid-cols-3 md:gap-5 md:min-h-0 md:overflow-hidden">
 
         {/* Column 1: Incoming (pending + confirmed) */}
-        <div className="flex flex-col gap-3 min-h-0">
+        <div className="flex flex-col gap-3 md:min-h-0">
           <ColumnHeader
             dotClass="bg-yellow-400"
             title="Incoming"
             count={incomingOrders.length}
           />
-          <div className="flex-1 flex flex-col gap-3 overflow-y-auto min-h-0 pr-1">
+          <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
             {incomingOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-12">No incoming orders</p>
+              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No incoming orders</p>
             ) : (
               incomingOrders.map(o => (
                 <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
@@ -307,15 +307,15 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
         </div>
 
         {/* Column 2: Preparing */}
-        <div className="flex flex-col gap-3 min-h-0">
+        <div className="flex flex-col gap-3 md:min-h-0 border-t border-[#5A5A40]/10 pt-4 md:border-0 md:pt-0">
           <ColumnHeader
             dotClass="bg-orange-400"
             title="Preparing"
             count={preparingOrders.length}
           />
-          <div className="flex-1 flex flex-col gap-3 overflow-y-auto min-h-0 pr-1">
+          <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
             {preparingOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-12">No orders preparing</p>
+              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders preparing</p>
             ) : (
               preparingOrders.map(o => (
                 <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
@@ -325,15 +325,15 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
         </div>
 
         {/* Column 3: Ready */}
-        <div className="flex flex-col gap-3 min-h-0">
+        <div className="flex flex-col gap-3 md:min-h-0 border-t border-[#5A5A40]/10 pt-4 md:border-0 md:pt-0">
           <ColumnHeader
             dotClass="bg-green-500"
             title="Ready"
             count={readyOrders.length}
           />
-          <div className="flex-1 flex flex-col gap-3 overflow-y-auto min-h-0 pr-1">
+          <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
             {readyOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-12">No orders ready</p>
+              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders ready</p>
             ) : (
               readyOrders.map(o => (
                 <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
