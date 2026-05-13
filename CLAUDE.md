@@ -19,11 +19,13 @@ Browser (React 19 + Vite)
   ├── App.tsx               — kiosk UI: menu grid, cart, voice controls
   ├── OrdersDashboard.tsx   — kitchen staff dashboard (polling)
   └── src/lib/
-       ├── geminiTools.ts   — Gemini tool declarations + system instruction + menu-context fetch
+       ├── geminiTools.ts   — tool declarations, system instruction builder, menu context fetch
        └── audioUtils.ts    — Web Audio API: 16 kHz PCM recorder, 24 kHz queued player
 
 Express server (server.ts, port 3000)
   ├── Vite dev middleware (dev) / static dist/ (prod)
+  ├── POST /api/gemini-token — exchanges GEMINI_API_KEY for a 60-second ephemeral token;
+  │     real key stays on server, browser only ever holds the short-lived token
   └── API proxy → Render backend (voiceai-hzyb.onrender.com)
         ├── /api/agent/*    — cart operations (resolve-item, remove-item, clear-cart, submit-order)
         ├── /api/menu       — full menu for UI grid
@@ -31,19 +33,22 @@ Express server (server.ts, port 3000)
 
 Google Gemini Live API  (wss)
   └── gemini-3.1-flash-live-preview
+        ├── Browser connects directly using the 60-second ephemeral token (not the real key)
         ├── Input:  16 kHz PCM chunks from AudioRecorder
         ├── Output: 24 kHz PCM chunks to AudioPlayer + function calls
-        └── Tools:  add_item, remove_item, clear_cart, confirm_order
+        └── Tools:  add_item, remove_item, clear_cart, confirm_order (handled in App.tsx)
 
 Render backend          (external REST service — not in this repo)
 Supabase                (configured; currently reserved for future local backup sync)
-Vercel                  (production deployment — rewrites /api/* to Render)
+Vercel                  (compatible — see "Vercel Deployment" note below)
 ```
 
 ### Data flow for a voice order
 
 ```
-Customer speaks → AudioRecorder (16 kHz PCM base64) → Gemini Live WebSocket
+Customer presses PTT → App.tsx POSTs /api/gemini-token → server exchanges real key for 60s token
+  → App creates new GoogleGenAI({ apiKey: ephemeralToken }) — real key never leaves server
+  → AudioRecorder (16 kHz PCM base64) → Gemini Live WebSocket (using ephemeral token)
   → Gemini recognises intent → calls add_item(session_id, dish_query, modifiers, qty, notes)
   → App.tsx intercepts tool call → POST /api/agent/resolve-item
   → Render backend fuzzy-matches dish, validates modifiers
@@ -60,8 +65,8 @@ Customer speaks → AudioRecorder (16 kHz PCM base64) → Gemini Live WebSocket
 
 | Path | Responsibility |
 |---|---|
-| `server.ts` | Express entry point; Vite middleware; API proxy to Render; Supabase init; warm-up ping |
-| `src/App.tsx` | Main kiosk component; Gemini session lifecycle; cart state; tool-call dispatch |
+| `server.ts` | Express entry point; Vite middleware; API proxy to Render; warm-up ping; **`/api/gemini-token` ephemeral token endpoint** |
+| `src/App.tsx` | Main kiosk component; fetches ephemeral token; Gemini session lifecycle; cart state; tool-call dispatch |
 | `src/OrdersDashboard.tsx` | Kitchen dashboard; order polling; status transitions |
 | `src/lib/geminiTools.ts` | Tool declarations (FunctionDeclaration[]); system instruction builder; menu context fetch with retry+cache |
 | `src/lib/audioUtils.ts` | AudioRecorder (ScriptProcessor, 16 kHz → PCM base64); AudioPlayer (queued BufferSource, 24 kHz) |
@@ -76,14 +81,43 @@ All secrets live in `.env` (never committed — see `.env.example`).
 
 | Variable | Used in | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` | `vite.config.ts` define → frontend | Authenticates Gemini Live API calls |
+| `GEMINI_API_KEY` | `server.ts` only | Authenticates Gemini Live API calls — **never sent to the browser** |
 | `SUPABASE_URL` | `server.ts` | Supabase project URL |
 | `SUPABASE_KEY` | `server.ts` | Supabase anon/service key |
 | `BACKEND_URL` | `server.ts` | Render backend base URL (defaults to `https://voiceai-hzyb.onrender.com`) |
 | `NODE_ENV` | `server.ts`, `vite.config.ts` | `development` enables Vite middleware; `production` serves `dist/` |
 | `DISABLE_HMR` | `vite.config.ts` | Set `true` in AI Studio environments to disable hot-module replacement |
 
-**Critical:** `GEMINI_API_KEY` is exposed to the browser at build time via Vite's `define`. Keep it out of any public repository. In production, consider routing Gemini traffic through the server instead.
+**Critical:** `GEMINI_API_KEY` lives exclusively in the server process. The browser never sees the key — only the 60-second ephemeral token returned by `/api/gemini-token`.
+
+### Vercel Deployment
+
+The `/api/gemini-token` endpoint lives in `server.ts` but `vercel.json` rewrites all `/api/*` to the Render backend. To deploy on Vercel, create a Vercel serverless function at `api/gemini-token.ts`:
+
+```typescript
+// api/gemini-token.ts
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import axios from 'axios';
+
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) return res.status(500).json({ error: 'Server configuration error' });
+  try {
+    const r = await axios.post(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-live-preview:generateEphemeralToken',
+      { ttl: '60s' },
+      { headers: { 'x-goog-api-key': geminiApiKey }, timeout: 10000 }
+    );
+    const ephemeralToken = r.data.token ?? r.data.ephemeralToken;
+    if (!ephemeralToken) throw new Error('No token in response');
+    res.json({ ephemeralToken });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+}
+```
+
+Vercel serverless functions in `api/` take precedence over `vercel.json` rewrites, so `/api/gemini-token` will be served by this function and not forwarded to Render.
 
 ---
 
@@ -110,11 +144,11 @@ Every `/api/*` route proxies to the Render backend. The local server adds only l
 
 ```
 connectToGemini()
-  1. Build system instruction (includes full menu markdown)
-  2. new GoogleGenAI({ apiKey }).live.connect(model, {tools, systemInstruction, ...})
+  1. POST /api/gemini-token → server exchanges real API key for a 60-second ephemeral token
+  2. new GoogleGenAI({ apiKey: ephemeralToken }).live.connect(model, {tools, systemInstruction, ...})
   3. Wait for BOTH session object AND WebSocket onopen before resolving
   4. Register: onmessage, onerror, onclose
-  5. On failure: retry up to 3× with exponential backoff (1 s, 2 s, 4 s)
+  5. On failure: retry up to 3× with exponential backoff (1.5 s, 3 s, 4.5 s)
 
 handleToggleRecording()
   PTT (push-to-talk):
@@ -135,6 +169,7 @@ Cleanup
 - Never call `start()` if `isConnectingRef.current` is true (prevents duplicate connections)
 - Never call `sendRealtimeInput` after `audioStreamEnd:true` on the same turn
 - Always send a tool response for every function call in a batch, even if the backend call failed
+- A fresh ephemeral token is fetched on every new `connectToGemini()` call (tokens are 60 s TTL)
 
 ---
 
@@ -285,6 +320,7 @@ For any non-trivial change, work through this before marking done:
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | First PTT press produces no audio | WebSocket not yet open when audio starts | `connectToGemini` dual-flag coordinator (`wsOpen` + `pendingSession`) in `App.tsx` |
+| `/api/gemini-token` returns 404 or error | Model may not support ephemeral tokens yet, or wrong endpoint | Check server logs `[TOKEN]`; verify the `generateEphemeralToken` endpoint with Google's docs |
 | Gemini doesn't respond after `add_item` | Missing or malformed `sendToolResponse` | Tool call handler in `App.tsx` `onmessage` |
 | Cart shows item but backend disagrees | Tool response optimistically updates UI before backend confirms | `add_item` handler — only add to local cart on `status === "ok"` |
 | `requires_input` loop never ends | Gemini re-sends the same modifiers | System instruction MUST say to re-call `add_item` with the customer's new input, not the original |
@@ -296,8 +332,8 @@ For any non-trivial change, work through this before marking done:
 
 ## Known Technical Debt
 
-- **[RESOLVED]** `GEMINI_API_KEY` baked into bundle — now fetched at runtime from `/api/config`; key never appears in compiled JS.
-- **[RESOLVED]** No rate limiting — `express-rate-limit` added: 200 req/15 min general, 100 req/15 min for agent routes.
+- **[RESOLVED]** `GEMINI_API_KEY` baked into bundle — server now vends a 60-second ephemeral token via `POST /api/gemini-token`; the real key is used only inside the Node.js process and never appears in any browser network request.
+- **[RESOLVED]** No rate limiting — `express-rate-limit` added: 200 req/15 min general, 100 req/15 min for agent routes, 10 req/min for token endpoint.
 - **[RESOLVED]** Supabase client imported but unused — removed entirely from `server.ts` and `package.json`.
 - **[RESOLVED]** Menu cache had no TTL — cache now stores `cached_at` timestamp; entries expire after 6 hours.
 - **[RESOLVED]** Implicit `any` types throughout — typed interfaces added for `MenuItem`, `ResolveItemResponse`, `SubmitOrderResponse`, `GeminiLiveSession`; `@types/react` installed to fix JSX type inference.
@@ -305,4 +341,5 @@ For any non-trivial change, work through this before marking done:
 **Remaining:**
 - `ScriptProcessorNode` is deprecated — plan migration to `AudioWorkletNode`; test on all target browsers before removing the old path.
 - Session IDs are never expired or invalidated server-side — the backend must enforce this.
-- For full API-key security, proxy Gemini Live through the server (requires WebSocket tunnelling) — the current `/api/config` approach keeps the key out of the bundle but it remains visible in network requests.
+- The `generateEphemeralToken` endpoint availability depends on Google's support for `gemini-3.1-flash-live-preview`. If unavailable, `[TOKEN]` errors will appear in server logs — either wait for Google to enable it or migrate to a GA model that supports it.
+- For Vercel deployment: add `api/gemini-token.ts` serverless function (see "Vercel Deployment" note in Environment Variables section).

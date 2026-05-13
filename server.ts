@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
+import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 
@@ -13,15 +14,12 @@ const IS_DEV = process.env.NODE_ENV !== 'production';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-// SHA-256 of the password so the plaintext never lives in the process.
-// Override with AUTH_PASSWORD_HASH in .env to rotate without touching code.
 const AUTH_USERNAME      = 'agent1101';
 const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH
   ?? 'a3046da0d15a27e89f2afe639b25748a7ad4d9290af3e7b1b6c1a5533c8f0a8c';
-// Random per boot by default; set SESSION_SECRET in .env to survive restarts.
 const SESSION_SECRET = process.env.SESSION_SECRET
   ?? crypto.randomBytes(32).toString('hex');
-const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 
 function issueToken(username: string): string {
   const payload = JSON.stringify({ sub: username, exp: Date.now() + TOKEN_TTL_MS });
@@ -37,7 +35,6 @@ function verifyToken(token: string): boolean {
     const b64 = token.slice(0, dot);
     const sig  = token.slice(dot + 1);
     const expected = crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('hex');
-    // Timing-safe comparison — both must be the same byte length
     const sigBuf = Buffer.from(sig);
     const expBuf = Buffer.from(expected);
     if (sigBuf.byteLength !== expBuf.byteLength) return false;
@@ -137,15 +134,13 @@ async function startServer() {
   if (!process.env.SESSION_SECRET) {
     console.warn(
       '[AUTH] SESSION_SECRET is not set — sessions will be lost on every server restart.\n' +
-      '       Set SESSION_SECRET in .env (local) and in Vercel environment variables (production).'
+      '       Set SESSION_SECRET in .env (local) and in your hosting environment (production).'
     );
   }
 
-  // Trust one reverse-proxy hop (Render / Vercel) so req.ip reflects the real client IP
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '100kb' }));
 
-  // Rate limiting — applied before any route so even 404s are counted
   const generalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 200,
@@ -154,7 +149,6 @@ async function startServer() {
     message: { error: 'Too many requests, please try again later.' },
   });
 
-  // Tighter budget for cart mutation routes (Gemini tool calls)
   const agentLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
@@ -163,7 +157,6 @@ async function startServer() {
     message: { error: 'Too many requests, please try again later.' },
   });
 
-  // Strict limit on auth endpoints to prevent brute force
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -172,11 +165,21 @@ async function startServer() {
     message: { error: 'Too many login attempts, please try again later.' },
   });
 
+  // Strict limit on token endpoint — one token per kiosk press is fine, but
+  // prevent automated abuse (each token costs a Google API roundtrip).
+  const tokenLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many token requests.' },
+  });
+
   app.use('/api/', generalLimiter);
   app.use('/api/agent/', agentLimiter);
   app.use('/api/auth/', authLimiter);
 
-  // Warm-up pings — wake Render from sleep before the first user request
+  // Warm-up pings
   backendClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
     console.warn('[WARMUP] Render backend cold-starting — first request may be slow')
   );
@@ -184,16 +187,33 @@ async function startServer() {
     console.warn('[WARMUP] menu-context cold-starting')
   );
 
-  // ── Config endpoint ───────────────────────────────────────────────────────
-  // Returns the Gemini API key at runtime so it is never baked into the static bundle.
-  app.get('/api/config', (_req: Request, res: Response) => {
+  // ── Gemini ephemeral token endpoint ───────────────────────────────────────
+  // The browser POSTs here just before opening its Gemini Live WebSocket.
+  // The server exchanges the real API key for a short-lived ephemeral token
+  // (TTL: 60 s). The browser uses the ephemeral token as the apiKey for
+  // GoogleGenAI — the real key never appears in any network response.
+  // Even if a token is intercepted it expires within one minute.
+  app.post('/api/gemini-token', tokenLimiter, async (_req: Request, res: Response) => {
     const geminiApiKey = process.env.GEMINI_API_KEY;
     if (!geminiApiKey) {
-      console.error('[CONFIG] GEMINI_API_KEY is not set');
+      console.error('[TOKEN] GEMINI_API_KEY is not set');
       res.status(500).json({ error: 'Server configuration error' });
       return;
     }
-    res.json({ geminiApiKey });
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: geminiApiKey, httpOptions: { apiVersion: 'v1alpha' } });
+      const token = await ai.authTokens.create({});
+      if (!token.name) throw new Error('SDK returned no token name');
+      console.log('[TOKEN] Ephemeral token issued');
+      res.json({ ephemeralToken: token.name });
+    } catch (err: unknown) {
+      const message = axios.isAxiosError(err)
+        ? ((err.response?.data as { error?: { message?: string } })?.error?.message ?? err.message)
+        : String(err);
+      console.error('[TOKEN] Failed to generate ephemeral token:', message);
+      res.status(500).json({ error: `Token generation failed: ${message}` });
+    }
   });
 
   // ── Auth endpoints ────────────────────────────────────────────────────────
@@ -244,7 +264,6 @@ async function startServer() {
     proxyPost('/api/v1/agent/submit-order', req, res, 201)
   );
 
-  // ── Create order (direct payload, used by confirm_order tool and manual button) ─
   app.post('/api/orders', (req: Request, res: Response) =>
     proxyPost('/api/v1/orders', req, res, 201)
   );

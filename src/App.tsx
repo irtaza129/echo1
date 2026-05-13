@@ -61,7 +61,6 @@ interface SubmitOrderResponse {
 }
 
 // Structural interface covering only the session methods this component calls.
-// The full SDK type is not exported — using a structural type avoids `any` here.
 interface GeminiLiveSession {
   sendRealtimeInput(input: {
     audio?: { data: string; mimeType: string };
@@ -109,7 +108,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
 
   const sessionIdRef    = useRef<string>(generateSessionId());
   const menuContextRef  = useRef<string>('');
-  const aiRef           = useRef<GoogleGenAI | null>(null);
   const sessionRef      = useRef<GeminiLiveSession | null>(null);
   const recorderRef     = useRef<AudioRecorder | null>(null);
   const playerRef       = useRef<AudioPlayer | null>(null);
@@ -131,20 +129,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       isSpeakingRef.current = false;
       setStatus('IDLE');
     };
-
-    // Fetch Gemini API key at runtime — never baked into the bundle
-    fetch('/api/config')
-      .then(r => {
-        if (!r.ok) throw new Error(`config ${r.status}`);
-        return r.json() as Promise<{ geminiApiKey: string }>;
-      })
-      .then(({ geminiApiKey }) => {
-        aiRef.current = new GoogleGenAI({ apiKey: geminiApiKey });
-      })
-      .catch(err => {
-        console.error('[INIT] Failed to load config:', err);
-        setStatus('Setup error — refresh page');
-      });
 
     // Pre-load menu context for AI (non-blocking)
     fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
@@ -188,16 +172,29 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   }, []);
 
   const connectToGemini = useCallback(async () => {
-    if (!aiRef.current) {
-      setStatus('Setup error — refresh page');
-      return;
-    }
     setStatus('CONNECTING');
+
+    // Fetch a short-lived ephemeral token from the server.
+    // The real GEMINI_API_KEY never leaves the server process — the browser
+    // only ever sees this token, which expires in 60 seconds.
+    let ephemeralToken: string;
+    try {
+      const r = await fetch('/api/gemini-token', { method: 'POST' });
+      if (!r.ok) throw new Error(`/api/gemini-token returned ${r.status}`);
+      ({ ephemeralToken } = await r.json() as { ephemeralToken: string });
+      if (!ephemeralToken) throw new Error('No ephemeralToken in server response');
+    } catch (err) {
+      console.error('[INIT] Failed to obtain Gemini token:', err);
+      throw err;
+    }
 
     if (!menuContextRef.current) {
       menuContextRef.current = await fetchMenuContext();
     }
     const sysInstruction = buildSystemInstruction(menuContextRef.current);
+
+    // Ephemeral tokens only work with v1alpha of the Gemini Live API.
+    const ai = new GoogleGenAI({ apiKey: ephemeralToken, httpOptions: { apiVersion: 'v1alpha' } });
 
     await new Promise<void>((resolve, reject) => {
       let pendingSession: GeminiLiveSession | null = null;
@@ -210,7 +207,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         }
       };
 
-      aiRef.current!.live.connect({
+      ai.live.connect({
         model: 'gemini-3.1-flash-live-preview',
         config: {
           responseModalities: [Modality.AUDIO],
@@ -222,11 +219,42 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         },
         callbacks: {
           onopen: () => {
+            console.log('[WS] onopen fired');
             setIsConnected(true);
             wsOpen = true;
             tryResolve();
           },
           onmessage: async (message: LiveServerMessage) => {
+            console.log('[MSG]', JSON.stringify(message).slice(0, 300));
+            // Token usage — logged whenever Gemini includes usageMetadata in a message.
+            // Pricing reference: gemini-3.1-flash-live-preview (verify at ai.google.dev/pricing).
+            // Update these constants if Google revises rates.
+            if (message.usageMetadata) {
+              const PRICE_TEXT_IN   =  0.75 / 1_000_000; // $ per token, text input
+              const PRICE_AUDIO_IN  =  3.00 / 1_000_000; // $ per token, audio input
+              const PRICE_TEXT_OUT  =  4.50 / 1_000_000; // $ per token, text output (incl. thinking)
+              const PRICE_AUDIO_OUT = 12.00 / 1_000_000; // $ per token, audio output
+
+              const u = message.usageMetadata;
+              const details = (arr: typeof u.promptTokensDetails) =>
+                (arr ?? []).map(d => `${d.modality ?? '?'}=${d.tokenCount ?? 0}`).join(' ') || 'n/a';
+
+              const textIn   = (u.promptTokensDetails   ?? []).find(d => d.modality === 'TEXT')?.tokenCount   ?? 0;
+              const audioIn  = (u.promptTokensDetails   ?? []).find(d => d.modality === 'AUDIO')?.tokenCount  ?? 0;
+              const textOut  = (u.responseTokensDetails ?? []).find(d => d.modality === 'TEXT')?.tokenCount   ?? 0;
+              const audioOut = (u.responseTokensDetails ?? []).find(d => d.modality === 'AUDIO')?.tokenCount  ?? 0;
+
+              const cost = textIn * PRICE_TEXT_IN + audioIn * PRICE_AUDIO_IN
+                         + textOut * PRICE_TEXT_OUT + audioOut * PRICE_AUDIO_OUT;
+
+              console.log(
+                `[TOKENS] prompt=${u.promptTokenCount ?? '?'} (${details(u.promptTokensDetails)})` +
+                ` response=${u.responseTokenCount ?? '?'} (${details(u.responseTokensDetails)})` +
+                ` total=${u.totalTokenCount ?? '?'}` +
+                ` est_cost_usd=$${cost.toFixed(6)}`
+              );
+            }
+
             // Audio response chunks
             if (message.serverContent?.modelTurn) {
               for (const part of (message.serverContent.modelTurn.parts || [])) {
@@ -243,7 +271,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               setStatus('IDLE');
             }
 
-            // Model finished turn — if no audio queued, unlock the mic
             if ((message.serverContent as { turnComplete?: boolean } | undefined)?.turnComplete
                 && !isSpeakingRef.current) {
               setStatus('IDLE');
@@ -375,24 +402,23 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                   })
                 );
               } catch {
-                // Safety net: each handler has its own try/catch, but if Promise.all itself
-                // rejects, send error responses to unblock the Gemini turn
                 functionResponses = calls.map(call => ({
                   id: call.id, name: call.name, response: { error: 'dispatch failed' },
                 }));
               }
 
-              // Always send tool responses — a missing response stalls the Gemini turn
               if (functionResponses.length > 0 && sessionRef.current) {
                 sessionRef.current.sendToolResponse({ functionResponses });
               }
             }
           },
           onerror: (e: unknown) => {
+            console.error('[WS] onerror:', e);
             setStatus('Connection error — tap to retry');
             reject(e);
           },
-          onclose: () => {
+          onclose: (e: unknown) => {
+            console.warn('[WS] onclose:', e);
             setIsConnected(false);
             sessionRef.current = null;
             if (isRecordingRef.current) {
@@ -458,9 +484,14 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     isRecordingRef.current = true;
     setStatus('RECORDING');
 
+    let chunkCount = 0;
     try {
       await recorderRef.current?.start((base64: string) => {
         if (isRecordingRef.current && sessionRef.current) {
+          chunkCount++;
+          if (chunkCount <= 3 || chunkCount % 20 === 0) {
+            console.log(`[AUDIO] sending chunk #${chunkCount}, len=${base64.length}`);
+          }
           sessionRef.current.sendRealtimeInput({
             audio: { data: base64, mimeType: 'audio/pcm;rate=16000' },
           });
@@ -588,7 +619,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
 
       {/* ── Left sidebar: branding + category nav ── */}
       <aside className="hidden lg:flex lg:w-60 shrink-0 flex-col overflow-hidden border-r border-[#5A5A40]/10">
-        {/* Logo */}
         <div className="px-5 pt-6 pb-4 shrink-0">
           <h1 className="text-xl lg:text-2xl font-serif font-bold text-[#5A5A40] leading-tight">
             SAVOUR FOODS
@@ -598,7 +628,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           </p>
         </div>
 
-        {/* Category nav — scrollable */}
         <div className="flex-1 overflow-y-auto min-h-0 px-2 pb-2">
           <p className="text-[10px] uppercase tracking-widest opacity-40 font-semibold px-3 mb-2">
             Menu
@@ -625,7 +654,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           )}
         </div>
 
-        {/* Live orders button */}
         {onNavigateToDashboard && (
           <div className="px-3 pb-3 shrink-0">
             <button
@@ -637,7 +665,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           </div>
         )}
 
-        {/* System status */}
         <div className="px-3 pb-4 shrink-0">
           <div className="glass-panel p-3">
             <p className="text-[9px] uppercase tracking-widest opacity-40 font-semibold mb-2">
@@ -658,7 +685,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       {/* ── Main: menu grid + voice section ── */}
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden p-3 lg:p-5 gap-3 lg:gap-4">
 
-        {/* Menu panel */}
         <div className="glass-panel flex-1 flex flex-col min-h-0 overflow-hidden">
           <div className="px-4 lg:px-5 py-3 lg:py-4 border-b border-[#5A5A40]/8 shrink-0 flex items-center justify-between">
             <div>
@@ -671,7 +697,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             </div>
           </div>
 
-          {/* Items grid — own scrollbar */}
           <div className="flex-1 overflow-y-auto min-h-0 p-3 lg:p-5">
             {menu.length === 0 ? (
               <div className="flex items-center justify-center h-24 opacity-35 text-sm">
@@ -717,7 +742,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         <div className="glass-panel shrink-0 p-3 lg:p-5">
           <div className="flex items-center gap-4 lg:gap-5">
 
-            {/* Mic button */}
             <div className="relative shrink-0">
               {isRecording && <div className="pulse-ring" />}
               <button
@@ -755,7 +779,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               </button>
             </div>
 
-            {/* Status text */}
             <div className="min-w-0 flex-1">
               <p className="text-[10px] uppercase tracking-widest opacity-45 font-semibold mb-1">
                 Voice Order
@@ -774,7 +797,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               )}
             </div>
 
-            {/* Animated level bars (recording state) */}
             {isRecording && (
               <div className="ml-auto flex items-center gap-0.5 shrink-0 pr-1">
                 {[14, 22, 16, 20, 12, 18, 14].map((h, i) => (
@@ -798,7 +820,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       <aside className="hidden lg:flex lg:w-72 shrink-0 flex-col overflow-hidden border-l border-[#5A5A40]/10">
         <div className="flex flex-col h-full overflow-hidden">
 
-          {/* Cart header */}
           <div className="px-5 pt-6 pb-4 shrink-0">
             <h3 className="text-base lg:text-lg font-bold text-[#5A5A40]">Current Order</h3>
             <p className="text-[10px] uppercase tracking-widest opacity-45 mt-0.5">
@@ -806,7 +827,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             </p>
           </div>
 
-          {/* Cart items — own scrollbar */}
           <div className="flex-1 overflow-y-auto min-h-0 px-4 lg:px-5 pb-2 flex flex-col gap-2">
             {cart.length === 0 ? (
               <p className="text-xs opacity-40 italic text-center pt-10 leading-relaxed">
@@ -835,7 +855,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             )}
           </div>
 
-          {/* Totals + actions */}
           <div className="mx-3 mb-3 bg-[#5A5A40] text-[#F8F7F2] rounded-2xl p-4 lg:p-5 shrink-0">
             <div className="flex justify-between mb-2 opacity-75">
               <span className="text-sm">Subtotal</span>
@@ -879,11 +898,9 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
             onClick={() => setShowMobileCart(false)}
           />
           <div className="relative bg-[#F8F7F2] rounded-t-3xl max-h-[85vh] flex flex-col overflow-hidden shadow-2xl">
-            {/* Handle */}
             <div className="flex justify-center pt-3 pb-1 shrink-0">
               <div className="w-10 h-1 bg-[#5A5A40]/20 rounded-full" />
             </div>
-            {/* Header */}
             <div className="flex items-center justify-between px-5 py-3 shrink-0 border-b border-[#5A5A40]/10">
               <div>
                 <h3 className="text-base font-bold text-[#5A5A40]">Current Order</h3>
@@ -901,7 +918,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 </svg>
               </button>
             </div>
-            {/* Items */}
             <div className="flex-1 overflow-y-auto px-5 py-2 flex flex-col gap-2 min-h-0">
               {cart.length === 0 ? (
                 <p className="text-xs opacity-40 italic text-center pt-10 leading-relaxed">
@@ -929,7 +945,6 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 ))
               )}
             </div>
-            {/* Totals + actions */}
             <div className="mx-3 mb-3 bg-[#5A5A40] text-[#F8F7F2] rounded-2xl p-4 shrink-0">
               <div className="flex justify-between mb-2 opacity-75">
                 <span className="text-sm">Subtotal</span>
