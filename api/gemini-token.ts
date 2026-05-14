@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
+import axios from 'axios';
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -13,35 +14,37 @@ export default async function handler(_req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  let text = '';
   try {
-    const r = await fetch(
+    const r = await axios.post<{ token?: string; ephemeralToken?: string }>(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-live-preview:generateEphemeralToken',
+      { ttl: '60s' },
       {
-        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-goog-api-key': geminiApiKey,
         },
-        body: JSON.stringify({ ttl: '60s' }),
+        timeout: 10000,
       }
     );
 
-    text = await r.text();
-
-    const data = JSON.parse(text) as { token?: string; ephemeralToken?: string; error?: unknown };
-    const ephemeralToken = data.token ?? data.ephemeralToken;
-
+    const ephemeralToken = r.data.token ?? r.data.ephemeralToken;
     if (!ephemeralToken) {
-      console.error('[TOKEN] No token in Google response (HTTP', r.status, '):', text.slice(0, 300));
-      json(res, 500, { error: 'No token in Google response', detail: text.slice(0, 300) });
+      console.error('[TOKEN] No token field in Google response (HTTP', r.status, '):', JSON.stringify(r.data).slice(0, 300));
+      json(res, 500, { error: 'No token in Google response', detail: JSON.stringify(r.data).slice(0, 300) });
       return;
     }
 
     console.log('[TOKEN] Ephemeral token issued');
     json(res, 200, { ephemeralToken });
-  } catch (err) {
-    console.error('[TOKEN] Failed:', err, '| raw response:', text.slice(0, 300));
-    json(res, 500, { error: `Token request failed: ${String(err)}`, raw: text.slice(0, 300) });
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      const status  = err.response?.status ?? 500;
+      const detail  = JSON.stringify(err.response?.data ?? err.message).slice(0, 300);
+      console.error('[TOKEN] Google API error:', status, detail);
+      json(res, status >= 400 && status < 600 ? status : 500, { error: `Google API error (${status})`, detail });
+    } else {
+      console.error('[TOKEN] Unexpected error:', err);
+      json(res, 500, { error: String(err) });
+    }
   }
 }
