@@ -12,6 +12,7 @@ import {
   fetchMenuContext,
   buildSystemInstruction,
 } from './lib/geminiTools';
+import type { TranscriptTurn, ToolCallRecord } from './lib/types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -98,13 +99,22 @@ function getStatusLabel(status: AppStatus): string {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?: () => void }) {
+export default function App({
+  onNavigateToDashboard,
+  onNavigateToTranscripts,
+  onTurnComplete,
+}: {
+  onNavigateToDashboard?: () => void;
+  onNavigateToTranscripts?: () => void;
+  onTurnComplete?: (turn: TranscriptTurn) => void;
+}) {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [menu, setMenu] = useState<MenuItem[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('');
   const [status, setStatus] = useState<AppStatus>('IDLE');
   const [isConnected, setIsConnected] = useState(false);
   const [showMobileCart, setShowMobileCart] = useState(false);
+  const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
 
   const sessionIdRef    = useRef<string>(generateSessionId());
   const menuContextRef  = useRef<string>('');
@@ -116,10 +126,21 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   const isConnectingRef = useRef(false);
   const cartRef         = useRef<CartItem[]>([]);
 
+  const transcriptionEnabledRef = useRef(false);
+  const turnIndexRef  = useRef(0);
+  const turnBufferRef = useRef<{
+    customerText: string; aiText: string;
+    toolCalls: ToolCallRecord[];
+    promptTokens: number; responseTokens: number; costUsd: number;
+  }>({ customerText: '', aiText: '', toolCalls: [], promptTokens: 0, responseTokens: 0, costUsd: 0 });
+
   const isRecording = status === 'RECORDING';
 
   // Keep cartRef in sync so the confirm_order closure always sees current cart
   useEffect(() => { cartRef.current = cart; }, [cart]);
+
+  // Keep transcriptionEnabledRef in sync for onmessage closures
+  useEffect(() => { transcriptionEnabledRef.current = transcriptionEnabled; }, [transcriptionEnabled]);
 
   useEffect(() => {
     recorderRef.current = new AudioRecorder();
@@ -173,6 +194,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
 
   const connectToGemini = useCallback(async () => {
     setStatus('CONNECTING');
+    turnIndexRef.current  = 0;
+    turnBufferRef.current = { customerText: '', aiText: '', toolCalls: [], promptTokens: 0, responseTokens: 0, costUsd: 0 };
 
     // Fetch a short-lived ephemeral token from the server.
     // The real GEMINI_API_KEY never leaves the server process — the browser
@@ -214,6 +237,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
           },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           systemInstruction: sysInstruction,
           tools: [{ functionDeclarations: allTools }],
         },
@@ -253,6 +278,20 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 ` total=${u.totalTokenCount ?? '?'}` +
                 ` est_cost_usd=$${cost.toFixed(6)}`
               );
+
+              turnBufferRef.current.promptTokens   += u.promptTokenCount   ?? 0;
+              turnBufferRef.current.responseTokens += u.responseTokenCount ?? 0;
+              turnBufferRef.current.costUsd        += cost;
+            }
+
+            // Accumulate transcription only when the feature is enabled
+            if (transcriptionEnabledRef.current) {
+              if (message.serverContent?.inputTranscription?.text) {
+                turnBufferRef.current.customerText += message.serverContent.inputTranscription.text;
+              }
+              if (message.serverContent?.outputTranscription?.text) {
+                turnBufferRef.current.aiText += message.serverContent.outputTranscription.text;
+              }
             }
 
             // Audio response chunks
@@ -271,9 +310,24 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               setStatus('IDLE');
             }
 
-            if ((message.serverContent as { turnComplete?: boolean } | undefined)?.turnComplete
-                && !isSpeakingRef.current) {
-              setStatus('IDLE');
+            if ((message.serverContent as { turnComplete?: boolean } | undefined)?.turnComplete) {
+              if (!isSpeakingRef.current) setStatus('IDLE');
+              const buf = { ...turnBufferRef.current };
+              const idx = turnIndexRef.current++;
+              turnBufferRef.current = { customerText: '', aiText: '', toolCalls: [],
+                                        promptTokens: 0, responseTokens: 0, costUsd: 0 };
+              if (transcriptionEnabledRef.current) {
+                onTurnComplete?.({
+                  index:          idx,
+                  customerText:   buf.customerText   || null,
+                  aiText:         buf.aiText         || null,
+                  toolCalls:      buf.toolCalls,
+                  promptTokens:   buf.promptTokens,
+                  responseTokens: buf.responseTokens,
+                  costUsd:        buf.costUsd,
+                  timestamp:      new Date().toISOString(),
+                });
+              }
             }
 
             // Tool calls — dispatch all in parallel, always send a response
@@ -405,6 +459,17 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
                 functionResponses = calls.map(call => ({
                   id: call.id, name: call.name, response: { error: 'dispatch failed' },
                 }));
+              }
+
+              // Record tool calls in the turn buffer (only when transcription is on)
+              if (transcriptionEnabledRef.current) {
+                calls.forEach((call, i) => {
+                  turnBufferRef.current.toolCalls.push({
+                    name:     call.name ?? '',
+                    args:     (call.args ?? {}) as Record<string, unknown>,
+                    response: (functionResponses[i] as { response: unknown }).response,
+                  });
+                });
               }
 
               if (functionResponses.length > 0 && sessionRef.current) {
@@ -655,12 +720,23 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
         </div>
 
         {onNavigateToDashboard && (
-          <div className="px-3 pb-3 shrink-0">
+          <div className="px-3 pb-1 shrink-0">
             <button
               onClick={onNavigateToDashboard}
               className="w-full py-2.5 glass-panel rounded-xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
             >
               Live Orders →
+            </button>
+          </div>
+        )}
+
+        {onNavigateToTranscripts && (
+          <div className="px-3 pb-3 shrink-0">
+            <button
+              onClick={onNavigateToTranscripts}
+              className="w-full py-2.5 glass-panel rounded-xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
+            >
+              Transcript →
             </button>
           </div>
         )}
@@ -674,9 +750,25 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${isConnected ? 'bg-green-500' : 'bg-[#A39171] dot-pulse'}`} />
               <span className="text-[10px] font-mono truncate">GEMINI 3.1 FLASH</span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 mb-2">
               <div className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
               <span className="text-[10px] font-mono">DB SYNCED</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] uppercase tracking-widest opacity-40 font-semibold">
+                Transcription
+              </span>
+              <button
+                onClick={() => setTranscriptionEnabled(v => !v)}
+                aria-label={transcriptionEnabled ? 'Disable transcription' : 'Enable transcription'}
+                className={`relative w-8 h-4 rounded-full transition-colors cursor-pointer ${
+                  transcriptionEnabled ? 'bg-[#5A5A40]' : 'bg-[#5A5A40]/20'
+                }`}
+              >
+                <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white shadow-sm transition-transform ${
+                  transcriptionEnabled ? 'translate-x-4' : 'translate-x-0.5'
+                }`} />
+              </button>
             </div>
           </div>
         </div>

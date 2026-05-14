@@ -1,16 +1,19 @@
-import { useState, useEffect, StrictMode } from 'react';
+import { useState, useEffect, useCallback, StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';
 import OrdersDashboard from './OrdersDashboard.tsx';
 import LoginScreen from './LoginScreen.tsx';
+import TranscriptScreen from './TranscriptScreen.tsx';
+import type { TranscriptTurn } from './lib/types';
 import './index.css';
 
-type Screen = 'loading' | 'login' | 'kiosk' | 'dashboard';
+type Screen = 'loading' | 'login' | 'kiosk' | 'dashboard' | 'transcripts';
 
 const TOKEN_KEY = 'sf_auth_token';
 
 function Root() {
   const [screen, setScreen] = useState<Screen>('loading');
+  const [conversationLog, setConversationLog] = useState<TranscriptTurn[]>([]);
 
   useEffect(() => {
     const token = sessionStorage.getItem(TOKEN_KEY);
@@ -33,6 +36,10 @@ function Root() {
     setScreen('kiosk');
   };
 
+  const handleTurnComplete = useCallback((turn: TranscriptTurn) => {
+    setConversationLog(prev => [...prev, turn]);
+  }, []);
+
   if (screen === 'loading') {
     // Brief validation check — render nothing to avoid flash
     return null;
@@ -43,7 +50,16 @@ function Root() {
   if (screen === 'dashboard') {
     return <OrdersDashboard onBack={() => setScreen('kiosk')} />;
   }
-  return <App onNavigateToDashboard={() => setScreen('dashboard')} />;
+  if (screen === 'transcripts') {
+    return <TranscriptScreen turns={conversationLog} onBack={() => setScreen('kiosk')} />;
+  }
+  return (
+    <App
+      onNavigateToDashboard={() => setScreen('dashboard')}
+      onNavigateToTranscripts={() => setScreen('transcripts')}
+      onTurnComplete={handleTurnComplete}
+    />
+  );
 }
 
 createRoot(document.getElementById('root')!).render(
