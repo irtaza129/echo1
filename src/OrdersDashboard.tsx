@@ -179,7 +179,7 @@ function ColumnHeader({
   );
 }
 
-export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
+export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => void; onLogout?: () => void }) {
   const [incomingOrders,  setIncomingOrders]  = useState<Order[]>([]);
   const [preparingOrders, setPreparingOrders] = useState<Order[]>([]);
   const [readyOrders,     setReadyOrders]     = useState<Order[]>([]);
@@ -258,6 +258,17 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
           >
             ← Kiosk
           </button>
+          {onLogout && (
+            <>
+              <div className="w-px h-5 bg-[#5A5A40]/20" />
+              <button
+                onClick={onLogout}
+                className="text-xs uppercase tracking-widest text-red-500 opacity-70 hover:opacity-100 cursor-pointer transition-opacity font-semibold"
+              >
+                Sign Out
+              </button>
+            </>
+          )}
           <div className="w-px h-6 bg-[#5A5A40]/20" />
           <div>
             <h1 className="text-lg md:text-xl lg:text-2xl font-serif font-bold text-[#5A5A40]">

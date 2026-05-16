@@ -1,5 +1,5 @@
 {
-  "include": ["src", "server.ts", "api"],
+  "include": ["src", "server.ts", "api", "adapter", "middleware"],
   "compilerOptions": {
     "strict": true,
     "target": "ES2022",
