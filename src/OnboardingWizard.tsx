@@ -1,6 +1,10 @@
-import { useState } from 'react';
+import { useState, useId } from 'react';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+interface MenuCategoryRow { id: string; name: string; sortOrder: number }
+interface MenuItemRow     { id: string; categoryId: string; name: string; description: string; price: number; available: boolean }
+interface MenuData        { categories: MenuCategoryRow[]; items: MenuItemRow[] }
 
 interface WizardConfig {
   restaurantName: string;
@@ -56,6 +60,7 @@ const STEPS = [
   'Restaurant',
   'Adapter',
   'Test',
+  'Menu',
   'AI Persona',
   'Rules',
   'Launch',
@@ -88,7 +93,67 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
     features: { deliveryOrders: false, tableNumbers: false, transcriptScreen: false, loyaltyPoints: false },
   });
 
-  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [testResult,    setTestResult]    = useState<{ ok: boolean; msg: string } | null>(null);
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+
+  const playVoicePreview = async (voice: string) => {
+    if (previewingVoice) return;
+    setPreviewingVoice(voice);
+    try {
+      const r = await fetch('/api/admin/preview-voice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwtToken}` },
+        body: JSON.stringify({ voice }),
+      });
+      if (!r.ok) { setPreviewingVoice(null); return; }
+      const { audioBase64, mimeType } = await r.json() as { audioBase64: string; mimeType: string };
+      const binary = atob(audioBase64);
+      const bytes  = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const int16   = new Int16Array(bytes.buffer);
+      const float32 = Float32Array.from(int16, s => s / 32768);
+      const rate    = parseInt(mimeType.match(/rate=(\d+)/)?.[1] ?? '24000');
+      const ctx     = new AudioContext({ sampleRate: rate });
+      const buf     = ctx.createBuffer(1, float32.length, rate);
+      buf.copyToChannel(float32, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+      src.onended = () => { ctx.close(); setPreviewingVoice(null); };
+    } catch {
+      setPreviewingVoice(null);
+    }
+  };
+  const [menuData,   setMenuData]   = useState<MenuData>({ categories: [], items: [] });
+  const uid = useId();
+
+  const addCategory = () => {
+    const id = `${uid}-cat-${Date.now()}`;
+    setMenuData(prev => ({
+      ...prev,
+      categories: [...prev.categories, { id, name: '', sortOrder: prev.categories.length }],
+    }));
+  };
+  const removeCategory = (catId: string) =>
+    setMenuData(prev => ({
+      categories: prev.categories.filter(c => c.id !== catId),
+      items:      prev.items.filter(i => i.categoryId !== catId),
+    }));
+  const updateCategory = (catId: string, patch: Partial<MenuCategoryRow>) =>
+    setMenuData(prev => ({ ...prev, categories: prev.categories.map(c => c.id === catId ? { ...c, ...patch } : c) }));
+
+  const addItem = (catId: string) => {
+    const id = `${uid}-item-${Date.now()}`;
+    setMenuData(prev => ({
+      ...prev,
+      items: [...prev.items, { id, categoryId: catId, name: '', description: '', price: 0, available: true }],
+    }));
+  };
+  const removeItem = (itemId: string) =>
+    setMenuData(prev => ({ ...prev, items: prev.items.filter(i => i.id !== itemId) }));
+  const updateItem = (itemId: string, patch: Partial<MenuItemRow>) =>
+    setMenuData(prev => ({ ...prev, items: prev.items.map(i => i.id === itemId ? { ...i, ...patch } : i) }));
 
   const patch = <K extends keyof WizardConfig>(section: K, updates: Partial<WizardConfig[K]>) =>
     setCfg(prev => ({ ...prev, [section]: { ...(prev[section] as object), ...updates } }));
@@ -132,6 +197,19 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
     setBusy(true);
     setError('');
     try {
+      const authHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${jwtToken}` };
+
+      // Save credentials first (custom_api only) — encrypted on the server
+      if (cfg.adapter.type === 'custom_api' && cfg.adapter.backendUrl) {
+        const cr = await fetch('/api/admin/save-credentials', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({ baseUrl: cfg.adapter.backendUrl, apiKey: cfg.adapter.apiKey || undefined }),
+        });
+        const crBody = await cr.json() as { ok?: boolean; error?: string };
+        if (!cr.ok || !crBody.ok) { setError(crBody.error ?? 'Failed to save credentials'); return; }
+      }
+
       const payload = {
         restaurantName: cfg.restaurantName,
         slug:           cfg.slug,
@@ -148,11 +226,21 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
       };
       const r = await fetch('/api/admin/save-config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwtToken}` },
+        headers: authHeaders,
         body: JSON.stringify(payload),
       });
       const body = await r.json() as { ok?: boolean; kioskUrl?: string; error?: string };
       if (!r.ok || !body.ok) { setError(body.error ?? 'Save failed'); return; }
+
+      // Save menu data for managed tenants that added items during onboarding
+      if (cfg.adapter.type === 'managed' && menuData.categories.length > 0) {
+        await fetch('/api/admin/menu', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify(menuData),
+        }).catch(() => undefined); // non-fatal
+      }
+
       onComplete(body.kioskUrl ?? `/kiosk/${cfg.slug}`);
     } catch {
       setError('Network error — please try again');
@@ -330,8 +418,73 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 3: AI Persona ─────────────────────────────────────────── */}
+          {/* ── Step 3: Menu ──────────────────────────────────────────────── */}
           {step === 3 && (
+            <div className="flex flex-col gap-4">
+              {cfg.adapter.type === 'custom_api' ? (
+                <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4">
+                  <p className="text-sm font-bold text-blue-800 mb-1">Menu comes from your API</p>
+                  <p className="text-xs text-blue-700 leading-relaxed">
+                    For Custom API adapters, the menu is fetched directly from your backend endpoint.
+                    No setup needed here — click Next to continue.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm opacity-60 leading-relaxed">
+                    Add your menu categories and items. You can edit or extend this any time from the Admin Dashboard → Menu tab.
+                  </p>
+
+                  {menuData.categories.map(cat => (
+                    <div key={cat.id} className="bg-white/60 rounded-2xl border border-[#5A5A40]/10 p-4 flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={cat.name}
+                          onChange={e => updateCategory(cat.id, { name: e.target.value })}
+                          className={INPUT + ' font-bold'}
+                          placeholder="Category name (e.g. Main Course)"
+                        />
+                        <button type="button" onClick={() => removeCategory(cat.id)}
+                          className="text-red-400 hover:text-red-600 text-xs px-2 shrink-0 cursor-pointer">✕</button>
+                      </div>
+
+                      {menuData.items.filter(i => i.categoryId === cat.id).map(item => (
+                        <div key={item.id} className="grid grid-cols-[1fr_1fr_80px_auto] gap-2 items-center">
+                          <input value={item.name}
+                            onChange={e => updateItem(item.id, { name: e.target.value })}
+                            className={INPUT} placeholder="Item name" />
+                          <input value={item.description}
+                            onChange={e => updateItem(item.id, { description: e.target.value })}
+                            className={INPUT} placeholder="Description" />
+                          <input type="number" min="0" step="0.01" value={item.price}
+                            onChange={e => updateItem(item.id, { price: Number(e.target.value) })}
+                            className={INPUT} placeholder="0.00" />
+                          <button type="button" onClick={() => removeItem(item.id)}
+                            className="text-red-400 hover:text-red-600 text-xs px-2 cursor-pointer">✕</button>
+                        </div>
+                      ))}
+
+                      <button type="button" onClick={() => addItem(cat.id)}
+                        className="self-start text-xs text-[#5A5A40] opacity-50 hover:opacity-90 mt-1 cursor-pointer">
+                        + Add item
+                      </button>
+                    </div>
+                  ))}
+
+                  <button type="button" onClick={addCategory}
+                    className="self-start px-4 py-2 border border-[#5A5A40]/20 rounded-xl text-sm text-[#5A5A40] hover:border-[#5A5A40]/50 transition cursor-pointer">
+                    + Add category
+                  </button>
+                  {menuData.categories.length === 0 && (
+                    <p className="text-xs opacity-40">You can skip this and add menu items later from the Admin Dashboard.</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── Step 4: AI Persona ─────────────────────────────────────────── */}
+          {step === 4 && (
             <div className="flex flex-col gap-4">
               <Field label="Agent Name" hint="How the AI introduces itself">
                 <input value={cfg.gemini.agentName}
@@ -339,17 +492,28 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
                   className={INPUT} placeholder="Savour Assistant" />
               </Field>
 
-              <Field label="Voice">
+              <Field label="Voice" hint="Click a name to select · ▶ to preview">
                 <div className="grid grid-cols-3 gap-2">
                   {VOICES.map(v => (
-                    <button key={v} type="button"
-                      onClick={() => patch('gemini', { voice: v })}
-                      className={`py-2 rounded-xl text-sm font-semibold border transition-all cursor-pointer ${
-                        cfg.gemini.voice === v
-                          ? 'bg-[#5A5A40] text-[#F8F7F2] border-[#5A5A40]'
-                          : 'border-[#5A5A40]/15 text-[#5A5A40] hover:border-[#5A5A40]/40'
-                      }`}
-                    >{v}</button>
+                    <div key={v} className="relative group">
+                      <button type="button"
+                        onClick={() => patch('gemini', { voice: v })}
+                        className={`w-full py-2 pr-7 rounded-xl text-sm font-semibold border transition-all cursor-pointer ${
+                          cfg.gemini.voice === v
+                            ? 'bg-[#5A5A40] text-[#F8F7F2] border-[#5A5A40]'
+                            : 'border-[#5A5A40]/15 text-[#5A5A40] hover:border-[#5A5A40]/40'
+                        }`}
+                      >{v}</button>
+                      <button
+                        type="button"
+                        onClick={e => { e.stopPropagation(); playVoicePreview(v); }}
+                        disabled={previewingVoice !== null}
+                        title="Preview voice"
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] opacity-50 hover:opacity-100 disabled:opacity-20 cursor-pointer transition"
+                      >
+                        {previewingVoice === v ? '…' : '▶'}
+                      </button>
+                    </div>
                   ))}
                 </div>
               </Field>
@@ -386,8 +550,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 4: Business Rules ─────────────────────────────────────── */}
-          {step === 4 && (
+          {/* ── Step 5: Business Rules ─────────────────────────────────────── */}
+          {step === 5 && (
             <div className="flex flex-col gap-5">
               <div className="flex gap-4 flex-wrap">
                 <Field label="GST / Tax Rate (%)">
@@ -435,8 +599,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 5: Launch ─────────────────────────────────────────────── */}
-          {step === 5 && (
+          {/* ── Step 6: Launch ─────────────────────────────────────────────── */}
+          {step === 6 && (
             <div className="flex flex-col gap-5">
               <div className="bg-white/60 rounded-2xl border border-[#5A5A40]/10 p-5 flex flex-col gap-3">
                 <Row label="Restaurant"  value={cfg.restaurantName} />

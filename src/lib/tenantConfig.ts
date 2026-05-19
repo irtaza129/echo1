@@ -4,8 +4,9 @@ import { z } from 'zod';
 const EndpointMappingSchema = z.object({
   operation:   z.string(),  // "resolveItem" | "getMenu" | "submitOrder" etc.
   method:      z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
-  url:         z.string().url(),
-  // Optional field-path overrides: maps our field name → their JSON path
+  // Relative path (e.g. "/api/menu") or absolute URL — resolved against baseUrl from credentials
+  path:        z.string(),
+  // Optional field-path overrides: maps our field name → their JSON path (dot notation)
   fieldMappings: z.record(z.string(), z.string()).optional(),
 });
 

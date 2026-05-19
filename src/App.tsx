@@ -11,6 +11,7 @@ import {
   generateSessionId,
   fetchMenuContext,
 } from './lib/geminiTools';
+import { tenantFetch } from './lib/apiClient';
 import { PromptBuilder } from './lib/PromptBuilder';
 import type { PromptConfig } from './lib/PromptBuilder';
 import type { TranscriptTurn, ToolCallRecord } from './lib/types';
@@ -20,6 +21,7 @@ import type { TranscriptTurn, ToolCallRecord } from './lib/types';
 // Shape of what GET /api/tenant-config/:slug returns (non-sensitive fields only).
 // Extends PromptConfig so PromptBuilder.build() accepts it directly.
 interface PublicTenantConfig extends PromptConfig {
+  tenantId?: string;
   branding: {
     primaryColor: string;
     logoUrl:      string;
@@ -64,12 +66,6 @@ const DEFAULT_TENANT_CONFIG: PublicTenantConfig = {
     loyaltyPoints:    false,
   },
 };
-
-// Derive tenant slug from kiosk URL: /kiosk/{slug} → slug, else 'savour-foods'.
-function getTenantSlug(): string {
-  const m = window.location.pathname.match(/^\/kiosk\/([a-z0-9-]+)/);
-  return m ? m[1] : 'savour-foods';
-}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -157,12 +153,14 @@ function getStatusLabel(status: AppStatus): string {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function App({
+  tenantSlug,
   onNavigateToDashboard,
   onNavigateToTranscripts,
   onNavigateToAdmin,
   onLogout,
   onTurnComplete,
 }: {
+  tenantSlug?:              string;
   onNavigateToDashboard?:  () => void;
   onNavigateToTranscripts?: () => void;
   onNavigateToAdmin?:       () => void;
@@ -180,6 +178,7 @@ export default function App({
 
   const sessionIdRef      = useRef<string>(generateSessionId());
   const tenantConfigRef   = useRef<PublicTenantConfig>(DEFAULT_TENANT_CONFIG);
+  const tenantIdRef       = useRef<string>('');
   const menuContextRef    = useRef<string>('');
   const sessionRef      = useRef<GeminiLiveSession | null>(null);
   const recorderRef     = useRef<AudioRecorder | null>(null);
@@ -217,50 +216,60 @@ export default function App({
       setStatus('IDLE');
     };
 
-    // Fetch tenant config (non-blocking — defaults keep the app usable immediately)
-    const slug = getTenantSlug();
+    // JWT prop takes precedence — authenticated users always see their own tenant's kiosk.
+    // URL slug is the fallback for unauthenticated direct access (e.g. customer scanning a QR code).
+    // Never read the URL first: the URL-sync effect in main.tsx fires AFTER this child effect,
+    // so window.location.pathname may still be stale at this point.
+    const urlSlug = window.location.pathname.match(/^\/kiosk\/([a-z0-9-]+)/)?.[1];
+    const slug = tenantSlug ?? urlSlug ?? 'savour-foods';
+
+    // Fetch tenant config first so we have the tenantId for all subsequent calls
     fetch(`/api/tenant-config/${slug}`)
       .then(r => r.ok ? r.json() as Promise<PublicTenantConfig> : Promise.reject(r.status))
-      .then(cfg => {
+      .then(async cfg => {
         setTenantConfig(cfg);
         tenantConfigRef.current = cfg;
+        const tid = cfg.tenantId ?? '';
+        tenantIdRef.current = tid;
         if (cfg.features.transcriptScreen) setTranscriptionEnabled(true);
-      })
-      .catch(err => console.warn('[TENANT] Failed to load config, using defaults:', err));
 
-    // Pre-load menu context for AI (non-blocking)
-    fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
+        // Pre-load menu context for Gemini (with tenant header)
+        fetchMenuContext(tid).then(ctx => { menuContextRef.current = ctx; });
 
-    // Structured menu for the UI grid — 3 attempts with backoff
-    const fetchMenuData = async () => {
-      const MAX_ATTEMPTS = 3;
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        try {
-          const r = await fetch('/api/menu');
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const data = await r.json() as MenuCategory[];
-          const dishes: MenuItem[] = [];
-          for (const cat of (Array.isArray(data) ? data : [])) {
-            for (const sub of (cat.sub_categories || [])) {
-              for (const dish of (sub.dishes || [])) {
-                dishes.push({ ...dish, category: cat.name });
+        // Structured menu for the UI grid — 3 attempts with backoff
+        const MAX_ATTEMPTS = 3;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          try {
+            const r = await tenantFetch('/api/menu', { tenantIdOverride: tid });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const data = await r.json() as MenuCategory[];
+            const dishes: MenuItem[] = [];
+            for (const cat of (Array.isArray(data) ? data : [])) {
+              for (const sub of (cat.sub_categories ?? [])) {
+                for (const dish of (sub.dishes ?? [])) dishes.push({ ...dish, category: cat.name });
+              }
+              // Also handle flat admin-panel format: { id, name, items[] }
+              const catAny = cat as unknown as { items?: MenuItem[] };
+              if (catAny.items) {
+                for (const item of catAny.items) dishes.push({ ...item, category: cat.name });
               }
             }
+            setMenu(dishes);
+            const cats = [...new Set(dishes.map(d => d.category))];
+            if (cats.length > 0) setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
+            return;
+          } catch (err) {
+            console.warn(`[MENU] fetch attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
+            if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
           }
-          setMenu(dishes);
-          const cats = [...new Set(dishes.map(d => d.category))];
-          if (cats.length > 0) {
-            setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
-          }
-          return;
-        } catch (err) {
-          console.warn(`[MENU] fetch attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
-          if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
         }
-      }
-      console.error('[MENU] Failed to load menu after all attempts');
-    };
-    fetchMenuData();
+        console.error('[MENU] Failed to load menu after all attempts');
+      })
+      .catch(err => {
+        console.warn('[TENANT] Failed to load config, using defaults:', err);
+        // Still try to load menu context with no tenant (defaults to Savour Foods)
+        fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
+      });
 
     return () => {
       recorderRef.current?.destroy();
@@ -277,9 +286,11 @@ export default function App({
     // Fetch a short-lived ephemeral token from the server.
     // The real GEMINI_API_KEY never leaves the server process — the browser
     // only ever sees this token, which expires in 60 seconds.
+    const tid = tenantIdRef.current;
+
     let ephemeralToken: string;
     try {
-      const r = await fetch('/api/gemini-token', { method: 'POST' });
+      const r = await tenantFetch('/api/gemini-token', { method: 'POST', tenantIdOverride: tid });
       if (!r.ok) throw new Error(`/api/gemini-token returned ${r.status}`);
       ({ ephemeralToken } = await r.json() as { ephemeralToken: string });
       if (!ephemeralToken) throw new Error('No ephemeralToken in server response');
@@ -289,7 +300,7 @@ export default function App({
     }
 
     if (!menuContextRef.current) {
-      menuContextRef.current = await fetchMenuContext();
+      menuContextRef.current = await fetchMenuContext(tenantIdRef.current || undefined);
     }
     const sysInstruction = PromptBuilder.build(tenantConfigRef.current, menuContextRef.current);
 
@@ -405,6 +416,17 @@ export default function App({
                   timestamp:      new Date().toISOString(),
                 });
               }
+              // Report usage metrics — fire-and-forget, only when there are tokens to record
+              if (buf.promptTokens > 0 || buf.responseTokens > 0) {
+                const jwt = sessionStorage.getItem('sf_jwt');
+                if (jwt) {
+                  fetch('/api/admin/report-usage', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwt}` },
+                    body:    JSON.stringify({ promptTokens: buf.promptTokens, responseTokens: buf.responseTokens, costUsd: buf.costUsd }),
+                  }).catch(() => undefined);
+                }
+              }
             }
 
             // Tool calls — dispatch all in parallel, always send a response
@@ -418,11 +440,18 @@ export default function App({
                   calls.map(async (call) => {
                     const args = call.args as Record<string, unknown>;
 
+                    // tenantFetch attaches Authorization (JWT) and X-Tenant-ID
+                    // automatically so the middleware can scope this call to
+                    // the right tenant — and 403 if they ever disagree.
+                    const agentTid = tenantIdRef.current;
+                    const agentH = { 'Content-Type': 'application/json' };
+
                     if (call.name === 'add_item') {
                       try {
-                        const res = await fetch('/api/agent/resolve-item', {
+                        const res = await tenantFetch('/api/agent/resolve-item', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({
                             session_id: sid,
                             dish_query: args.dish_query,
@@ -457,9 +486,10 @@ export default function App({
 
                     } else if (call.name === 'remove_item') {
                       try {
-                        await fetch('/api/agent/remove-item', {
+                        await tenantFetch('/api/agent/remove-item', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
                         });
                         setCart((prev: CartItem[]) => prev.filter((i: CartItem) => i.cart_item_id !== args.cart_item_id));
@@ -470,9 +500,10 @@ export default function App({
 
                     } else if (call.name === 'clear_cart') {
                       try {
-                        await fetch('/api/agent/clear-cart', {
+                        await tenantFetch('/api/agent/clear-cart', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({ session_id: sid }),
                         });
                         setCart([]);
@@ -493,11 +524,19 @@ export default function App({
                         const gst  = Math.round(sub * cfg.businessRules.gstRate);
                         const tot  = sub + gst;
 
-                        const raw = await fetch('/api/agent/submit-order', {
+                        const raw = await tenantFetch('/api/agent/submit-order', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({
                             session_id:     sid,
+                            cart_items:     currentCart.map(i => ({
+                              cart_item_id: i.cart_item_id,
+                              summary:      i.summary,
+                              quantity:     i.quantity,
+                              unit_price:   i.unit_price,
+                              notes:        i.notes ?? null,
+                            })),
                             customer_name:  args.customer_name  || 'Guest',
                             customer_phone: args.customer_phone || '0000000000',
                             order_type:     args.order_type     || 'dine_in',
@@ -658,11 +697,20 @@ export default function App({
       const sub = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
       const gst = Math.round(sub * cfg.businessRules.gstRate);
 
-      const raw = await fetch('/api/agent/submit-order', {
+      const tid = tenantIdRef.current;
+      const raw = await tenantFetch('/api/agent/submit-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        tenantIdOverride: tid,
         body: JSON.stringify({
           session_id:     sessionIdRef.current,
+          cart_items:     cart.map(i => ({
+            cart_item_id: i.cart_item_id,
+            summary:      i.summary,
+            quantity:     i.quantity,
+            unit_price:   i.unit_price,
+            notes:        i.notes ?? null,
+          })),
           customer_name:  'Guest',
           customer_phone: '0000000000',
           order_type:     'dine_in',

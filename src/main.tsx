@@ -6,6 +6,7 @@ import LoginScreen from './LoginScreen.tsx';
 import SignupScreen from './SignupScreen.tsx';
 import OnboardingWizard from './OnboardingWizard.tsx';
 import AdminDashboard from './AdminDashboard.tsx';
+import SuperAdminDashboard from './SuperAdminDashboard.tsx';
 import TranscriptScreen from './TranscriptScreen.tsx';
 import type { TranscriptTurn } from './lib/types';
 import './index.css';
@@ -43,7 +44,8 @@ type Screen =
   | 'kiosk'
   | 'dashboard'
   | 'transcripts'
-  | 'admin';
+  | 'admin'
+  | 'super_admin';
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
@@ -75,8 +77,10 @@ function Root() {
           const claims = decodeJwt(jwt);
           setJwtToken(jwt);
           setJwtClaims(claims);
+          setScreen(claims?.role === 'super_admin' ? 'super_admin' : 'kiosk');
+        } else {
+          setScreen('kiosk');
         }
-        setScreen('kiosk');
       })
       .catch(() => setScreen('login'));
   }, []);
@@ -85,13 +89,15 @@ function Root() {
 
   const handleLogin = (token: string, jwt?: string, role?: string, slug?: string) => {
     sessionStorage.setItem(TOKEN_KEY, token);
+    let effectiveRole = role;
     if (jwt) {
       sessionStorage.setItem(JWT_KEY, jwt);
       const claims = decodeJwt(jwt);
       setJwtToken(jwt);
       setJwtClaims(claims ?? { role: role ?? '', slug: slug ?? '', tenantId: '', sub: '' });
+      effectiveRole = claims?.role ?? role;
     }
-    setScreen('kiosk');
+    setScreen(effectiveRole === 'super_admin' ? 'super_admin' : 'kiosk');
   };
 
   const handleSignedUp = (jwt: string, slug: string) => {
@@ -118,6 +124,19 @@ function Root() {
     setConversationLog([]);
     setScreen('login');
   };
+
+  // ── URL sync ─────────────────────────────────────────────────────────────
+  // Keep the browser URL aligned with the logged-in tenant's kiosk slug.
+  // Without this, a stale URL like /kiosk/johnny-jugnu left from a previous
+  // session would feed the wrong slug to App when the Savour admin logs in.
+  useEffect(() => {
+    if (screen === 'kiosk' && jwtClaims?.slug && jwtClaims.slug !== 'super') {
+      const target = `/kiosk/${jwtClaims.slug}`;
+      if (window.location.pathname !== target) {
+        window.history.replaceState({}, '', target);
+      }
+    }
+  }, [screen, jwtClaims?.slug]);
 
   // ── Transcript ────────────────────────────────────────────────────────────
 
@@ -170,6 +189,15 @@ function Root() {
     );
   }
 
+  if (screen === 'super_admin') {
+    return (
+      <SuperAdminDashboard
+        jwtToken={jwtToken}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
   if (screen === 'dashboard') {
     return (
       <OrdersDashboard
@@ -190,8 +218,11 @@ function Root() {
 
   // Default: kiosk
   const adminRole = jwtClaims ? isAdmin(jwtClaims.role) : false;
+  // Pass slug so the kiosk loads the correct tenant config when accessed via the admin panel
+  // (URL may still be "/" rather than "/kiosk/{slug}" during in-app navigation)
   return (
     <App
+      tenantSlug={jwtClaims?.slug || undefined}
       onNavigateToDashboard={() => setScreen('dashboard')}
       onNavigateToTranscripts={() => setScreen('transcripts')}
       onNavigateToAdmin={adminRole ? () => setScreen('admin') : undefined}
