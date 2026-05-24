@@ -14,6 +14,14 @@ import { getRedis, redisKey, TTL } from './src/lib/redis.js';
 import { attachAdapter } from './middleware/tenant.js';
 import type { IRestaurantAdapter } from './adapter/IRestaurantAdapter.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
+import {
+  tenantsRepo,
+  tenantConfigsRepo,
+  credentialsRepo,
+  usersRepo,
+  auditRepo,
+  dualWrite,
+} from './src/lib/repo.js';
 
 dotenv.config();
 
@@ -261,17 +269,17 @@ async function writeAuditLog(tenantId: string, action: string, sub: string, deta
     await redis.lpush(key, entry);
     await redis.ltrim(key, 0, 499);
   } catch { /* non-fatal */ }
+  // Dual-write to Postgres — append-only, isolated from Redis success/failure.
+  void dualWrite('audit_log', auditRepo.append({ tenantId, actor: sub, action, details }));
 }
 
-// Ensure a tenant row exists in the FastAPI/Supabase operational DB.
-// Called at registration and before every menu sync — if the endpoint doesn't
-// exist yet the error is logged but not thrown (menu sync will surface its own error).
+// Ensure a tenant row exists in the relational source of truth (Supabase
+// `tenants`). Previously this called FastAPI's `/api/v1/admin/ensure-tenant`,
+// which 500s — the FK violations on category sync were the visible symptom.
+// We now write directly to the shared Supabase `tenants` table so both this
+// app and the FastAPI menu-sync flow are reading from the same row.
 async function ensureTenantInBackend(tenantId: string, slug: string, name: string, plan: string): Promise<void> {
-  await axios.post(
-    `${BACKEND_URL}/api/v1/admin/ensure-tenant`,
-    { slug, name, plan, status: 'active' },
-    { headers: { 'X-Tenant-ID': tenantId }, timeout: 20_000 },
-  );
+  await tenantsRepo.upsert({ id: tenantId, slug, name, plan, status: 'active' });
 }
 
 // Helper: propagate adapter errors with the correct HTTP status
@@ -502,10 +510,12 @@ async function startServer() {
 
       void writeAuditLog(tenantId, 'register', email.toLowerCase(), `slug=${slug} plan=${plan ?? 'starter'}`);
 
-      // Register tenant in the FastAPI operational DB (non-fatal — can be retried via Sync to AI)
-      ensureTenantInBackend(tenantId, slug, restaurantName, plan ?? 'starter').catch(err =>
-        console.warn('[AUTH] ensureTenantInBackend failed (non-fatal):', (err as Error).message)
-      );
+      // Dual-write registration into the relational source of truth so the
+      // tenant row, its config, and the admin user all exist in Postgres.
+      // Each is independent — a failure on one doesn't block the others.
+      void dualWrite('tenants.upsert',         tenantsRepo.upsert({ id: tenantId, slug, name: restaurantName, plan: plan ?? 'starter' }));
+      void dualWrite('tenant_configs.upsert',  tenantConfigsRepo.upsert(tenantId, config, email.toLowerCase()));
+      void dualWrite('platform_users.upsert',  usersRepo.upsert({ tenantId, email: email.toLowerCase(), passwordHash, role: 'tenant_admin' }));
 
       if (!process.env.JWT_SECRET) {
         res.status(500).json({ error: 'Server not configured for JWT auth' }); return;
@@ -659,6 +669,10 @@ async function startServer() {
       // Invalidate stale menu cache so next request re-fetches from backend
       await redis.del(redisKey.menuContext(tenantId)).catch(() => undefined);
       void writeAuditLog(tenantId, 'config_save', req.jwtPayload!.sub);
+      // Dual-write the config (and keep tenants.slug/name in sync — admins
+      // editing the restaurant name in the wizard should propagate to Postgres).
+      void dualWrite('tenant_configs.upsert', tenantConfigsRepo.upsert(tenantId, config, req.jwtPayload!.sub));
+      void dualWrite('tenants.upsert',        tenantsRepo.upsert({ id: tenantId, slug: config.slug, name: config.restaurantName, plan: config.plan }));
       console.log(`[ADMIN] Config saved for tenant ${tenantId}`);
       res.json({ ok: true, kioskUrl: `/kiosk/${config.slug}` });
     } catch (err) {
@@ -733,6 +747,7 @@ async function startServer() {
       const redis = getRedis();
       await redis.set(redisKey.credentialsKey(tenantId), blob);
       void writeAuditLog(tenantId, 'credentials_save', req.jwtPayload!.sub);
+      void dualWrite('adapter_credentials.upsert', credentialsRepo.upsert(tenantId, blob));
       res.json({ ok: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1023,10 +1038,15 @@ async function startServer() {
           configRaw?.plan  ?? 'starter',
         );
       } catch (ensureErr) {
+        // Surface the real error instead of masking it behind the downstream
+        // FK violation on categories. If we couldn't create the tenant row
+        // there's no point trying to insert child rows that depend on it.
         const ensureMsg = axios.isAxiosError(ensureErr)
           ? ((ensureErr.response?.data as { detail?: string })?.detail ?? ensureErr.message)
           : String(ensureErr);
-        console.warn('[MENU] ensure-tenant step failed (continuing to sync):', ensureMsg);
+        console.error('[MENU] ensure-tenant failed — aborting sync:', ensureMsg);
+        res.status(502).json({ ok: false, error: `ensure-tenant failed: ${ensureMsg}` });
+        return;
       }
 
       await axios.post(
