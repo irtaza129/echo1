@@ -1,5 +1,7 @@
 /**
- * geminiTools.ts  — AI tool declarations for the Savour Foods voice agent.
+ * geminiTools.ts  — AI tool declarations for the voice agent.
+ *
+ * System instruction is now built by PromptBuilder, not here.
  */
 
 import { Type, FunctionDeclaration } from "@google/genai";
@@ -119,17 +121,18 @@ export const allTools = [add_item, remove_item, clear_cart, confirm_order];
 
 // ── Menu context cache ────────────────────────────────────────────────────────
 
-const MENU_CACHE_KEY = 'savour_menu_context_v1';
 const MENU_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-interface MenuCacheEntry {
-  text: string;
-  cached_at: number;
+// Cache key is tenant-scoped so switching tenants never serves the wrong menu
+function cacheKey(tenantId?: string) {
+  return `menu_context_v2_${tenantId ?? 'default'}`;
 }
 
-function readCache(): string | null {
+interface MenuCacheEntry { text: string; cached_at: number }
+
+function readCache(tenantId?: string): string | null {
   try {
-    const raw = localStorage.getItem(MENU_CACHE_KEY);
+    const raw = localStorage.getItem(cacheKey(tenantId));
     if (!raw) return null;
     const entry: MenuCacheEntry = JSON.parse(raw);
     if (Date.now() - entry.cached_at > MENU_CACHE_TTL_MS) return null;
@@ -139,64 +142,36 @@ function readCache(): string | null {
   }
 }
 
-function writeCache(text: string): void {
+function writeCache(text: string, tenantId?: string): void {
   try {
-    const entry: MenuCacheEntry = { text, cached_at: Date.now() };
-    localStorage.setItem(MENU_CACHE_KEY, JSON.stringify(entry));
+    localStorage.setItem(cacheKey(tenantId), JSON.stringify({ text, cached_at: Date.now() } satisfies MenuCacheEntry));
   } catch {
     // localStorage may be unavailable (private mode, storage quota exceeded)
   }
 }
 
-export async function fetchMenuContext(): Promise<string> {
+export async function fetchMenuContext(tenantId?: string): Promise<string> {
+  const { tenantFetch } = await import('./apiClient');
   const MAX_ATTEMPTS = 4;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await fetch("/api/agent/menu-context");
+      const res = await tenantFetch('/api/agent/menu-context', { tenantIdOverride: tenantId });
       if (!res.ok) throw new Error(`status ${res.status}`);
       const text = await res.text();
       if (text.trimStart().startsWith('{')) throw new Error('backend returned error JSON');
-      writeCache(text);
+      writeCache(text, tenantId);
       return text;
     } catch (err) {
       console.warn(`[MENU] fetchMenuContext attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
       if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
     }
   }
-  const cached = readCache();
+  const cached = readCache(tenantId);
   if (cached) {
     console.warn('[MENU] fetchMenuContext: using cached menu context (all attempts failed)');
     return cached;
   }
   console.error('[MENU] fetchMenuContext: all attempts exhausted, no cache available');
-  return "";
+  return '';
 }
 
-export function buildSystemInstruction(menuContext: string): string {
-  return `You are the voice-ordering assistant for a Savour Foods kiosk in Islamabad.
-Your ONLY role is to help customers place their order using the official menu below.
-
-${menuContext}
-
-LANGUAGE:
-- Understand and respond in English, Urdu, and Roman Urdu.
-- "Aik special choice pulao, leg aur chest piece, boxed" → add_item("special choice pulao", ["leg piece", "chest piece", "boxed"])
-- "Cola Next" or "Colla Next" is the cola drink (NOT Pepsi or Coke — those brands are not sold here).
-- "Fizzup" or "Fizz Up" is the lemon/lime drink.
-
-DRINK RULES:
-- When a customer says "cola" or "coke"  → use "Cola Next" as the modifier.
-- When a customer says "sprite" or "7up" → use "Fizzup" as the modifier.
-- When a customer says "water"            → use "Savour Mineral Water" as the modifier.
-
-ORDERING RULES:
-1. Do NOT speak first. Wait for the customer to place an order.
-2. When a customer orders an item, immediately call add_item with everything they said.
-3. If add_item returns status="requires_input", speak the ai_instruction naturally to the customer.
-4. Once they answer, call add_item again with the full modifiers list (both old and new answers).
-5. When the customer is finished, read back a brief summary of their order and total, then ask for confirmation.
-6. Only call confirm_order after they say yes/confirm/theek hai.
-7. Be EXTREMELY concise. Confirm items with 2-3 words max once added successfully.
-8. Never mention GST or tax unless asked (it is 15%, added at checkout).
-`;
-}

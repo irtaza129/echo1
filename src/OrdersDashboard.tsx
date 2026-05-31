@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { tenantFetch, getCurrentTenant } from './lib/apiClient';
 
 type SelectedOption = {
   option_name: string;
@@ -179,7 +180,7 @@ function ColumnHeader({
   );
 }
 
-export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
+export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => void; onLogout?: () => void }) {
   const [incomingOrders,  setIncomingOrders]  = useState<Order[]>([]);
   const [preparingOrders, setPreparingOrders] = useState<Order[]>([]);
   const [readyOrders,     setReadyOrders]     = useState<Order[]>([]);
@@ -191,11 +192,21 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
     setLoading(true);
     setError(null);
     try {
+      // Refuse to fetch when we don't know which tenant we're scoped to —
+      // otherwise the server falls back to Savour and we'd show the wrong
+      // restaurant's orders on the kitchen dashboard.
+      const { tenantId } = getCurrentTenant();
+      if (!tenantId) {
+        setError('Not signed in — please log in to view your orders.');
+        setLoading(false);
+        return;
+      }
+
       const [pendingRes, confirmedRes, preparingRes, readyRes] = await Promise.all([
-        fetch('/api/orders?status=pending&per_page=50').then(r => r.json()),
-        fetch('/api/orders?status=confirmed&per_page=50').then(r => r.json()),
-        fetch('/api/orders?status=preparing&per_page=50').then(r => r.json()),
-        fetch('/api/orders?status=ready&per_page=50').then(r => r.json()),
+        tenantFetch('/api/orders?status=pending&per_page=50').then(r => r.json()),
+        tenantFetch('/api/orders?status=confirmed&per_page=50').then(r => r.json()),
+        tenantFetch('/api/orders?status=preparing&per_page=50').then(r => r.json()),
+        tenantFetch('/api/orders?status=ready&per_page=50').then(r => r.json()),
       ]);
 
       const extract = (res: any): Order[] =>
@@ -229,7 +240,7 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
     const steps = TRANSITION_STEPS[key] ?? [target];
     try {
       for (const step of steps) {
-        const r = await fetch(`/api/orders/${orderId}/status`, {
+        const r = await tenantFetch(`/api/orders/${orderId}/status`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: step }),
@@ -258,6 +269,17 @@ export default function OrdersDashboard({ onBack }: { onBack: () => void }) {
           >
             ← Kiosk
           </button>
+          {onLogout && (
+            <>
+              <div className="w-px h-5 bg-[#5A5A40]/20" />
+              <button
+                onClick={onLogout}
+                className="text-xs uppercase tracking-widest text-red-500 opacity-70 hover:opacity-100 cursor-pointer transition-opacity font-semibold"
+              >
+                Sign Out
+              </button>
+            </>
+          )}
           <div className="w-px h-6 bg-[#5A5A40]/20" />
           <div>
             <h1 className="text-lg md:text-xl lg:text-2xl font-serif font-bold text-[#5A5A40]">

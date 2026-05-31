@@ -1,27 +1,42 @@
 import { useState } from 'react';
 
-export default function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
+interface LoginResponse {
+  token?:    string;
+  jwtToken?: string;
+  role?:     string;
+  slug?:     string;
+  error?:    string;
+}
+
+interface Props {
+  onLogin:         (token: string, jwtToken?: string, role?: string, slug?: string) => void;
+  onCreateAccount: () => void;
+}
+
+export default function LoginScreen({ onLogin, onCreateAccount }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error,    setError]    = useState('');
   const [loading,  setLoading]  = useState(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
       const r = await fetch('/api/auth/login', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        // Support both legacy username and email-based login
+        body: JSON.stringify({ username, email: username, password }),
       });
-      const body = await r.json() as { token?: string; error?: string };
+      const body = await r.json() as LoginResponse;
       if (!r.ok) {
         setError(body.error || 'Invalid credentials');
         return;
       }
-      onLogin(body.token!);
+      if (body.jwtToken) sessionStorage.setItem('sf_jwt', body.jwtToken);
+      onLogin(body.token!, body.jwtToken, body.role, body.slug);
     } catch {
       setError('Connection error — please try again');
     } finally {
@@ -35,9 +50,9 @@ export default function LoginScreen({ onLogin }: { onLogin: (token: string) => v
 
         {/* Branding */}
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-serif font-bold text-[#5A5A40]">SAVOUR FOODS</h1>
+          <h1 className="text-3xl font-serif font-bold text-[#5A5A40]">Voice Kiosk</h1>
           <p className="text-[10px] tracking-widest uppercase opacity-40 mt-1.5">
-            Staff Portal · Islamabad
+            Staff Portal
           </p>
         </div>
 
@@ -55,7 +70,7 @@ export default function LoginScreen({ onLogin }: { onLogin: (token: string) => v
               htmlFor="sf-username"
               className="text-[11px] uppercase tracking-widest opacity-50 font-semibold"
             >
-              Username
+              Username or Email
             </label>
             <input
               id="sf-username"
@@ -65,7 +80,7 @@ export default function LoginScreen({ onLogin }: { onLogin: (token: string) => v
               autoComplete="username"
               autoFocus
               required
-              placeholder="Enter username"
+              placeholder="Enter username or email"
               className="w-full bg-white/80 border border-[#5A5A40]/15 rounded-xl px-4 py-3 text-sm text-[#3D3D33] placeholder:opacity-30 focus:outline-none focus:ring-2 focus:ring-[#5A5A40]/25 transition"
             />
           </div>
@@ -100,6 +115,17 @@ export default function LoginScreen({ onLogin }: { onLogin: (token: string) => v
           >
             {loading ? 'Signing in…' : 'Sign In'}
           </button>
+
+          <p className="text-center text-xs opacity-50">
+            Don't have an account?{' '}
+            <button
+              type="button"
+              onClick={onCreateAccount}
+              className="underline cursor-pointer hover:opacity-80"
+            >
+              Create one
+            </button>
+          </p>
         </form>
 
       </div>

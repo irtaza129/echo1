@@ -10,9 +10,62 @@ import {
   allTools,
   generateSessionId,
   fetchMenuContext,
-  buildSystemInstruction,
 } from './lib/geminiTools';
+import { tenantFetch } from './lib/apiClient';
+import { PromptBuilder } from './lib/PromptBuilder';
+import type { PromptConfig } from './lib/PromptBuilder';
 import type { TranscriptTurn, ToolCallRecord } from './lib/types';
+
+// ── Tenant config ─────────────────────────────────────────────────────────────
+
+// Shape of what GET /api/tenant-config/:slug returns (non-sensitive fields only).
+// Extends PromptConfig so PromptBuilder.build() accepts it directly.
+interface PublicTenantConfig extends PromptConfig {
+  tenantId?: string;
+  branding: {
+    primaryColor: string;
+    logoUrl:      string;
+    kioskTitle:   string;
+  };
+  businessRules: {
+    gstRate:            number;
+    currencySymbol:     string;
+    orderStatusMachine: string[];
+  };
+  features: {
+    deliveryOrders:   boolean;
+    tableNumbers:     boolean;
+    transcriptScreen: boolean;
+    loyaltyPoints:    boolean;
+  };
+}
+
+// Fallback used while the fetch is in-flight and on fetch failure.
+const DEFAULT_TENANT_CONFIG: PublicTenantConfig = {
+  restaurantName: 'Savour Foods',
+  gemini: {
+    agentName:          'Savour Assistant',
+    voice:              'Puck',
+    languages:          ['en', 'ur', 'roman-ur'],
+    systemPromptExtras: '',
+  },
+  branding: {
+    primaryColor: '#C8102E',
+    logoUrl:      '',
+    kioskTitle:   'Welcome to Savour Foods',
+  },
+  businessRules: {
+    gstRate:            0.15,
+    currencySymbol:     'PKR',
+    orderStatusMachine: ['pending','confirmed','preparing','ready','out_for_delivery','delivered'],
+  },
+  features: {
+    deliveryOrders:   false,
+    tableNumbers:     true,
+    transcriptScreen: true,
+    loyaltyPoints:    false,
+  },
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -100,14 +153,21 @@ function getStatusLabel(status: AppStatus): string {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function App({
+  tenantSlug,
   onNavigateToDashboard,
   onNavigateToTranscripts,
+  onNavigateToAdmin,
+  onLogout,
   onTurnComplete,
 }: {
-  onNavigateToDashboard?: () => void;
+  tenantSlug?:              string;
+  onNavigateToDashboard?:  () => void;
   onNavigateToTranscripts?: () => void;
-  onTurnComplete?: (turn: TranscriptTurn) => void;
+  onNavigateToAdmin?:       () => void;
+  onLogout?:                () => void;
+  onTurnComplete?:          (turn: TranscriptTurn) => void;
 }) {
+  const [tenantConfig, setTenantConfig] = useState<PublicTenantConfig>(DEFAULT_TENANT_CONFIG);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [menu, setMenu] = useState<MenuItem[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('');
@@ -116,8 +176,10 @@ export default function App({
   const [showMobileCart, setShowMobileCart] = useState(false);
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
 
-  const sessionIdRef    = useRef<string>(generateSessionId());
-  const menuContextRef  = useRef<string>('');
+  const sessionIdRef      = useRef<string>(generateSessionId());
+  const tenantConfigRef   = useRef<PublicTenantConfig>(DEFAULT_TENANT_CONFIG);
+  const tenantIdRef       = useRef<string>('');
+  const menuContextRef    = useRef<string>('');
   const sessionRef      = useRef<GeminiLiveSession | null>(null);
   const recorderRef     = useRef<AudioRecorder | null>(null);
   const playerRef       = useRef<AudioPlayer | null>(null);
@@ -136,6 +198,9 @@ export default function App({
 
   const isRecording = status === 'RECORDING';
 
+  // Keep tenantConfigRef in sync for connectToGemini closures (avoids stale config)
+  useEffect(() => { tenantConfigRef.current = tenantConfig; }, [tenantConfig]);
+
   // Keep cartRef in sync so the confirm_order closure always sees current cart
   useEffect(() => { cartRef.current = cart; }, [cart]);
 
@@ -151,39 +216,60 @@ export default function App({
       setStatus('IDLE');
     };
 
-    // Pre-load menu context for AI (non-blocking)
-    fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
+    // JWT prop takes precedence — authenticated users always see their own tenant's kiosk.
+    // URL slug is the fallback for unauthenticated direct access (e.g. customer scanning a QR code).
+    // Never read the URL first: the URL-sync effect in main.tsx fires AFTER this child effect,
+    // so window.location.pathname may still be stale at this point.
+    const urlSlug = window.location.pathname.match(/^\/kiosk\/([a-z0-9-]+)/)?.[1];
+    const slug = tenantSlug ?? urlSlug ?? 'savour-foods';
 
-    // Structured menu for the UI grid — 3 attempts with backoff
-    const fetchMenuData = async () => {
-      const MAX_ATTEMPTS = 3;
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        try {
-          const r = await fetch('/api/menu');
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const data = await r.json() as MenuCategory[];
-          const dishes: MenuItem[] = [];
-          for (const cat of (Array.isArray(data) ? data : [])) {
-            for (const sub of (cat.sub_categories || [])) {
-              for (const dish of (sub.dishes || [])) {
-                dishes.push({ ...dish, category: cat.name });
+    // Fetch tenant config first so we have the tenantId for all subsequent calls
+    fetch(`/api/tenant-config/${slug}`)
+      .then(r => r.ok ? r.json() as Promise<PublicTenantConfig> : Promise.reject(r.status))
+      .then(async cfg => {
+        setTenantConfig(cfg);
+        tenantConfigRef.current = cfg;
+        const tid = cfg.tenantId ?? '';
+        tenantIdRef.current = tid;
+        if (cfg.features.transcriptScreen) setTranscriptionEnabled(true);
+
+        // Pre-load menu context for Gemini (with tenant header)
+        fetchMenuContext(tid).then(ctx => { menuContextRef.current = ctx; });
+
+        // Structured menu for the UI grid — 3 attempts with backoff
+        const MAX_ATTEMPTS = 3;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          try {
+            const r = await tenantFetch('/api/menu', { tenantIdOverride: tid });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const data = await r.json() as MenuCategory[];
+            const dishes: MenuItem[] = [];
+            for (const cat of (Array.isArray(data) ? data : [])) {
+              for (const sub of (cat.sub_categories ?? [])) {
+                for (const dish of (sub.dishes ?? [])) dishes.push({ ...dish, category: cat.name });
+              }
+              // Also handle flat admin-panel format: { id, name, items[] }
+              const catAny = cat as unknown as { items?: MenuItem[] };
+              if (catAny.items) {
+                for (const item of catAny.items) dishes.push({ ...item, category: cat.name });
               }
             }
+            setMenu(dishes);
+            const cats = [...new Set(dishes.map(d => d.category))];
+            if (cats.length > 0) setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
+            return;
+          } catch (err) {
+            console.warn(`[MENU] fetch attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
+            if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
           }
-          setMenu(dishes);
-          const cats = [...new Set(dishes.map(d => d.category))];
-          if (cats.length > 0) {
-            setSelectedCategory(prev => (prev && cats.includes(prev)) ? prev : cats[0]);
-          }
-          return;
-        } catch (err) {
-          console.warn(`[MENU] fetch attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
-          if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
         }
-      }
-      console.error('[MENU] Failed to load menu after all attempts');
-    };
-    fetchMenuData();
+        console.error('[MENU] Failed to load menu after all attempts');
+      })
+      .catch(err => {
+        console.warn('[TENANT] Failed to load config, using defaults:', err);
+        // Still try to load menu context with no tenant (defaults to Savour Foods)
+        fetchMenuContext().then(ctx => { menuContextRef.current = ctx; });
+      });
 
     return () => {
       recorderRef.current?.destroy();
@@ -200,9 +286,11 @@ export default function App({
     // Fetch a short-lived ephemeral token from the server.
     // The real GEMINI_API_KEY never leaves the server process — the browser
     // only ever sees this token, which expires in 60 seconds.
+    const tid = tenantIdRef.current;
+
     let ephemeralToken: string;
     try {
-      const r = await fetch('/api/gemini-token', { method: 'POST' });
+      const r = await tenantFetch('/api/gemini-token', { method: 'POST', tenantIdOverride: tid });
       if (!r.ok) throw new Error(`/api/gemini-token returned ${r.status}`);
       ({ ephemeralToken } = await r.json() as { ephemeralToken: string });
       if (!ephemeralToken) throw new Error('No ephemeralToken in server response');
@@ -212,9 +300,9 @@ export default function App({
     }
 
     if (!menuContextRef.current) {
-      menuContextRef.current = await fetchMenuContext();
+      menuContextRef.current = await fetchMenuContext(tenantIdRef.current || undefined);
     }
-    const sysInstruction = buildSystemInstruction(menuContextRef.current);
+    const sysInstruction = PromptBuilder.build(tenantConfigRef.current, menuContextRef.current);
 
     // Ephemeral tokens only work with v1alpha of the Gemini Live API.
     const ai = new GoogleGenAI({ apiKey: ephemeralToken, httpOptions: { apiVersion: 'v1alpha' } });
@@ -235,7 +323,7 @@ export default function App({
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: tenantConfigRef.current.gemini.voice } },
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
@@ -328,6 +416,17 @@ export default function App({
                   timestamp:      new Date().toISOString(),
                 });
               }
+              // Report usage metrics — fire-and-forget, only when there are tokens to record
+              if (buf.promptTokens > 0 || buf.responseTokens > 0) {
+                const jwt = sessionStorage.getItem('sf_jwt');
+                if (jwt) {
+                  fetch('/api/admin/report-usage', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwt}` },
+                    body:    JSON.stringify({ promptTokens: buf.promptTokens, responseTokens: buf.responseTokens, costUsd: buf.costUsd }),
+                  }).catch(() => undefined);
+                }
+              }
             }
 
             // Tool calls — dispatch all in parallel, always send a response
@@ -341,11 +440,18 @@ export default function App({
                   calls.map(async (call) => {
                     const args = call.args as Record<string, unknown>;
 
+                    // tenantFetch attaches Authorization (JWT) and X-Tenant-ID
+                    // automatically so the middleware can scope this call to
+                    // the right tenant — and 403 if they ever disagree.
+                    const agentTid = tenantIdRef.current;
+                    const agentH = { 'Content-Type': 'application/json' };
+
                     if (call.name === 'add_item') {
                       try {
-                        const res = await fetch('/api/agent/resolve-item', {
+                        const res = await tenantFetch('/api/agent/resolve-item', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({
                             session_id: sid,
                             dish_query: args.dish_query,
@@ -380,9 +486,10 @@ export default function App({
 
                     } else if (call.name === 'remove_item') {
                       try {
-                        await fetch('/api/agent/remove-item', {
+                        await tenantFetch('/api/agent/remove-item', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
                         });
                         setCart((prev: CartItem[]) => prev.filter((i: CartItem) => i.cart_item_id !== args.cart_item_id));
@@ -393,9 +500,10 @@ export default function App({
 
                     } else if (call.name === 'clear_cart') {
                       try {
-                        await fetch('/api/agent/clear-cart', {
+                        await tenantFetch('/api/agent/clear-cart', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({ session_id: sid }),
                         });
                         setCart([]);
@@ -410,15 +518,25 @@ export default function App({
                         if (currentCart.length === 0) {
                           return { id: call.id, name: call.name, response: { error: 'Cart is empty.' } };
                         }
+                        const cfg  = tenantConfigRef.current;
+                        const cur  = cfg.businessRules.currencySymbol;
                         const sub  = currentCart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
-                        const gst  = Math.round(sub * 0.15);
+                        const gst  = Math.round(sub * cfg.businessRules.gstRate);
                         const tot  = sub + gst;
 
-                        const raw = await fetch('/api/agent/submit-order', {
+                        const raw = await tenantFetch('/api/agent/submit-order', {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: agentH,
+                          tenantIdOverride: agentTid,
                           body: JSON.stringify({
                             session_id:     sid,
+                            cart_items:     currentCart.map(i => ({
+                              cart_item_id: i.cart_item_id,
+                              summary:      i.summary,
+                              quantity:     i.quantity,
+                              unit_price:   i.unit_price,
+                              notes:        i.notes ?? null,
+                            })),
                             customer_name:  args.customer_name  || 'Guest',
                             customer_phone: args.customer_phone || '0000000000',
                             order_type:     args.order_type     || 'dine_in',
@@ -435,9 +553,10 @@ export default function App({
                           const lines = currentCart.map(i =>
                             `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`
                           ).join(', ');
+                          const gstLabel = gst > 0 ? ` GST ${cur} ${gst},` : '';
                           const confirmMsg =
                             `Order confirmed! Order number ${orderId}. ${lines}. ` +
-                            `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${tot}. Shukriya!`;
+                            `Subtotal ${cur} ${sub},${gstLabel} Total ${cur} ${tot}. Shukriya!`;
                           setCart([]);
                           setStatus('ORDER_CONFIRMED');
                           setTimeout(() => setStatus('IDLE'), 5000);
@@ -573,14 +692,25 @@ export default function App({
     if (cart.length === 0) return;
     setStatus('SUBMITTING');
     try {
+      const cfg = tenantConfigRef.current;
+      const cur = cfg.businessRules.currencySymbol;
       const sub = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
-      const gst = Math.round(sub * 0.15);
+      const gst = Math.round(sub * cfg.businessRules.gstRate);
 
-      const raw = await fetch('/api/agent/submit-order', {
+      const tid = tenantIdRef.current;
+      const raw = await tenantFetch('/api/agent/submit-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        tenantIdOverride: tid,
         body: JSON.stringify({
           session_id:     sessionIdRef.current,
+          cart_items:     cart.map(i => ({
+            cart_item_id: i.cart_item_id,
+            summary:      i.summary,
+            quantity:     i.quantity,
+            unit_price:   i.unit_price,
+            notes:        i.notes ?? null,
+          })),
           customer_name:  'Guest',
           customer_phone: '0000000000',
           order_type:     'dine_in',
@@ -593,9 +723,10 @@ export default function App({
       const orderId = res.id ?? res.order_id ?? res.order_number;
       if (orderId) {
         const lines = cart.map(i => `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`).join(', ');
+        const gstLabel = gst > 0 ? ` GST ${cur} ${gst},` : '';
         const confirmMsg =
           `Order confirmed! Order number ${orderId}. ${lines}. ` +
-          `Subtotal PKR ${sub}, GST PKR ${gst}, Total PKR ${sub + gst}. Shukriya!`;
+          `Subtotal ${cur} ${sub},${gstLabel} Total ${cur} ${sub + gst}. Shukriya!`;
         setCart([]);
         setStatus('ORDER_CONFIRMED');
         setTimeout(() => setStatus('IDLE'), 5000);
@@ -622,8 +753,10 @@ export default function App({
   const categories = [...new Set(menu.map((m: MenuItem) => m.category))];
   const filteredItems = menu.filter((item: MenuItem) => item.category === selectedCategory);
   const subtotal = cart.reduce((sum: number, item: CartItem) => sum + item.unit_price * item.quantity, 0);
-  const gst   = Math.round(subtotal * 0.15);
-  const total = subtotal + gst;
+  const gstRate  = tenantConfig.businessRules.gstRate;
+  const currency = tenantConfig.businessRules.currencySymbol;
+  const gst      = Math.round(subtotal * gstRate);
+  const total    = subtotal + gst;
 
   return (
     <div className="flex flex-col lg:flex-row h-full overflow-hidden select-none bg-[#F8F7F2]">
@@ -631,8 +764,8 @@ export default function App({
       {/* ── Mobile top bar ── */}
       <div className="lg:hidden flex items-center justify-between px-4 py-3 border-b border-[#5A5A40]/10 shrink-0">
         <div>
-          <h1 className="text-base font-serif font-bold text-[#5A5A40] leading-tight">SAVOUR FOODS</h1>
-          <p className="text-[9px] tracking-widest uppercase opacity-50">Islamabad / Blue Area</p>
+          <h1 className="text-base font-serif font-bold text-[#5A5A40] leading-tight">{tenantConfig.restaurantName.toUpperCase()}</h1>
+          <p className="text-[9px] tracking-widest uppercase opacity-50">{tenantConfig.branding.kioskTitle}</p>
         </div>
         <div className="flex items-center gap-3">
           {onNavigateToDashboard && (
@@ -686,10 +819,10 @@ export default function App({
       <aside className="hidden lg:flex lg:w-60 shrink-0 flex-col overflow-hidden border-r border-[#5A5A40]/10">
         <div className="px-5 pt-6 pb-4 shrink-0">
           <h1 className="text-xl lg:text-2xl font-serif font-bold text-[#5A5A40] leading-tight">
-            SAVOUR FOODS
+            {tenantConfig.restaurantName.toUpperCase()}
           </h1>
           <p className="text-[10px] tracking-widest uppercase opacity-50 mt-0.5">
-            Islamabad / Blue Area
+            {tenantConfig.branding.kioskTitle}
           </p>
         </div>
 
@@ -731,12 +864,34 @@ export default function App({
         )}
 
         {onNavigateToTranscripts && (
-          <div className="px-3 pb-3 shrink-0">
+          <div className="px-3 pb-1 shrink-0">
             <button
               onClick={onNavigateToTranscripts}
               className="w-full py-2.5 glass-panel rounded-xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
             >
               Transcript →
+            </button>
+          </div>
+        )}
+
+        {onNavigateToAdmin && (
+          <div className="px-3 pb-1 shrink-0">
+            <button
+              onClick={onNavigateToAdmin}
+              className="w-full py-2.5 glass-panel rounded-xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
+            >
+              Admin →
+            </button>
+          </div>
+        )}
+
+        {onLogout && (
+          <div className="px-3 pb-1 shrink-0">
+            <button
+              onClick={onLogout}
+              className="w-full py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest text-red-500 border border-red-200 hover:bg-red-50 transition-colors cursor-pointer"
+            >
+              Sign Out
             </button>
           </div>
         )}
@@ -940,7 +1095,7 @@ export default function App({
                     )}
                   </div>
                   <span className="font-mono text-sm text-[#5A5A40] whitespace-nowrap shrink-0 font-semibold">
-                    PKR {Math.round(item.unit_price * item.quantity)}
+                    {currency} {Math.round(item.unit_price * item.quantity)}
                   </span>
                 </div>
               ))
@@ -950,15 +1105,17 @@ export default function App({
           <div className="mx-3 mb-3 bg-[#5A5A40] text-[#F8F7F2] rounded-2xl p-4 lg:p-5 shrink-0">
             <div className="flex justify-between mb-2 opacity-75">
               <span className="text-sm">Subtotal</span>
-              <span className="text-sm font-mono">PKR {subtotal}</span>
+              <span className="text-sm font-mono">{currency} {subtotal}</span>
             </div>
-            <div className="flex justify-between mb-3 opacity-75">
-              <span className="text-sm">GST (15%)</span>
-              <span className="text-sm font-mono">PKR {gst}</span>
-            </div>
+            {gstRate > 0 && (
+              <div className="flex justify-between mb-3 opacity-75">
+                <span className="text-sm">GST ({Math.round(gstRate * 100)}%)</span>
+                <span className="text-sm font-mono">{currency} {gst}</span>
+              </div>
+            )}
             <div className="flex justify-between items-end border-t border-white/20 pt-3 mb-4">
               <span className="text-base font-serif">Total</span>
-              <span className="text-xl font-bold font-mono">PKR {total}</span>
+              <span className="text-xl font-bold font-mono">{currency} {total}</span>
             </div>
 
             <button
@@ -1031,7 +1188,7 @@ export default function App({
                       )}
                     </div>
                     <span className="font-mono text-sm text-[#5A5A40] whitespace-nowrap shrink-0 font-semibold">
-                      PKR {Math.round(item.unit_price * item.quantity)}
+                      {currency} {Math.round(item.unit_price * item.quantity)}
                     </span>
                   </div>
                 ))
@@ -1040,15 +1197,17 @@ export default function App({
             <div className="mx-3 mb-3 bg-[#5A5A40] text-[#F8F7F2] rounded-2xl p-4 shrink-0">
               <div className="flex justify-between mb-2 opacity-75">
                 <span className="text-sm">Subtotal</span>
-                <span className="text-sm font-mono">PKR {subtotal}</span>
+                <span className="text-sm font-mono">{currency} {subtotal}</span>
               </div>
-              <div className="flex justify-between mb-3 opacity-75">
-                <span className="text-sm">GST (15%)</span>
-                <span className="text-sm font-mono">PKR {gst}</span>
-              </div>
+              {gstRate > 0 && (
+                <div className="flex justify-between mb-3 opacity-75">
+                  <span className="text-sm">GST ({Math.round(gstRate * 100)}%)</span>
+                  <span className="text-sm font-mono">{currency} {gst}</span>
+                </div>
+              )}
               <div className="flex justify-between items-end border-t border-white/20 pt-3 mb-4">
                 <span className="text-base font-serif">Total</span>
-                <span className="text-xl font-bold font-mono">PKR {total}</span>
+                <span className="text-xl font-bold font-mono">{currency} {total}</span>
               </div>
               <button
                 onClick={() => { submitOrder(); setShowMobileCart(false); }}
