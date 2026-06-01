@@ -7,7 +7,7 @@ interface FullConfig {
   slug:           string;
   restaurantName: string;
   plan:           string;
-  adapter:        { type: string };
+  adapter:        { type: string; endpointMappings?: EndpointMappingDraft[] };
   gemini: {
     agentName:          string;
     voice:              string;
@@ -39,7 +39,12 @@ interface Props {
   onNavigateToDashboard: () => void;
 }
 
-type Tab = 'overview' | 'config' | 'menu' | 'connection' | 'usage' | 'audit';
+type Tab = 'overview' | 'config' | 'menu' | 'connection' | 'usage' | 'audit' | 'staff';
+
+interface StaffMember {
+  email: string;
+  role:  string;
+}
 
 interface MenuCategoryRow { id: string; name: string; sortOrder: number }
 interface MenuItemRow     { id: string; categoryId: string; name: string; description: string; price: number; available: boolean }
@@ -59,6 +64,37 @@ interface AuditEntry {
   sub:      string;
   tenantId: string;
   details?: string;
+}
+
+interface EndpointMappingDraft {
+  operation:     string;
+  method:        'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  path:          string;
+  fieldMappings: Record<string, string>;
+}
+
+const ENDPOINT_OPERATIONS = [
+  { key: 'getMenuForUI',      label: 'Menu (kiosk display)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/menu' },
+  { key: 'resolveItem',       label: 'Add to Cart',            defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/resolve-item' },
+  { key: 'submitOrder',       label: 'Submit Order',           defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/submit-order' },
+  { key: 'getOrders',         label: 'Get Orders (kitchen)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/orders' },
+  { key: 'updateOrderStatus', label: 'Update Order Status',    defaultMethod: 'PATCH' as const, defaultPath: '/api/v1/orders' },
+  { key: 'getMenuContext',    label: 'AI Menu Context',        defaultMethod: 'GET'   as const, defaultPath: '/api/v1/agent/menu-context' },
+];
+
+const RESOLVE_ITEM_MAP_FIELDS = [
+  { key: 'status',         hint: '"ok" / "not_found" / "requires_input"' },
+  { key: 'cart_item_id',   hint: 'Unique item ID for remove operations' },
+  { key: 'unit_price',     hint: 'Item price as a number' },
+  { key: 'summary',        hint: 'Item display name / description' },
+  { key: 'ai_instruction', hint: 'Prompt text when requires_input' },
+];
+
+function getEffectiveMappings(adapter: { endpointMappings?: EndpointMappingDraft[] }): EndpointMappingDraft[] {
+  return ENDPOINT_OPERATIONS.map(opDef => {
+    const saved = adapter.endpointMappings?.find(m => m.operation === opDef.key);
+    return saved ?? { operation: opDef.key, method: opDef.defaultMethod, path: opDef.defaultPath, fieldMappings: {} };
+  });
 }
 
 const VOICES = ['Puck','Zephyr','Charon','Kore','Fenrir','Aoede','Orbit','Umbriel','Algieba'];
@@ -102,6 +138,16 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   const menuUid = useId();
 
   const authHeaders = { Authorization: `Bearer ${jwtToken}`, 'Content-Type': 'application/json' };
+
+  const [staffList,       setStaffList]       = useState<StaffMember[]>([]);
+  const [staffLoaded,     setStaffLoaded]     = useState(false);
+  const [staffLoading,    setStaffLoading]    = useState(false);
+  const [inviteEmail,     setInviteEmail]     = useState('');
+  const [inviteRole,      setInviteRole]      = useState<'staff' | 'manager'>('staff');
+  const [invitePassword,  setInvitePassword]  = useState('');
+  const [inviteBusy,      setInviteBusy]      = useState(false);
+  const [inviteMsg,       setInviteMsg]       = useState('');
+  const [removingEmail,   setRemovingEmail]   = useState<string | null>(null);
 
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
 
@@ -226,6 +272,25 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   const patchDraft = <K extends keyof FullConfig>(section: K, updates: Partial<FullConfig[K]>) =>
     setDraft(prev => prev ? { ...prev, [section]: { ...(prev[section] as object), ...updates } } : prev);
 
+  const [showFieldMap, setShowFieldMap] = useState(false);
+
+  const patchDraftMapping = (opKey: string, updates: Partial<EndpointMappingDraft>) =>
+    setDraft(prev => {
+      if (!prev) return prev;
+      const current = getEffectiveMappings(prev.adapter);
+      return { ...prev, adapter: { ...prev.adapter, endpointMappings: current.map(m => m.operation === opKey ? { ...m, ...updates } : m) } };
+    });
+
+  const setDraftFieldMapping = (opKey: string, ourField: string, theirPath: string) =>
+    setDraft(prev => {
+      if (!prev) return prev;
+      const current = getEffectiveMappings(prev.adapter);
+      const m = current.find(x => x.operation === opKey);
+      const fm = { ...(m?.fieldMappings ?? {}), [ourField]: theirPath };
+      if (!theirPath) delete fm[ourField];
+      return { ...prev, adapter: { ...prev.adapter, endpointMappings: current.map(x => x.operation === opKey ? { ...x, fieldMappings: fm } : x) } };
+    });
+
   const handleSave = async () => {
     if (!draft) return;
     setSaving(true);
@@ -327,6 +392,14 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
         .catch(() => undefined)
         .finally(() => setMenuLoading(false));
     }
+    if (t === 'staff' && !staffLoaded) {
+      setStaffLoading(true);
+      fetch('/api/admin/staff', { headers: { Authorization: `Bearer ${jwtToken}` } })
+        .then(r => r.json() as Promise<StaffMember[]>)
+        .then(d => { setStaffList(Array.isArray(d) ? d : []); setStaffLoaded(true); })
+        .catch(() => undefined)
+        .finally(() => setStaffLoading(false));
+    }
   };
 
   const copyKioskUrl = () => {
@@ -381,7 +454,7 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
 
       {/* ── Tabs ────────────────────────────────────────────────────────────── */}
       <nav className="shrink-0 flex gap-0 border-b border-[#5A5A40]/10 px-5 bg-white/30 overflow-x-auto">
-        {(['overview', 'config', 'menu', 'usage', 'audit', 'connection'] as Tab[]).map(t => (
+        {(['overview', 'config', 'menu', 'staff', 'usage', 'audit', 'connection'] as Tab[]).map(t => (
           <button
             key={t}
             onClick={() => handleTabChange(t)}
@@ -391,11 +464,12 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                 : 'border-transparent text-[#5A5A40] opacity-40 hover:opacity-70'
             }`}
           >
-            {t === 'overview' ? 'Overview'
-              : t === 'config' ? 'Configuration'
-              : t === 'menu'   ? 'Menu'
-              : t === 'usage'  ? 'Usage'
-              : t === 'audit'  ? 'Audit Log'
+            {t === 'overview'    ? 'Overview'
+              : t === 'config'   ? 'Configuration'
+              : t === 'menu'     ? 'Menu'
+              : t === 'staff'    ? 'Staff'
+              : t === 'usage'    ? 'Usage'
+              : t === 'audit'    ? 'Audit Log'
               : 'Connection Test'}
           </button>
         ))}
@@ -584,6 +658,93 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
               </Section>
             )}
 
+            {/* Endpoint Mapping — only shown for custom_api adapter */}
+            {draft.adapter.type === 'custom_api' && (
+              <Section title="Endpoint Configuration">
+                <p className="text-xs opacity-50 leading-relaxed -mt-1">
+                  Override the HTTP method and path for each operation. The defaults mirror our managed backend — only edit if your POS uses different paths.
+                  Changes are saved with the <strong>Save Changes</strong> button below.
+                </p>
+
+                <div className="flex flex-col gap-2">
+                  <div className="grid grid-cols-[144px_80px_1fr] gap-x-2 px-1 pb-1">
+                    {['Operation', 'Method', 'Path'].map(h => (
+                      <span key={h} className="text-[10px] uppercase tracking-widest opacity-35 font-semibold">{h}</span>
+                    ))}
+                  </div>
+                  {ENDPOINT_OPERATIONS.map(opDef => {
+                    const m = getEffectiveMappings(draft.adapter).find(x => x.operation === opDef.key)!;
+                    return (
+                      <div key={opDef.key} className="grid grid-cols-[144px_80px_1fr] gap-x-2 items-center">
+                        <span className="text-xs font-semibold text-[#5A5A40] opacity-80 leading-tight truncate">
+                          {opDef.label}
+                        </span>
+                        <select
+                          value={m.method}
+                          onChange={e => patchDraftMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
+                          className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none cursor-pointer"
+                        >
+                          {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
+                            <option key={v} value={v}>{v}</option>
+                          ))}
+                        </select>
+                        <input
+                          value={m.path}
+                          onChange={e => patchDraftMapping(opDef.key, { path: e.target.value })}
+                          className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-3 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                          placeholder={opDef.defaultPath}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="border-t border-[#5A5A40]/8 pt-4">
+                  <button
+                    type="button"
+                    onClick={() => setShowFieldMap(s => !s)}
+                    className="flex items-center gap-1.5 text-xs text-[#5A5A40] opacity-60 hover:opacity-90 cursor-pointer"
+                  >
+                    <span className="font-mono text-[10px]">{showFieldMap ? '▾' : '▸'}</span>
+                    <span className="font-semibold uppercase tracking-widest">Response Field Mappings</span>
+                    <span className="opacity-50 ml-1 normal-case tracking-normal font-normal">— Add to Cart response</span>
+                  </button>
+                  {showFieldMap && (
+                    <div className="mt-3 flex flex-col gap-3">
+                      <p className="text-[10px] opacity-40 leading-relaxed">
+                        If your <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">Add to Cart</code> endpoint returns fields under
+                        different names, enter the dot-notation path to each value here.
+                        Example: if their item ID lives at <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">data.item.id</code>,
+                        put <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">data.item.id</code> next to <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">cart_item_id</code>.
+                        Leave blank if your API already uses that field name.
+                      </p>
+                      <div className="grid grid-cols-[144px_1fr] gap-x-2 px-1 pb-0.5">
+                        <span className="text-[10px] uppercase tracking-widest opacity-35 font-semibold">Our field</span>
+                        <span className="text-[10px] uppercase tracking-widest opacity-35 font-semibold">Their JSON path</span>
+                      </div>
+                      {RESOLVE_ITEM_MAP_FIELDS.map(field => {
+                        const m = getEffectiveMappings(draft.adapter).find(x => x.operation === 'resolveItem')!;
+                        return (
+                          <div key={field.key} className="grid grid-cols-[144px_1fr] gap-x-2 items-start">
+                            <div className="pt-2">
+                              <span className="text-xs font-mono text-[#5A5A40] opacity-70">{field.key}</span>
+                              <p className="text-[9px] opacity-35 leading-snug mt-0.5">{field.hint}</p>
+                            </div>
+                            <input
+                              value={m.fieldMappings[field.key] ?? ''}
+                              onChange={e => setDraftFieldMapping('resolveItem', field.key, e.target.value)}
+                              placeholder={`their.path.for.${field.key}`}
+                              className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-3 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </Section>
+            )}
+
             {/* Business Rules */}
             <Section title="Business Rules">
               <Field label="GST / Tax Rate (%)">
@@ -739,6 +900,166 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {/* Staff */}
+        {tab === 'staff' && (
+          <div className="flex flex-col gap-5">
+            <p className="text-sm opacity-60 leading-relaxed">
+              Invite staff and managers to view the kitchen dashboard and update order status.
+              Staff accounts are scoped to this tenant only.
+            </p>
+
+            {/* Invite form */}
+            <div className="bg-white/60 border border-white/80 rounded-2xl p-5 flex flex-col gap-4">
+              <p className="text-[10px] uppercase tracking-widest opacity-40 font-semibold -mb-1">Invite New Member</p>
+
+              <Field label="Email">
+                <input
+                  type="email"
+                  value={inviteEmail}
+                  onChange={e => setInviteEmail(e.target.value)}
+                  className={INPUT}
+                  placeholder="staff@yourrestaurant.com"
+                />
+              </Field>
+
+              <Field label="Role">
+                <div className="flex gap-2">
+                  {(['staff', 'manager'] as const).map(r => (
+                    <button
+                      key={r}
+                      type="button"
+                      onClick={() => setInviteRole(r)}
+                      className={`px-4 py-2 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                        inviteRole === r
+                          ? 'bg-[#5A5A40] text-[#F8F7F2] border-[#5A5A40]'
+                          : 'border-[#5A5A40]/20 text-[#5A5A40] hover:border-[#5A5A40]/50'
+                      }`}
+                    >
+                      {r === 'staff' ? 'Staff — view & update orders' : 'Manager — view, update & reports'}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+
+              <Field label="Temporary Password" hint="Share this with the staff member — they can change it after first login">
+                <input
+                  type="password"
+                  value={invitePassword}
+                  onChange={e => setInvitePassword(e.target.value)}
+                  className={INPUT}
+                  placeholder="Min. 8 characters"
+                />
+              </Field>
+
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={async () => {
+                    if (!inviteEmail || !invitePassword) return;
+                    setInviteBusy(true);
+                    setInviteMsg('');
+                    try {
+                      const r = await fetch('/api/admin/staff/invite', {
+                        method:  'POST',
+                        headers: authHeaders,
+                        body:    JSON.stringify({ email: inviteEmail, staffRole: inviteRole, password: invitePassword }),
+                      });
+                      const body = await r.json() as { ok?: boolean; error?: string };
+                      if (r.ok && body.ok) {
+                        setStaffList(prev => {
+                          const exists = prev.find(s => s.email === inviteEmail.toLowerCase());
+                          return exists
+                            ? prev.map(s => s.email === inviteEmail.toLowerCase() ? { ...s, role: inviteRole } : s)
+                            : [...prev, { email: inviteEmail.toLowerCase(), role: inviteRole }];
+                        });
+                        setInviteEmail('');
+                        setInvitePassword('');
+                        setInviteMsg('Invited!');
+                      } else {
+                        setInviteMsg(body.error ?? 'Invite failed');
+                      }
+                    } catch {
+                      setInviteMsg('Network error');
+                    } finally {
+                      setInviteBusy(false);
+                      setTimeout(() => setInviteMsg(m => m === 'Invited!' ? '' : m), 3000);
+                    }
+                  }}
+                  disabled={inviteBusy || !inviteEmail || !invitePassword}
+                  className="px-6 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl font-bold text-xs uppercase tracking-widest hover:bg-[#4a4a33] transition disabled:opacity-50 cursor-pointer"
+                >
+                  {inviteBusy ? 'Inviting…' : 'Invite'}
+                </button>
+                {inviteMsg && (
+                  <span className={`text-sm font-semibold ${inviteMsg === 'Invited!' ? 'text-green-600' : 'text-red-600'}`}>
+                    {inviteMsg}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Current staff list */}
+            <div className="bg-white/60 border border-white/80 rounded-2xl overflow-hidden">
+              <div className="px-5 py-3 border-b border-[#5A5A40]/8">
+                <p className="text-[10px] uppercase tracking-widest opacity-40 font-semibold">Current Staff</p>
+              </div>
+              {staffLoading ? (
+                <p className="text-sm opacity-40 text-center py-8">Loading…</p>
+              ) : staffList.length === 0 ? (
+                <p className="text-sm opacity-40 text-center py-8">No staff members yet — invite someone above.</p>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-[#5A5A40]/8">
+                      {['Email', 'Role', ''].map(h => (
+                        <th key={h} className="px-5 py-3 text-left font-semibold uppercase tracking-widest opacity-40">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {staffList.map(member => (
+                      <tr key={member.email} className="border-b border-[#5A5A40]/5 last:border-0 hover:bg-[#5A5A40]/3">
+                        <td className="px-5 py-3 font-mono opacity-70">{member.email}</td>
+                        <td className="px-5 py-3">
+                          <span className="px-2 py-0.5 rounded-full bg-[#5A5A40]/8 font-semibold uppercase tracking-widest text-[10px]">
+                            {member.role}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3 text-right">
+                          <button
+                            onClick={async () => {
+                              setRemovingEmail(member.email);
+                              try {
+                                const r = await fetch(`/api/admin/staff/${encodeURIComponent(member.email)}`, {
+                                  method:  'DELETE',
+                                  headers: { Authorization: `Bearer ${jwtToken}` },
+                                });
+                                if (r.ok) {
+                                  setStaffList(prev => prev.filter(s => s.email !== member.email));
+                                } else {
+                                  const body = await r.json() as { error?: string };
+                                  alert(body.error ?? 'Remove failed');
+                                }
+                              } catch {
+                                alert('Network error');
+                              } finally {
+                                setRemovingEmail(null);
+                              }
+                            }}
+                            disabled={removingEmail === member.email}
+                            className="text-red-500 hover:text-red-700 font-semibold transition cursor-pointer disabled:opacity-40"
+                          >
+                            {removingEmail === member.email ? 'Removing…' : 'Remove'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         )}
 

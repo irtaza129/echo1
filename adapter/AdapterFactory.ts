@@ -2,6 +2,7 @@ import type { TenantConfig, AdapterCredentials } from '../src/lib/tenantConfig.j
 import type { IRestaurantAdapter } from './IRestaurantAdapter.js';
 import { ManagedBackendAdapter } from './ManagedBackendAdapter.js';
 import { CustomApiAdapter }      from './CustomApiAdapter.js';
+import { WebhookAdapter }        from './WebhookAdapter.js';
 
 const DEFAULT_BACKEND_URL = process.env.BACKEND_URL ?? 'https://voiceai-hzyb.onrender.com';
 
@@ -18,8 +19,7 @@ export class AdapterFactory {
         return new CustomApiAdapter(config, credentials);
 
       case 'webhook':
-        // Phase 6 — WebhookAdapter (push events to tenant URL)
-        throw new Error(`[ADAPTER] webhook adapter not yet implemented for tenant ${config.slug}`);
+        return new WebhookAdapter(config, credentials);
     }
   }
 }

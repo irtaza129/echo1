@@ -11,9 +11,10 @@ interface WizardConfig {
   slug:           string;
   plan:           string;
   adapter: {
-    type:       'managed' | 'custom_api';
-    backendUrl: string;
-    apiKey:     string;
+    type:             'managed' | 'custom_api';
+    backendUrl:       string;
+    apiKey:           string;
+    endpointMappings: EndpointMappingDraft[];
   };
   gemini: {
     agentName:          string;
@@ -38,6 +39,13 @@ interface WizardConfig {
   };
 }
 
+interface EndpointMappingDraft {
+  operation:     string;
+  method:        'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  path:          string;
+  fieldMappings: Record<string, string>;
+}
+
 interface Props {
   jwtToken:         string;
   initialSlug:      string;
@@ -58,6 +66,7 @@ const LANGUAGE_OPTIONS = [
 
 const STEPS = [
   'Restaurant',
+  'Plan',
   'Adapter',
   'Test',
   'Menu',
@@ -65,6 +74,47 @@ const STEPS = [
   'Rules',
   'Launch',
 ] as const;
+
+const PLANS = [
+  {
+    id:    'starter' as const,
+    name:  'Starter',
+    price: 'Free',
+    desc:  'Perfect for a single-location restaurant getting started with voice ordering.',
+    features: ['1 kiosk URL', 'Managed backend', 'Basic AI persona', 'Email support'],
+  },
+  {
+    id:    'growth' as const,
+    name:  'Growth',
+    price: '$49 / mo',
+    desc:  'For growing restaurants that need custom branding and multi-language support.',
+    features: ['3 kiosk URLs', 'Custom API adapter', 'All AI persona options', 'Transcript screen', 'Priority support'],
+  },
+  {
+    id:    'enterprise' as const,
+    name:  'Enterprise',
+    price: 'Contact us',
+    desc:  'Full platform access for chains, franchises, and enterprise deployments.',
+    features: ['Unlimited kiosks', 'Webhook adapter', 'White-label branding', 'Dedicated support', 'SLA guarantee'],
+  },
+] as const;
+
+const ENDPOINT_OPERATIONS = [
+  { key: 'getMenuForUI',      label: 'Menu (kiosk display)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/menu' },
+  { key: 'resolveItem',       label: 'Add to Cart',            defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/resolve-item' },
+  { key: 'submitOrder',       label: 'Submit Order',           defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/submit-order' },
+  { key: 'getOrders',         label: 'Get Orders (kitchen)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/orders' },
+  { key: 'updateOrderStatus', label: 'Update Order Status',    defaultMethod: 'PATCH' as const, defaultPath: '/api/v1/orders' },
+  { key: 'getMenuContext',    label: 'AI Menu Context',        defaultMethod: 'GET'   as const, defaultPath: '/api/v1/agent/menu-context' },
+];
+
+const RESOLVE_ITEM_MAP_FIELDS = [
+  { key: 'status',         hint: '"ok" / "not_found" / "requires_input"' },
+  { key: 'cart_item_id',   hint: 'Unique item ID for remove operations' },
+  { key: 'unit_price',     hint: 'Item price as a number' },
+  { key: 'summary',        hint: 'Item display name / description' },
+  { key: 'ai_instruction', hint: 'Prompt text when requires_input' },
+];
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -77,7 +127,17 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
     restaurantName: initialName,
     slug:           initialSlug,
     plan:           'starter',
-    adapter: { type: 'managed', backendUrl: '', apiKey: '' },
+    adapter: {
+      type:             'managed',
+      backendUrl:       '',
+      apiKey:           '',
+      endpointMappings: ENDPOINT_OPERATIONS.map(op => ({
+        operation:     op.key,
+        method:        op.defaultMethod,
+        path:          op.defaultPath,
+        fieldMappings: {},
+      })),
+    },
     gemini: {
       agentName:          `${initialName} Assistant`,
       voice:              'Puck',
@@ -94,7 +154,36 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
   });
 
   const [testResult,    setTestResult]    = useState<{ ok: boolean; msg: string } | null>(null);
+  const [showEpConfig,  setShowEpConfig]  = useState(false);
+  const [showFieldMap,  setShowFieldMap]  = useState(false);
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+
+  const patchMapping = (opKey: string, updates: Partial<EndpointMappingDraft>) =>
+    setCfg(prev => ({
+      ...prev,
+      adapter: {
+        ...prev.adapter,
+        endpointMappings: prev.adapter.endpointMappings.map(m =>
+          m.operation === opKey ? { ...m, ...updates } : m
+        ),
+      },
+    }));
+
+  const setFieldMapping = (opKey: string, ourField: string, theirPath: string) =>
+    setCfg(prev => {
+      const m = prev.adapter.endpointMappings.find(x => x.operation === opKey);
+      const fm = { ...(m?.fieldMappings ?? {}), [ourField]: theirPath };
+      if (!theirPath) delete fm[ourField];
+      return {
+        ...prev,
+        adapter: {
+          ...prev.adapter,
+          endpointMappings: prev.adapter.endpointMappings.map(x =>
+            x.operation === opKey ? { ...x, fieldMappings: fm } : x
+          ),
+        },
+      };
+    });
 
   const playVoicePreview = async (voice: string) => {
     if (previewingVoice) return;
@@ -214,7 +303,10 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
         restaurantName: cfg.restaurantName,
         slug:           cfg.slug,
         plan:           cfg.plan,
-        adapter:        { type: cfg.adapter.type },
+        adapter: {
+          type:             cfg.adapter.type,
+          endpointMappings: cfg.adapter.type === 'custom_api' ? cfg.adapter.endpointMappings : undefined,
+        },
         gemini:         cfg.gemini,
         branding:       cfg.branding,
         businessRules: {
@@ -232,7 +324,7 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
       const body = await r.json() as { ok?: boolean; kioskUrl?: string; error?: string };
       if (!r.ok || !body.ok) { setError(body.error ?? 'Save failed'); return; }
 
-      // Save menu data for managed tenants that added items during onboarding
+      // Save menu data for managed tenants that added items during onboarding (step 4)
       if (cfg.adapter.type === 'managed' && menuData.categories.length > 0) {
         await fetch('/api/admin/menu', {
           method: 'POST',
@@ -348,8 +440,51 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 1: Adapter ────────────────────────────────────────────── */}
+          {/* ── Step 1: Plan ──────────────────────────────────────────────── */}
           {step === 1 && (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm opacity-60 leading-relaxed">
+                Choose the plan that fits your restaurant. You can upgrade at any time from the Admin Dashboard.
+              </p>
+              <div className="flex flex-col gap-3">
+                {PLANS.map(plan => (
+                  <button
+                    key={plan.id}
+                    type="button"
+                    onClick={() => setCfg(p => ({ ...p, plan: plan.id }))}
+                    className={`rounded-2xl border p-4 text-left transition-all cursor-pointer ${
+                      cfg.plan === plan.id
+                        ? 'border-[#5A5A40] bg-[#5A5A40]/6 ring-1 ring-[#5A5A40]/20'
+                        : 'border-[#5A5A40]/15 hover:border-[#5A5A40]/30'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="font-bold text-sm text-[#5A5A40]">{plan.name}</p>
+                        <p className="text-xs opacity-55 mt-1 leading-relaxed">{plan.desc}</p>
+                        <ul className="mt-2 flex flex-col gap-0.5">
+                          {plan.features.map(f => (
+                            <li key={f} className="text-xs opacity-50 flex items-center gap-1.5">
+                              <span className="text-[#5A5A40] font-bold">·</span> {f}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                      <span className={`shrink-0 text-sm font-bold whitespace-nowrap ${
+                        cfg.plan === plan.id ? 'text-[#5A5A40]' : 'opacity-40'
+                      }`}>{plan.price}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] opacity-40 leading-relaxed">
+                Billing is handled separately — selecting a plan here sets your feature tier. Contact us to activate paid plans.
+              </p>
+            </div>
+          )}
+
+          {/* ── Step 2: Adapter ────────────────────────────────────────────── */}
+          {step === 2 && (
             <div className="flex flex-col gap-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {([
@@ -384,13 +519,100 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
                       onChange={e => patch('adapter', { apiKey: e.target.value })}
                       className={INPUT} placeholder="sk-…" />
                   </Field>
+
+                  <div className="border-t border-[#5A5A40]/10 pt-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowEpConfig(s => !s)}
+                      className="flex items-center gap-1.5 text-xs text-[#5A5A40] opacity-60 hover:opacity-90 cursor-pointer w-full text-left"
+                    >
+                      <span className="font-mono text-[10px]">{showEpConfig ? '▾' : '▸'}</span>
+                      <span className="font-semibold uppercase tracking-widest">Endpoint Configuration</span>
+                      <span className="opacity-50 ml-1 normal-case tracking-normal font-normal">— override API paths &amp; methods</span>
+                    </button>
+
+                    {showEpConfig && (
+                      <div className="mt-3 flex flex-col gap-2">
+                        <p className="text-[10px] opacity-40 leading-snug mb-1">
+                          Map each operation to your POS API endpoint. The defaults mirror our managed backend — only change if your API uses different paths.
+                        </p>
+
+                        {ENDPOINT_OPERATIONS.map(opDef => {
+                          const m = cfg.adapter.endpointMappings.find(x => x.operation === opDef.key);
+                          return (
+                            <div key={opDef.key} className="flex items-center gap-2">
+                              <span className="text-[10px] font-semibold text-[#5A5A40] w-36 shrink-0 opacity-80 leading-tight">
+                                {opDef.label}
+                              </span>
+                              <select
+                                value={m?.method ?? opDef.defaultMethod}
+                                onChange={e => patchMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
+                                className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none w-20 shrink-0 cursor-pointer"
+                              >
+                                {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
+                                  <option key={v} value={v}>{v}</option>
+                                ))}
+                              </select>
+                              <input
+                                value={m?.path ?? opDef.defaultPath}
+                                onChange={e => patchMapping(opDef.key, { path: e.target.value })}
+                                className="flex-1 text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                                placeholder={opDef.defaultPath}
+                              />
+                            </div>
+                          );
+                        })}
+
+                        <div className="mt-2 border-t border-[#5A5A40]/8 pt-3">
+                          <button
+                            type="button"
+                            onClick={() => setShowFieldMap(s => !s)}
+                            className="flex items-center gap-1.5 text-[10px] text-[#5A5A40] opacity-50 hover:opacity-80 cursor-pointer"
+                          >
+                            <span className="font-mono">{showFieldMap ? '▾' : '▸'}</span>
+                            <span className="font-semibold uppercase tracking-widest">Response Field Mappings</span>
+                            <span className="opacity-60 ml-1 normal-case tracking-normal font-normal">(Add to Cart)</span>
+                          </button>
+                          {showFieldMap && (
+                            <div className="mt-2 flex flex-col gap-2 pl-1">
+                              <p className="text-[10px] opacity-40 leading-snug">
+                                If your <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">Add to Cart</code> endpoint returns fields
+                                under different names, enter the dot-notation path to each value.
+                                Example: if the item ID is at <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">data.item.id</code>,
+                                enter that next to <code className="font-mono bg-[#5A5A40]/8 px-0.5 rounded">cart_item_id</code>.
+                              </p>
+                              {RESOLVE_ITEM_MAP_FIELDS.map(field => {
+                                const m = cfg.adapter.endpointMappings.find(x => x.operation === 'resolveItem');
+                                return (
+                                  <div key={field.key} className="flex items-start gap-2">
+                                    <span className="text-[10px] font-mono w-32 shrink-0 pt-2 text-[#5A5A40] opacity-60">
+                                      {field.key}
+                                    </span>
+                                    <div className="flex-1">
+                                      <input
+                                        value={m?.fieldMappings?.[field.key] ?? ''}
+                                        onChange={e => setFieldMapping('resolveItem', field.key, e.target.value)}
+                                        placeholder={`their.path.for.${field.key}`}
+                                        className="w-full text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                                      />
+                                      <p className="text-[9px] opacity-35 mt-0.5">{field.hint}</p>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* ── Step 2: Test Connection ────────────────────────────────────── */}
-          {step === 2 && (
+          {/* ── Step 3: Test Connection ────────────────────────────────────── */}
+          {step === 3 && (
             <div className="flex flex-col gap-4">
               <p className="text-sm opacity-60 leading-relaxed">
                 We'll verify the connection to your {cfg.adapter.type === 'managed' ? 'managed' : 'custom'} backend
@@ -418,8 +640,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 3: Menu ──────────────────────────────────────────────── */}
-          {step === 3 && (
+          {/* ── Step 4: Menu ──────────────────────────────────────────────── */}
+          {step === 4 && (
             <div className="flex flex-col gap-4">
               {cfg.adapter.type === 'custom_api' ? (
                 <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4">
@@ -483,8 +705,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 4: AI Persona ─────────────────────────────────────────── */}
-          {step === 4 && (
+          {/* ── Step 5: AI Persona ─────────────────────────────────────────── */}
+          {step === 5 && (
             <div className="flex flex-col gap-4">
               <Field label="Agent Name" hint="How the AI introduces itself">
                 <input value={cfg.gemini.agentName}
@@ -550,8 +772,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 5: Business Rules ─────────────────────────────────────── */}
-          {step === 5 && (
+          {/* ── Step 6: Business Rules ─────────────────────────────────────── */}
+          {step === 6 && (
             <div className="flex flex-col gap-5">
               <div className="flex gap-4 flex-wrap">
                 <Field label="GST / Tax Rate (%)">
@@ -599,8 +821,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
             </div>
           )}
 
-          {/* ── Step 6: Launch ─────────────────────────────────────────────── */}
-          {step === 6 && (
+          {/* ── Step 7: Launch ─────────────────────────────────────────────── */}
+          {step === 7 && (
             <div className="flex flex-col gap-5">
               <div className="bg-white/60 rounded-2xl border border-[#5A5A40]/10 p-5 flex flex-col gap-3">
                 <Row label="Restaurant"  value={cfg.restaurantName} />

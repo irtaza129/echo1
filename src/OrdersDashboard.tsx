@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { tenantFetch, getCurrentTenant } from './lib/apiClient';
 
 type SelectedOption = {
@@ -6,29 +6,34 @@ type SelectedOption = {
   choice_name: string;
 };
 
+// Handles both Render-backend shape (dish_name / item_total) and local-order
+// shape (name / summary / unit_price) so the same component works for all tenants.
 type OrderItem = {
-  dish_name: string;
-  quantity: number;
-  unit_price: string | number;
-  item_total: string | number;
-  notes?: string | null;
+  dish_name?:        string;
+  name?:             string;
+  summary?:          string;
+  quantity:          number;
+  unit_price:        string | number;
+  item_total?:       string | number;
+  notes?:            string | null;
   selected_options?: SelectedOption[];
+  modifiers?:        string[];
 };
 
 type Order = {
-  id: string;
-  customer_name: string;
-  customer_phone: string;
-  order_type: string;
-  status: string;
-  total_amount: string | number;
-  subtotal: string | number;
-  notes?: string | null;
-  created_at: string;
-  items: OrderItem[];
+  id:              string;
+  customer_name:   string;
+  customer_phone:  string;
+  order_type:      string;
+  status:          string;
+  total_amount?:   string | number;
+  total?:          string | number;
+  subtotal?:       string | number;
+  notes?:          string | null;
+  created_at:      string;
+  items:           OrderItem[];
 };
 
-// The status we want the order to end up in after clicking the button
 const TARGET_STATUS: Record<string, string> = {
   pending:   'preparing',
   confirmed: 'preparing',
@@ -36,9 +41,7 @@ const TARGET_STATUS: Record<string, string> = {
   ready:     'delivered',
 };
 
-// API only allows single-step transitions, so some targets need intermediate hops:
-// pending → confirmed → preparing
-// ready   → out_for_delivery → delivered
+// API only allows single-step transitions, so some targets need intermediate hops
 const TRANSITION_STEPS: Record<string, string[]> = {
   'pending→preparing':  ['confirmed', 'preparing'],
   'ready→delivered':    ['out_for_delivery', 'delivered'],
@@ -66,26 +69,41 @@ const STATUS_BADGE: Record<string, string> = {
   ready:     'bg-green-50 text-green-800 border-green-200',
 };
 
+function getItemLabel(item: OrderItem): string {
+  return item.dish_name ?? item.name ?? item.summary ?? '?';
+}
+
+function getItemTotal(item: OrderItem): number {
+  if (item.item_total !== undefined) return parseFloat(String(item.item_total)) || 0;
+  return (Number(item.unit_price) || 0) * (item.quantity || 1);
+}
+
+function getOrderTotal(order: Order): number {
+  const raw = order.total_amount ?? order.total ?? order.subtotal;
+  if (raw !== undefined) return parseFloat(String(raw)) || 0;
+  return (order.items ?? []).reduce((s, i) => s + getItemTotal(i), 0);
+}
+
+function getModifiers(item: OrderItem): string[] {
+  if (item.selected_options?.length) {
+    return item.selected_options.map(o => `${o.option_name}: ${o.choice_name}`);
+  }
+  return item.modifiers ?? [];
+}
+
 function OrderCard({
   order,
+  currency,
   onAdvance,
 }: {
-  order: Order;
-  onAdvance: (id: string, currentStatus: string) => Promise<void>;
+  order:     Order;
+  currency:  string;
+  onAdvance: (id: string, currentStatus: string) => void;
 }) {
-  const [loading, setLoading] = useState(false);
-  const target = TARGET_STATUS[order.status];
-  const total  = parseFloat(String(order.total_amount)) || 0;
-
-  const handleAdvance = async () => {
-    setLoading(true);
-    await onAdvance(order.id, order.status);
-    setLoading(false);
-  };
-
+  const target  = TARGET_STATUS[order.status];
+  const total   = getOrderTotal(order);
   const timeStr = new Date(order.created_at).toLocaleTimeString('en-PK', {
-    hour: '2-digit',
-    minute: '2-digit',
+    hour: '2-digit', minute: '2-digit',
   });
 
   return (
@@ -102,7 +120,7 @@ function OrderCard({
         </div>
         <div className="flex flex-col items-end gap-1.5 shrink-0">
           <span className="text-[10px] uppercase tracking-wide px-2 py-0.5 bg-[#5A5A40]/8 text-[#5A5A40] rounded-lg font-medium">
-            {order.order_type.replace('_', ' ')}
+            {(order.order_type ?? 'dine_in').replace('_', ' ')}
           </span>
           <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] font-medium uppercase tracking-wide ${STATUS_BADGE[order.status] ?? 'bg-gray-50 text-gray-700 border-gray-200'}`}>
             <div className={`w-1.5 h-1.5 rounded-full ${STATUS_COLOR[order.status] ?? 'bg-gray-400'}`} />
@@ -117,16 +135,14 @@ function OrderCard({
           <div key={i}>
             <div className="flex justify-between items-start text-sm gap-2">
               <span className="text-[#3D3D33] font-medium leading-snug">
-                {item.quantity}× {item.dish_name}
+                {item.quantity}× {getItemLabel(item)}
               </span>
               <span className="font-mono text-xs opacity-55 whitespace-nowrap shrink-0 pt-0.5">
-                PKR {Math.round(parseFloat(String(item.item_total)))}
+                {currency} {Math.round(getItemTotal(item))}
               </span>
             </div>
-            {(item.selected_options || []).map((opt, j) => (
-              <p key={j} className="text-[11px] opacity-40 pl-4 leading-snug">
-                {opt.option_name}: {opt.choice_name}
-              </p>
+            {getModifiers(item).map((m, j) => (
+              <p key={j} className="text-[11px] opacity-40 pl-4 leading-snug">{m}</p>
             ))}
             {item.notes && (
               <p className="text-[11px] italic opacity-40 pl-4 leading-snug">{item.notes}</p>
@@ -143,32 +159,23 @@ function OrderCard({
 
       {/* Footer */}
       <div className="flex justify-between items-center pt-1">
-        <span className="font-bold text-sm text-[#5A5A40]">PKR {Math.round(total)}</span>
+        <span className="font-bold text-sm text-[#5A5A40]">{currency} {Math.round(total)}</span>
         <span className="text-[10px] opacity-35 font-mono">{timeStr}</span>
       </div>
 
       {target && (
         <button
-          onClick={handleAdvance}
-          disabled={loading}
-          className="w-full py-2 rounded-xl font-bold text-xs uppercase tracking-widest bg-[#5A5A40] text-[#F8F7F2] hover:bg-[#4a4a33] active:scale-95 transition-all disabled:opacity-40 cursor-pointer"
+          onClick={() => onAdvance(order.id, order.status)}
+          className="w-full py-2 rounded-xl font-bold text-xs uppercase tracking-widest bg-[#5A5A40] text-[#F8F7F2] hover:bg-[#4a4a33] active:scale-95 transition-all cursor-pointer"
         >
-          {loading ? 'Updating...' : ADVANCE_LABEL[order.status]}
+          {ADVANCE_LABEL[order.status]}
         </button>
       )}
     </div>
   );
 }
 
-function ColumnHeader({
-  dotClass,
-  title,
-  count,
-}: {
-  dotClass: string;
-  title: string;
-  count: number;
-}) {
+function ColumnHeader({ dotClass, title, count }: { dotClass: string; title: string; count: number }) {
   return (
     <div className="flex items-center gap-2.5 shrink-0 pb-1">
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${dotClass}`} />
@@ -184,78 +191,112 @@ export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => vo
   const [incomingOrders,  setIncomingOrders]  = useState<Order[]>([]);
   const [preparingOrders, setPreparingOrders] = useState<Order[]>([]);
   const [readyOrders,     setReadyOrders]     = useState<Order[]>([]);
-  const [loading,    setLoading]    = useState(false);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [error,      setError]      = useState<string | null>(null);
+  const [currency,        setCurrency]        = useState('PKR');
+  const [lastUpdated,     setLastUpdated]     = useState<Date | null>(null);
+  const [error,           setError]           = useState<string | null>(null);
+  const fetchingRef = useRef(false);
+
+  const splitOrders = useCallback((orders: Order[]) => {
+    const byTime = (a: Order, b: Order) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+
+    setIncomingOrders(
+      orders.filter(o => o.status === 'pending' || o.status === 'confirmed').sort(byTime)
+    );
+    setPreparingOrders(orders.filter(o => o.status === 'preparing').sort(byTime));
+    setReadyOrders(    orders.filter(o => o.status === 'ready').sort(byTime));
+  }, []);
 
   const fetchOrders = useCallback(async () => {
-    setLoading(true);
+    if (fetchingRef.current) return;
+    fetchingRef.current = true;
     setError(null);
     try {
-      // Refuse to fetch when we don't know which tenant we're scoped to —
-      // otherwise the server falls back to Savour and we'd show the wrong
-      // restaurant's orders on the kitchen dashboard.
       const { tenantId } = getCurrentTenant();
       if (!tenantId) {
         setError('Not signed in — please log in to view your orders.');
-        setLoading(false);
         return;
       }
-
-      const [pendingRes, confirmedRes, preparingRes, readyRes] = await Promise.all([
-        tenantFetch('/api/orders?status=pending&per_page=50').then(r => r.json()),
-        tenantFetch('/api/orders?status=confirmed&per_page=50').then(r => r.json()),
-        tenantFetch('/api/orders?status=preparing&per_page=50').then(r => r.json()),
-        tenantFetch('/api/orders?status=ready&per_page=50').then(r => r.json()),
-      ]);
-
-      const extract = (res: any): Order[] =>
-        (res.items ?? res.orders ?? res.data ?? []) as Order[];
-
-      const byTime = (a: Order, b: Order) =>
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-
-      setIncomingOrders(
-        [...extract(pendingRes), ...extract(confirmedRes)].sort(byTime)
-      );
-      setPreparingOrders(extract(preparingRes).sort(byTime));
-      setReadyOrders(extract(readyRes).sort(byTime));
+      const r = await tenantFetch('/api/orders/active');
+      if (!r.ok) { setError(`Could not fetch orders (HTTP ${r.status})`); return; }
+      const data = await r.json() as Order[];
+      splitOrders(Array.isArray(data) ? data : []);
       setLastUpdated(new Date());
-    } catch (err: any) {
-      setError('Could not fetch orders: ' + err.message);
+    } catch (err: unknown) {
+      setError('Could not fetch orders: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      fetchingRef.current = false;
     }
-    setLoading(false);
+  }, [splitOrders]);
+
+  // Fetch currency symbol from tenant config once on mount
+  useEffect(() => {
+    tenantFetch('/api/admin/my-config')
+      .then(r => r.ok ? r.json() : null)
+      .then((cfg: { businessRules?: { currencySymbol?: string } } | null) => {
+        if (cfg?.businessRules?.currencySymbol) setCurrency(cfg.businessRules.currencySymbol);
+      })
+      .catch(() => undefined);
   }, []);
 
+  // Initial fetch + 6-second auto-refresh
   useEffect(() => {
     fetchOrders();
-    const interval = setInterval(fetchOrders, 60_000);
+    const interval = setInterval(fetchOrders, 6_000);
     return () => clearInterval(interval);
   }, [fetchOrders]);
 
-  const advanceStatus = async (orderId: string, currentStatus: string) => {
+  const advanceStatus = useCallback(async (orderId: string, currentStatus: string) => {
     const target = TARGET_STATUS[currentStatus];
     if (!target) return;
+
+    // Optimistic update: move the card to the target column immediately
+    const moveOrder = (orders: Order[], status: string): [Order | undefined, Order[]] => {
+      const idx = orders.findIndex(o => o.id === orderId);
+      if (idx === -1) return [undefined, orders];
+      const updated = { ...orders[idx], status };
+      return [updated, orders.filter((_, i) => i !== idx)];
+    };
+
+    setIncomingOrders(prev => {
+      const [found, rest] = moveOrder(prev, target);
+      if (!found) return prev;
+      if (target === 'preparing') setPreparingOrders(p => [...p, found].sort(
+        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      ));
+      return rest;
+    });
+    setPreparingOrders(prev => {
+      const [found, rest] = moveOrder(prev, target);
+      if (!found) return prev;
+      if (target === 'ready') setReadyOrders(p => [...p, found].sort(
+        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      ));
+      return rest;
+    });
+    setReadyOrders(prev => {
+      const [, rest] = moveOrder(prev, target);
+      return rest;
+    });
+
+    // Fire API calls in background, then reconcile
     const key   = `${currentStatus}→${target}`;
     const steps = TRANSITION_STEPS[key] ?? [target];
     try {
       for (const step of steps) {
         const r = await tenantFetch(`/api/orders/${orderId}/status`, {
-          method: 'PATCH',
+          method:  'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: step }),
+          body:    JSON.stringify({ status: step }),
         });
-        if (!r.ok) {
-          const body = await r.json().catch(() => ({}));
-          console.error(`[Dashboard] transition to "${step}" failed:`, body);
-          break;
-        }
+        if (!r.ok) { console.error(`[Dashboard] transition to "${step}" failed`); break; }
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('[Dashboard] advanceStatus error:', err);
     }
+    // Reconcile with server truth after the API call
     await fetchOrders();
-  };
+  }, [fetchOrders]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden select-none bg-[#F8F7F2] p-3 md:p-5 lg:p-7 gap-3 md:gap-5">
@@ -287,17 +328,16 @@ export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => vo
             </h1>
             <p className="text-[10px] opacity-40 uppercase tracking-widest mt-0.5 hidden sm:block">
               {lastUpdated
-                ? `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every 60s`
-                : 'Loading...'}
+                ? `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every 6s`
+                : 'Loading…'}
             </p>
           </div>
         </div>
         <button
           onClick={fetchOrders}
-          disabled={loading}
-          className="px-4 py-2 glass-panel text-xs uppercase tracking-widest font-bold text-[#5A5A40] hover:bg-white/80 transition-colors disabled:opacity-40 cursor-pointer rounded-xl"
+          className="px-4 py-2 glass-panel text-xs uppercase tracking-widest font-bold text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer rounded-xl"
         >
-          {loading ? '...' : '↻ Refresh'}
+          ↻ Refresh
         </button>
       </div>
 
@@ -307,60 +347,45 @@ export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => vo
         </div>
       )}
 
-      {/* Order board — stacks vertically on mobile, 3 columns on md+ */}
+      {/* Order board */}
       <div className="flex-1 flex flex-col gap-4 overflow-y-auto md:grid md:grid-cols-3 md:gap-5 md:min-h-0 md:overflow-hidden">
 
-        {/* Column 1: Incoming (pending + confirmed) */}
+        {/* Column 1: Incoming */}
         <div className="flex flex-col gap-3 md:min-h-0">
-          <ColumnHeader
-            dotClass="bg-yellow-400"
-            title="Incoming"
-            count={incomingOrders.length}
-          />
+          <ColumnHeader dotClass="bg-yellow-400" title="Incoming" count={incomingOrders.length} />
           <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
-            {incomingOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No incoming orders</p>
-            ) : (
-              incomingOrders.map(o => (
-                <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
-              ))
-            )}
+            {incomingOrders.length === 0
+              ? <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No incoming orders</p>
+              : incomingOrders.map(o => (
+                  <OrderCard key={o.id} order={o} currency={currency} onAdvance={advanceStatus} />
+                ))
+            }
           </div>
         </div>
 
         {/* Column 2: Preparing */}
         <div className="flex flex-col gap-3 md:min-h-0 border-t border-[#5A5A40]/10 pt-4 md:border-0 md:pt-0">
-          <ColumnHeader
-            dotClass="bg-orange-400"
-            title="Preparing"
-            count={preparingOrders.length}
-          />
+          <ColumnHeader dotClass="bg-orange-400" title="Preparing" count={preparingOrders.length} />
           <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
-            {preparingOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders preparing</p>
-            ) : (
-              preparingOrders.map(o => (
-                <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
-              ))
-            )}
+            {preparingOrders.length === 0
+              ? <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders preparing</p>
+              : preparingOrders.map(o => (
+                  <OrderCard key={o.id} order={o} currency={currency} onAdvance={advanceStatus} />
+                ))
+            }
           </div>
         </div>
 
         {/* Column 3: Ready */}
         <div className="flex flex-col gap-3 md:min-h-0 border-t border-[#5A5A40]/10 pt-4 md:border-0 md:pt-0">
-          <ColumnHeader
-            dotClass="bg-green-500"
-            title="Ready"
-            count={readyOrders.length}
-          />
+          <ColumnHeader dotClass="bg-green-500" title="Ready" count={readyOrders.length} />
           <div className="flex flex-col gap-3 md:flex-1 md:overflow-y-auto md:min-h-0 md:pr-1">
-            {readyOrders.length === 0 ? (
-              <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders ready</p>
-            ) : (
-              readyOrders.map(o => (
-                <OrderCard key={o.id} order={o} onAdvance={advanceStatus} />
-              ))
-            )}
+            {readyOrders.length === 0
+              ? <p className="text-xs opacity-35 italic text-center pt-8 md:pt-12">No orders ready</p>
+              : readyOrders.map(o => (
+                  <OrderCard key={o.id} order={o} currency={currency} onAdvance={advanceStatus} />
+                ))
+            }
           </div>
         </div>
 

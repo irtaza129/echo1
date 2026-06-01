@@ -19,15 +19,16 @@ interface AdapterTemplate {
 }
 
 interface Props {
-  jwtToken: string;
-  onLogout: () => void;
+  jwtToken:       string;
+  onLogout:       () => void;
+  onManageTenant: (jwt: string, slug: string) => void;
 }
 
 type Tab = 'tenants' | 'templates';
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function SuperAdminDashboard({ jwtToken, onLogout }: Props) {
+export default function SuperAdminDashboard({ jwtToken, onLogout, onManageTenant }: Props) {
   const [tab,           setTab]           = useState<Tab>('tenants');
   const [tenants,       setTenants]       = useState<TenantSummary[]>([]);
   const [templates,     setTemplates]     = useState<AdapterTemplate[]>([]);
@@ -56,11 +57,7 @@ export default function SuperAdminDashboard({ jwtToken, onLogout }: Props) {
       });
       const body = await r.json() as { jwtToken?: string; slug?: string; error?: string };
       if (!r.ok || !body.jwtToken) { alert(body.error ?? 'Impersonation failed'); return; }
-      // Open the admin panel in a new tab using the impersonation token
-      const url = new URL('/admin-impersonate', window.location.origin);
-      url.searchParams.set('token', body.jwtToken);
-      url.searchParams.set('slug',  body.slug ?? slug);
-      window.open(url.toString(), '_blank');
+      onManageTenant(body.jwtToken, body.slug ?? slug);
     } catch (err) {
       alert(String(err));
     } finally {

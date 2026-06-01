@@ -25,8 +25,9 @@ import {
 
 dotenv.config();
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IS_DEV  = process.env.NODE_ENV !== 'production';
+const UUID_RE  = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const IS_DEV   = process.env.NODE_ENV !== 'production';
+const ONE_YEAR = 365 * 24 * 60 * 60;
 const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
 
 // Slugs that cannot be claimed by registered tenants. Anything in this set
@@ -500,7 +501,6 @@ async function startServer() {
         },
       });
 
-      const ONE_YEAR = 365 * 24 * 60 * 60;
       await Promise.all([
         redis.set(emailKey, { email: email.toLowerCase(), passwordHash, tenantId, slug, role: 'tenant_admin' }, { ex: ONE_YEAR }),
         redis.set(slugKey,  tenantId, { ex: ONE_YEAR }),
@@ -1426,6 +1426,122 @@ async function startServer() {
       const result = await req.adapter!.updateOrderStatus(req.params.orderId, status);
       res.json(result);
     } catch (err) { adapterError(res, err); }
+  });
+
+  // ── Orders: single endpoint for all active statuses (used by live dashboard) ─
+  // Returns pending + confirmed + preparing + ready in one request so the
+  // kitchen dashboard can poll at 6-second intervals without 4× the requests.
+  app.get('/api/orders/active', attachAdapter, async (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store, must-revalidate');
+    const tenantId    = req.tenantConfig?.tenantId;
+    const ACTIVE      = ['pending', 'confirmed', 'preparing', 'ready'] as const;
+
+    if (tenantId) {
+      const menu = await getLocalMenu(tenantId);
+      if (menu) {
+        try {
+          const redis  = getRedis();
+          const ids    = await redis.lrange(redisKey.localOrders(tenantId), 0, 199);
+          const orders = (await Promise.all(
+            ids.map(id => redis.get<LocalOrder>(redisKey.localOrder(id)).catch(() => null))
+          )).filter((o): o is LocalOrder => o !== null && (ACTIVE as readonly string[]).includes(o.status));
+          res.json(orders); return;
+        } catch (err) {
+          console.error('[LOCAL] get-orders/active failed:', err);
+          res.status(500).json({ error: 'Failed to load orders' }); return;
+        }
+      }
+    }
+
+    try {
+      const results = await Promise.all(
+        ACTIVE.map(s => req.adapter!.getOrders({ status: s, perPage: 50 }))
+      );
+      res.json((results as unknown[][]).flat());
+    } catch (err) { adapterError(res, err); }
+  });
+
+  // ── Staff management ───────────────────────────────────────────────────────
+  // tenant_admin can invite staff/manager accounts scoped to their own tenant.
+
+  app.get('/api/admin/staff', requireAuth, async (req: Request, res: Response) => {
+    const { tenantId, role } = req.jwtPayload!;
+    if (role !== 'tenant_admin' && role !== 'super_admin') {
+      res.status(403).json({ error: 'Forbidden' }); return;
+    }
+    try {
+      const redis    = getRedis();
+      const emails   = (await redis.smembers(`tenant:staff:${tenantId}`)) as string[];
+      const members  = (await Promise.all(
+        emails.map(async email => {
+          const u = await redis.get<{ email: string; role: string }>(`user:email:${email}`).catch(() => null);
+          return u ? { email: u.email, role: u.role } : null;
+        })
+      )).filter(Boolean);
+      res.json(members);
+    } catch (err) {
+      console.error('[STAFF] list failed:', err);
+      res.status(500).json({ error: 'Failed to load staff' });
+    }
+  });
+
+  app.post('/api/admin/staff/invite', requireAuth, authLimiter, async (req: Request, res: Response) => {
+    const { tenantId, role } = req.jwtPayload!;
+    if (role !== 'tenant_admin' && role !== 'super_admin') {
+      res.status(403).json({ error: 'Forbidden' }); return;
+    }
+    const { email, staffRole, password } =
+      req.body as { email?: string; staffRole?: string; password?: string };
+
+    if (!email || !password)                          { res.status(400).json({ error: 'email and password are required' }); return; }
+    if (!['staff', 'manager'].includes(staffRole ?? '')){ res.status(400).json({ error: 'staffRole must be "staff" or "manager"' }); return; }
+    if (password.length < 8)                          { res.status(400).json({ error: 'Password must be at least 8 characters' }); return; }
+
+    try {
+      const redis        = getRedis();
+      const emailKey     = `user:email:${email.toLowerCase()}`;
+      const existing     = await redis.get<{ tenantId: string }>(emailKey).catch(() => null);
+      if (existing && existing.tenantId !== tenantId) {
+        res.status(409).json({ error: 'That email is already registered to a different account' }); return;
+      }
+      const configRaw      = await redis.get<{ slug?: string }>(redisKey.tenantConfig(tenantId)).catch(() => null);
+      const slug           = configRaw?.slug ?? tenantId;
+      const passwordHash   = crypto.createHash('sha256').update(password).digest('hex');
+
+      await redis.set(emailKey,
+        { email: email.toLowerCase(), passwordHash, tenantId, slug, role: staffRole },
+        { ex: ONE_YEAR }
+      );
+      await redis.sadd(`tenant:staff:${tenantId}`, email.toLowerCase());
+      void writeAuditLog(tenantId, 'staff_invite', req.jwtPayload!.sub, `email=${email} role=${staffRole}`);
+      console.log(`[STAFF] Invited ${email} as ${staffRole} for tenant ${tenantId}`);
+      res.status(201).json({ ok: true });
+    } catch (err) {
+      console.error('[STAFF] invite failed:', err);
+      res.status(500).json({ error: 'Failed to invite staff member' });
+    }
+  });
+
+  app.delete('/api/admin/staff/:email', requireAuth, async (req: Request, res: Response) => {
+    const { tenantId, role } = req.jwtPayload!;
+    if (role !== 'tenant_admin' && role !== 'super_admin') {
+      res.status(403).json({ error: 'Forbidden' }); return;
+    }
+    const email = decodeURIComponent(req.params.email).toLowerCase();
+    try {
+      const redis = getRedis();
+      const u     = await redis.get<{ tenantId: string; role: string }>(`user:email:${email}`).catch(() => null);
+      if (!u) { res.status(404).json({ error: 'Staff member not found' }); return; }
+      if (u.tenantId !== tenantId) { res.status(403).json({ error: 'Cannot remove users from another tenant' }); return; }
+      if (u.role === 'tenant_admin') { res.status(400).json({ error: 'Cannot remove a tenant admin account' }); return; }
+      await redis.del(`user:email:${email}`);
+      await redis.srem(`tenant:staff:${tenantId}`, email);
+      void writeAuditLog(tenantId, 'staff_remove', req.jwtPayload!.sub, `removed=${email}`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[STAFF] remove failed:', err);
+      res.status(500).json({ error: 'Failed to remove staff member' });
+    }
   });
 
   // ── Static / SPA ────────────────────────────────────────────────────────────
