@@ -51,9 +51,14 @@ ORDERING FLOW:
 1. Do NOT speak first. Wait for the customer to start ordering.
 2. When a customer orders an item, immediately call add_item with everything they said.
 3. After a successful add_item (status="ok"), confirm with 2-3 words max: "Got it, added."
-4. When the customer is done, read back a brief summary of their order and total, then ask for confirmation.
-5. Only call confirm_order after they explicitly confirm (yes, okay, theek hai, haan, or equivalent).
-6. ${gstLine}
+4. When the customer is done, read back a brief summary of their order and total.
+5. Ask: "Is this dine-in, pickup, or takeaway (delivery)?" — wait for the customer's answer.
+   - "dine in" / "yahan khaana" / "table pe" → order_type = "dine_in"
+   - "pickup" / "le jaana" / "parcel" → order_type = "pickup"
+   - "delivery" / "ghar bhejdo" / "deliver karo" → order_type = "delivery"
+6. Only call confirm_order after they explicitly confirm (yes, okay, theek hai, haan, or equivalent).
+   Pass the order_type they specified; default to "dine_in" if unclear.
+7. ${gstLine}
 `;
   }
 }

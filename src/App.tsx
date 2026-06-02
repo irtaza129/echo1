@@ -175,6 +175,7 @@ export default function App({
   const [isConnected, setIsConnected] = useState(false);
   const [showMobileCart, setShowMobileCart] = useState(false);
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
+  const [manualOrderType, setManualOrderType] = useState<'dine_in' | 'pickup' | 'delivery'>('dine_in');
 
   const sessionIdRef      = useRef<string>(generateSessionId());
   const tenantConfigRef   = useRef<PublicTenantConfig>(DEFAULT_TENANT_CONFIG);
@@ -713,7 +714,7 @@ export default function App({
           })),
           customer_name:  'Guest',
           customer_phone: '0000000000',
-          order_type:     'dine_in',
+          order_type:     manualOrderType,
           payment_method: 'cash',
           delivery_fee:   0,
           discount:       0,
@@ -1118,6 +1119,21 @@ export default function App({
               <span className="text-xl font-bold font-mono">{currency} {total}</span>
             </div>
 
+            <div className="flex gap-1 mb-3">
+              {(['dine_in', 'pickup', 'delivery'] as const).map(t => (
+                <button
+                  key={t}
+                  onClick={() => setManualOrderType(t)}
+                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wide transition-all ${
+                    manualOrderType === t
+                      ? 'bg-[#A39171] text-white'
+                      : 'bg-white/10 text-white/60 hover:bg-white/20'
+                  }`}
+                >
+                  {t === 'dine_in' ? 'Dine In' : t === 'pickup' ? 'Pickup' : 'Takeaway'}
+                </button>
+              ))}
+            </div>
             <button
               onClick={submitOrder}
               disabled={cart.length === 0}
@@ -1208,6 +1224,21 @@ export default function App({
               <div className="flex justify-between items-end border-t border-white/20 pt-3 mb-4">
                 <span className="text-base font-serif">Total</span>
                 <span className="text-xl font-bold font-mono">{currency} {total}</span>
+              </div>
+              <div className="flex gap-1 mb-3">
+                {(['dine_in', 'pickup', 'delivery'] as const).map(t => (
+                  <button
+                    key={t}
+                    onClick={() => setManualOrderType(t)}
+                    className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wide transition-all ${
+                      manualOrderType === t
+                        ? 'bg-[#A39171] text-white'
+                        : 'bg-white/10 text-white/60 hover:bg-white/20'
+                    }`}
+                  >
+                    {t === 'dine_in' ? 'Dine In' : t === 'pickup' ? 'Pickup' : 'Takeaway'}
+                  </button>
+                ))}
               </div>
               <button
                 onClick={() => { submitOrder(); setShowMobileCart(false); }}
