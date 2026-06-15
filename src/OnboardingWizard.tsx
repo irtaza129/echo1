@@ -1,4 +1,10 @@
 import { useState, useId } from 'react';
+import {
+  POS_PRESETS, getPreset, defaultEndpointMappings,
+  ENDPOINT_OPERATIONS, RESOLVE_ITEM_MAP_FIELDS,
+  type EndpointMapping, type PresetAdapterType,
+} from './lib/posPresets';
+import EndpointDiscovery from './EndpointDiscovery';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -11,9 +17,11 @@ interface WizardConfig {
   slug:           string;
   plan:           string;
   adapter: {
-    type:             'managed' | 'custom_api';
+    presetId:         string;
+    type:             PresetAdapterType;
     backendUrl:       string;
     apiKey:           string;
+    webhookUrl:       string;
     endpointMappings: EndpointMappingDraft[];
   };
   gemini: {
@@ -39,12 +47,7 @@ interface WizardConfig {
   };
 }
 
-interface EndpointMappingDraft {
-  operation:     string;
-  method:        'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-  path:          string;
-  fieldMappings: Record<string, string>;
-}
+type EndpointMappingDraft = EndpointMapping;
 
 interface Props {
   jwtToken:         string;
@@ -99,23 +102,6 @@ const PLANS = [
   },
 ] as const;
 
-const ENDPOINT_OPERATIONS = [
-  { key: 'getMenuForUI',      label: 'Menu (kiosk display)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/menu' },
-  { key: 'resolveItem',       label: 'Add to Cart',            defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/resolve-item' },
-  { key: 'submitOrder',       label: 'Submit Order',           defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/submit-order' },
-  { key: 'getOrders',         label: 'Get Orders (kitchen)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/orders' },
-  { key: 'updateOrderStatus', label: 'Update Order Status',    defaultMethod: 'PATCH' as const, defaultPath: '/api/v1/orders' },
-  { key: 'getMenuContext',    label: 'AI Menu Context',        defaultMethod: 'GET'   as const, defaultPath: '/api/v1/agent/menu-context' },
-];
-
-const RESOLVE_ITEM_MAP_FIELDS = [
-  { key: 'status',         hint: '"ok" / "not_found" / "requires_input"' },
-  { key: 'cart_item_id',   hint: 'Unique item ID for remove operations' },
-  { key: 'unit_price',     hint: 'Item price as a number' },
-  { key: 'summary',        hint: 'Item display name / description' },
-  { key: 'ai_instruction', hint: 'Prompt text when requires_input' },
-];
-
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function OnboardingWizard({ jwtToken, initialSlug, initialName, onComplete, onLogout }: Props) {
@@ -128,15 +114,12 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
     slug:           initialSlug,
     plan:           'starter',
     adapter: {
+      presetId:         'managed',
       type:             'managed',
       backendUrl:       '',
       apiKey:           '',
-      endpointMappings: ENDPOINT_OPERATIONS.map(op => ({
-        operation:     op.key,
-        method:        op.defaultMethod,
-        path:          op.defaultPath,
-        fieldMappings: {},
-      })),
+      webhookUrl:       '',
+      endpointMappings: defaultEndpointMappings(),
     },
     gemini: {
       agentName:          `${initialName} Assistant`,
@@ -247,18 +230,33 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
   const patch = <K extends keyof WizardConfig>(section: K, updates: Partial<WizardConfig[K]>) =>
     setCfg(prev => ({ ...prev, [section]: { ...(prev[section] as object), ...updates } }));
 
+  // Pick a connection preset (Managed / Foodics / Custom API / Webhook). Sets the
+  // adapter type and seeds endpoint mappings from the preset (or platform defaults).
+  const selectPreset = (presetId: string) =>
+    setCfg(prev => {
+      const preset = getPreset(presetId);
+      if (!preset) return prev;
+      return {
+        ...prev,
+        adapter: {
+          ...prev.adapter,
+          presetId,
+          type:             preset.adapterType,
+          endpointMappings: preset.endpointMappings ?? defaultEndpointMappings(),
+        },
+      };
+    });
+
   // ── Step actions ─────────────────────────────────────────────────────────────
 
   const runTest = async () => {
     setBusy(true);
     setTestResult(null);
     setError('');
-    const url = cfg.adapter.type === 'managed'
-      ? (cfg.adapter.backendUrl || '/api/agent/menu-context')  // proxy to our own backend for managed
-      : cfg.adapter.backendUrl;
     try {
-      if (cfg.adapter.type === 'managed') {
-        // For managed adapters, test through our own proxy (which already knows the backend URL)
+      // custom_api probes the entered backend URL; managed + webhook tenants
+      // build their menu locally, so we verify through our own proxy instead.
+      if (cfg.adapter.type !== 'custom_api') {
         const r = await fetch('/api/agent/menu-context');
         if (r.ok) {
           const text = await r.text();
@@ -270,7 +268,11 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
         const r = await fetch('/api/admin/test-connection', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwtToken}` },
-          body: JSON.stringify({ backendUrl: url }),
+          body: JSON.stringify({
+            backendUrl:       cfg.adapter.backendUrl,
+            apiKey:           cfg.adapter.apiKey || undefined,
+            endpointMappings: cfg.adapter.endpointMappings,
+          }),
         });
         const body = await r.json() as { ok: boolean; sampleOutput?: string; error?: string };
         setTestResult({ ok: body.ok, msg: body.ok ? (body.sampleOutput ?? 'Connected!') : (body.error ?? 'Unknown error') });
@@ -288,12 +290,21 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
     try {
       const authHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${jwtToken}` };
 
-      // Save credentials first (custom_api only) — encrypted on the server
-      if (cfg.adapter.type === 'custom_api' && cfg.adapter.backendUrl) {
+      // Save credentials first — encrypted on the server.
+      //   custom_api → base URL + optional API key
+      //   webhook    → webhook URL we POST orders to
+      const needsCreds =
+        (cfg.adapter.type === 'custom_api' && cfg.adapter.backendUrl) ||
+        (cfg.adapter.type === 'webhook'    && cfg.adapter.webhookUrl);
+      if (needsCreds) {
         const cr = await fetch('/api/admin/save-credentials', {
           method: 'POST',
           headers: authHeaders,
-          body: JSON.stringify({ baseUrl: cfg.adapter.backendUrl, apiKey: cfg.adapter.apiKey || undefined }),
+          body: JSON.stringify({
+            baseUrl:    cfg.adapter.backendUrl || undefined,
+            apiKey:     cfg.adapter.apiKey     || undefined,
+            webhookUrl: cfg.adapter.webhookUrl || undefined,
+          }),
         });
         const crBody = await cr.json() as { ok?: boolean; error?: string };
         if (!cr.ok || !crBody.ok) { setError(crBody.error ?? 'Failed to save credentials'); return; }
@@ -324,8 +335,8 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
       const body = await r.json() as { ok?: boolean; kioskUrl?: string; error?: string };
       if (!r.ok || !body.ok) { setError(body.error ?? 'Save failed'); return; }
 
-      // Save menu data for managed tenants that added items during onboarding (step 4)
-      if (cfg.adapter.type === 'managed' && menuData.categories.length > 0) {
+      // Save menu data for tenants that build their menu here (managed + webhook)
+      if (cfg.adapter.type !== 'custom_api' && menuData.categories.length > 0) {
         await fetch('/api/admin/menu', {
           method: 'POST',
           headers: authHeaders,
@@ -486,49 +497,90 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
           {/* ── Step 2: Adapter ────────────────────────────────────────────── */}
           {step === 2 && (
             <div className="flex flex-col gap-4">
+              <p className="text-sm opacity-60 leading-relaxed -mt-2">
+                How do you take orders today? Pick the option that matches your restaurant — we'll handle the technical part.
+              </p>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {([
-                  { type: 'managed',    title: 'Managed (Recommended)', desc: 'We handle your backend. Zero setup required. Best for most restaurants.' },
-                  { type: 'custom_api', title: 'Custom API',            desc: 'Point to your own POS or ordering system REST API.' },
-                ] as const).map(opt => (
+                {POS_PRESETS.map(preset => (
                   <button
-                    key={opt.type}
+                    key={preset.id}
                     type="button"
-                    onClick={() => patch('adapter', { type: opt.type })}
+                    onClick={() => selectPreset(preset.id)}
                     className={`rounded-2xl border p-4 text-left transition-all cursor-pointer ${
-                      cfg.adapter.type === opt.type
+                      cfg.adapter.presetId === preset.id
                         ? 'border-[#5A5A40] bg-[#5A5A40]/6 ring-1 ring-[#5A5A40]/20'
                         : 'border-[#5A5A40]/15 hover:border-[#5A5A40]/30'
                     }`}
                   >
-                    <p className="font-bold text-sm text-[#5A5A40]">{opt.title}</p>
-                    <p className="text-xs opacity-55 mt-1 leading-relaxed">{opt.desc}</p>
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg leading-none">{preset.icon}</span>
+                      <p className="font-bold text-sm text-[#5A5A40]">{preset.name}</p>
+                      {preset.recommended && (
+                        <span className="ml-auto text-[9px] font-bold uppercase tracking-widest text-green-700 bg-green-100 px-1.5 py-0.5 rounded-full">
+                          Recommended
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs opacity-55 mt-1.5 leading-relaxed">{preset.tagline}</p>
                   </button>
                 ))}
               </div>
 
-              {cfg.adapter.type === 'custom_api' && (
-                <div className="flex flex-col gap-3 mt-2 bg-white/40 rounded-2xl p-4 border border-[#5A5A40]/10">
-                  <Field label="Backend Base URL">
-                    <input value={cfg.adapter.backendUrl}
-                      onChange={e => patch('adapter', { backendUrl: e.target.value })}
-                      className={INPUT} placeholder="https://api.myrestaurant.com" />
-                  </Field>
-                  <Field label="API Key (optional)">
-                    <input type="password" value={cfg.adapter.apiKey}
-                      onChange={e => patch('adapter', { apiKey: e.target.value })}
-                      className={INPUT} placeholder="sk-…" />
-                  </Field>
+              {(() => {
+                const preset = getPreset(cfg.adapter.presetId);
+                if (!preset) return null;
+                return (
+                  <div className="flex flex-col gap-3 mt-1 bg-white/40 rounded-2xl p-4 border border-[#5A5A40]/10">
+                    {preset.setupNote && (
+                      <p className="text-xs text-[#5A5A40] opacity-70 leading-relaxed">{preset.setupNote}</p>
+                    )}
 
-                  <div className="border-t border-[#5A5A40]/10 pt-3">
+                    {preset.needsBaseUrl && (
+                      <Field label={preset.baseUrlLabel ?? 'Backend URL'}>
+                        <input value={cfg.adapter.backendUrl}
+                          onChange={e => patch('adapter', { backendUrl: e.target.value })}
+                          className={INPUT} placeholder={preset.baseUrlPlaceholder ?? 'https://api.myrestaurant.com'} />
+                      </Field>
+                    )}
+
+                    {preset.needsApiKey && (
+                      <Field label={preset.apiKeyLabel ?? 'API Key'} hint={preset.apiKeyHelp}>
+                        <input type="password" value={cfg.adapter.apiKey}
+                          onChange={e => patch('adapter', { apiKey: e.target.value })}
+                          className={INPUT} placeholder="••••••••" />
+                      </Field>
+                    )}
+
+                    {preset.needsWebhookUrl && (
+                      <Field label={preset.webhookUrlLabel ?? 'Webhook URL'} hint={preset.webhookUrlHelp}>
+                        <input value={cfg.adapter.webhookUrl}
+                          onChange={e => patch('adapter', { webhookUrl: e.target.value })}
+                          className={INPUT} placeholder="https://hooks.zapier.com/…" />
+                      </Field>
+                    )}
+
+                    {preset.docsUrl && (
+                      <a href={preset.docsUrl} target="_blank" rel="noreferrer"
+                        className="text-xs text-[#5A5A40] underline opacity-60 hover:opacity-90 self-start">
+                        Where do I find this? →
+                      </a>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {cfg.adapter.type === 'custom_api' && (
+                <div className="flex flex-col gap-3 bg-white/40 rounded-2xl p-4 border border-[#5A5A40]/10">
+                  <div className="border-t-0 pt-0">
                     <button
                       type="button"
                       onClick={() => setShowEpConfig(s => !s)}
                       className="flex items-center gap-1.5 text-xs text-[#5A5A40] opacity-60 hover:opacity-90 cursor-pointer w-full text-left"
                     >
                       <span className="font-mono text-[10px]">{showEpConfig ? '▾' : '▸'}</span>
-                      <span className="font-semibold uppercase tracking-widest">Endpoint Configuration</span>
-                      <span className="opacity-50 ml-1 normal-case tracking-normal font-normal">— override API paths &amp; methods</span>
+                      <span className="font-semibold uppercase tracking-widest">Advanced — Endpoint Configuration</span>
+                      <span className="opacity-50 ml-1 normal-case tracking-normal font-normal">— optional, for developers</span>
                     </button>
 
                     {showEpConfig && (
@@ -540,24 +592,36 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
                         {ENDPOINT_OPERATIONS.map(opDef => {
                           const m = cfg.adapter.endpointMappings.find(x => x.operation === opDef.key);
                           return (
-                            <div key={opDef.key} className="flex items-center gap-2">
-                              <span className="text-[10px] font-semibold text-[#5A5A40] w-36 shrink-0 opacity-80 leading-tight">
-                                {opDef.label}
-                              </span>
-                              <select
-                                value={m?.method ?? opDef.defaultMethod}
-                                onChange={e => patchMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
-                                className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none w-20 shrink-0 cursor-pointer"
-                              >
-                                {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
-                                  <option key={v} value={v}>{v}</option>
-                                ))}
-                              </select>
-                              <input
-                                value={m?.path ?? opDef.defaultPath}
-                                onChange={e => patchMapping(opDef.key, { path: e.target.value })}
-                                className="flex-1 text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
-                                placeholder={opDef.defaultPath}
+                            <div key={opDef.key} className="flex flex-col gap-1 border-b border-[#5A5A40]/5 pb-2 last:border-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-semibold text-[#5A5A40] w-36 shrink-0 opacity-80 leading-tight">
+                                  {opDef.label}
+                                </span>
+                                <select
+                                  value={m?.method ?? opDef.defaultMethod}
+                                  onChange={e => patchMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
+                                  className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none w-20 shrink-0 cursor-pointer"
+                                >
+                                  {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
+                                    <option key={v} value={v}>{v}</option>
+                                  ))}
+                                </select>
+                                <input
+                                  value={m?.path ?? opDef.defaultPath}
+                                  onChange={e => patchMapping(opDef.key, { path: e.target.value })}
+                                  className="flex-1 text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                                  placeholder={opDef.defaultPath}
+                                />
+                              </div>
+                              <EndpointDiscovery
+                                label={opDef.label}
+                                method={m?.method ?? opDef.defaultMethod}
+                                path={m?.path ?? opDef.defaultPath}
+                                baseUrl={cfg.adapter.backendUrl}
+                                apiKey={cfg.adapter.apiKey}
+                                jwtToken={jwtToken}
+                                params={m?.params}
+                                onChange={p => patchMapping(opDef.key, { params: p })}
                               />
                             </div>
                           );
@@ -828,7 +892,12 @@ export default function OnboardingWizard({ jwtToken, initialSlug, initialName, o
                 <Row label="Restaurant"  value={cfg.restaurantName} />
                 <Row label="Kiosk URL"   value={`/kiosk/${cfg.slug}`} mono />
                 <Row label="Plan"        value={cfg.plan} />
-                <Row label="Adapter"     value={cfg.adapter.type === 'managed' ? 'Managed Backend' : `Custom API — ${cfg.adapter.backendUrl}`} />
+                <Row label="Connection"  value={
+                  (getPreset(cfg.adapter.presetId)?.name ?? 'Custom') +
+                  (cfg.adapter.type === 'custom_api' && cfg.adapter.backendUrl ? ` — ${cfg.adapter.backendUrl}`
+                   : cfg.adapter.type === 'webhook'  && cfg.adapter.webhookUrl ? ` — ${cfg.adapter.webhookUrl}`
+                   : '')
+                } />
                 <Row label="AI Agent"    value={`${cfg.gemini.agentName} (${cfg.gemini.voice})`} />
                 <Row label="Languages"   value={cfg.gemini.languages.join(', ')} />
                 <Row label="GST"         value={`${(cfg.businessRules.gstRate * 100).toFixed(1)}%`} />

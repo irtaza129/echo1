@@ -62,62 +62,77 @@ export class CustomApiAdapter implements IRestaurantAdapter {
   }
 
   // Find the configured path for an operation, or fall back to default.
-  private resolve(op: string): { path: string; fieldMappings?: Record<string, string> } {
+  private resolve(op: string): {
+    path: string;
+    fieldMappings?: Record<string, string>;
+    params?: { query?: Record<string, string>; body?: Record<string, string>; headers?: Record<string, string> };
+  } {
     const m = this.mappings.find(x => x.operation === op);
     return {
       path:          m?.path ?? DEFAULTS[op]?.path ?? `/${op}`,
       fieldMappings: m?.fieldMappings,
+      params:        m?.params,
+    };
+  }
+
+  // Build the axios request config (static query params + headers) the onboarder
+  // configured for an operation. Body params are merged separately by the caller.
+  private requestConfig(params?: { query?: Record<string, string>; headers?: Record<string, string> }) {
+    return {
+      params:  params?.query   ?? undefined,
+      headers: params?.headers ?? undefined,
     };
   }
 
   // ── Menu ─────────────────────────────────────────────────────────────────────
 
   async getMenuContext(): Promise<string> {
-    const { path } = this.resolve('getMenuContext');
-    const res = await this.client.get<string>(path);
+    const { path, params } = this.resolve('getMenuContext');
+    const res = await this.client.get<string>(path, this.requestConfig(params));
     return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
   }
 
   async getMenuForUI(): Promise<unknown> {
-    const { path } = this.resolve('getMenuForUI');
-    const res = await this.client.get(path);
+    const { path, params } = this.resolve('getMenuForUI');
+    const res = await this.client.get(path, this.requestConfig(params));
     return res.data;
   }
 
   // ── Cart ─────────────────────────────────────────────────────────────────────
 
   async resolveItem(params: ResolveItemParams): Promise<ResolveItemResult> {
-    const { path, fieldMappings } = this.resolve('resolveItem');
+    const { path, fieldMappings, params: extra } = this.resolve('resolveItem');
     const res = await this.client.post(path, {
       session_id:  params.sessionId,
       dish_query:  params.dishQuery,
       modifiers:   params.modifiers ?? [],
       quantity:    params.quantity  ?? 1,
       notes:       params.notes     ?? null,
-    });
+      ...(extra?.body ?? {}),
+    }, this.requestConfig(extra));
     return applyFieldMappings(res.data, fieldMappings) as ResolveItemResult;
   }
 
   async removeItem(sessionId: string, cartItemId: string): Promise<void> {
-    const { path } = this.resolve('removeItem');
-    await this.client.post(path, { session_id: sessionId, cart_item_id: cartItemId });
+    const { path, params: extra } = this.resolve('removeItem');
+    await this.client.post(path, { session_id: sessionId, cart_item_id: cartItemId, ...(extra?.body ?? {}) }, this.requestConfig(extra));
   }
 
   async clearCart(sessionId: string): Promise<void> {
-    const { path } = this.resolve('clearCart');
-    await this.client.post(path, { session_id: sessionId });
+    const { path, params: extra } = this.resolve('clearCart');
+    await this.client.post(path, { session_id: sessionId, ...(extra?.body ?? {}) }, this.requestConfig(extra));
   }
 
   async getCart(sessionId: string): Promise<unknown> {
-    const { path } = this.resolve('getCart');
-    const res = await this.client.get(`${path}/${sessionId}`);
+    const { path, params: extra } = this.resolve('getCart');
+    const res = await this.client.get(`${path}/${sessionId}`, this.requestConfig(extra));
     return res.data;
   }
 
   // ── Orders ───────────────────────────────────────────────────────────────────
 
   async submitOrder(params: SubmitOrderParams): Promise<OrderResult> {
-    const { path, fieldMappings } = this.resolve('submitOrder');
+    const { path, fieldMappings, params: extra } = this.resolve('submitOrder');
     const res = await this.client.post(path, {
       session_id:     params.sessionId,
       customer_name:  params.customerName  ?? null,
@@ -128,22 +143,24 @@ export class CustomApiAdapter implements IRestaurantAdapter {
       discount:       params.discount      ?? 0,
       instructions:   params.instructions  ?? null,
       notes:          params.notes         ?? null,
-    });
+      ...(extra?.body ?? {}),
+    }, this.requestConfig(extra));
     return applyFieldMappings(res.data, fieldMappings) as OrderResult;
   }
 
   async getOrders(filter?: OrderFilter): Promise<unknown> {
-    const { path } = this.resolve('getOrders');
-    const params: Record<string, string> = {};
-    if (filter?.status)  params.status   = filter.status;
-    if (filter?.perPage) params.per_page = String(filter.perPage);
-    const res = await this.client.get(path, { params });
+    const { path, params: extra } = this.resolve('getOrders');
+    // Configured static query params (e.g. branch_id) merge with the live filter.
+    const query: Record<string, string> = { ...(extra?.query ?? {}) };
+    if (filter?.status)  query.status   = filter.status;
+    if (filter?.perPage) query.per_page = String(filter.perPage);
+    const res = await this.client.get(path, { params: query, headers: extra?.headers });
     return res.data;
   }
 
   async updateOrderStatus(orderId: string, status: string): Promise<unknown> {
-    const { path } = this.resolve('updateOrderStatus');
-    const res = await this.client.patch(`${path}/${orderId}/status`, { status });
+    const { path, params: extra } = this.resolve('updateOrderStatus');
+    const res = await this.client.patch(`${path}/${orderId}/status`, { status, ...(extra?.body ?? {}) }, this.requestConfig(extra));
     return res.data;
   }
 }

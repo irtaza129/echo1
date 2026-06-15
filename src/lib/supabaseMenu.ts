@@ -34,7 +34,25 @@ function categoryId(name: string): string {
   return `cat:${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
 }
 
+// ── Mock menu data (USE_MOCK_SUPABASE=true) ──────────────────────────────────
+const MOCK_MENU: MenuData = {
+  categories: [
+    { id: 'cat:burgers', name: 'Burgers', sortOrder: 1 },
+    { id: 'cat:drinks', name: 'Drinks', sortOrder: 2 },
+  ],
+  items: [
+    { id: 'dish:1', categoryId: 'cat:burgers', name: 'Chicken Whopper', description: 'Crispy chicken whopper burger', price: 450, available: true },
+    { id: 'dish:2', categoryId: 'cat:burgers', name: 'Zinger Burger', description: 'Spicy zinger burger', price: 350, available: true },
+    { id: 'dish:3', categoryId: 'cat:drinks', name: 'Cola Next', description: 'Cola drink 500ml', price: 80, available: true },
+  ],
+};
+
 export async function fetchMenuFromSupabase(tenantId: string): Promise<MenuData> {
+  // Return mock data when Supabase mocking is enabled (local dev / CI)
+  if (process.env.USE_MOCK_SUPABASE === 'true') {
+    return MOCK_MENU;
+  }
+
   if (!UUID_RE.test(tenantId)) {
     throw new Error(`[SUPABASE] refusing menu fetch — invalid tenantId "${tenantId}"`);
   }

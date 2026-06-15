@@ -7,12 +7,18 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { issueJwt, extractJwt, type JwtPayload, type UserRole } from './src/lib/jwt.js';
-import { encryptCredentials, decryptCredentials } from './src/lib/crypto.js';
+import { encryptCredentials, decryptCredentials, type EncryptedBlob } from './src/lib/crypto.js';
 import { parseTenantConfig } from './src/lib/tenantConfig.js';
-import type { TenantConfig } from './src/lib/tenantConfig.js';
+import type { TenantConfig, AdapterCredentials } from './src/lib/tenantConfig.js';
 import { getRedis, redisKey, TTL } from './src/lib/redis.js';
 import { attachAdapter } from './middleware/tenant.js';
+import { AdapterFactory } from './adapter/AdapterFactory.js';
 import type { IRestaurantAdapter } from './adapter/IRestaurantAdapter.js';
+import { PaymentProviderFactory } from './payments/PaymentProviderFactory.js';
+import type { IPaymentProvider, PaymentTransaction } from './payments/IPaymentProvider.js';
+import { rupeesToPaisa, paisaToRupees } from './payments/money.js';
+import { probeEndpoint } from './adapter/probeEndpoint.js';
+import type { HttpMethod } from './src/lib/posPresets.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
 import {
   tenantsRepo,
@@ -84,9 +90,36 @@ interface LocalOrder {
   customer_phone: string;
   order_type:     string;
   payment_method: string;
+  // Online-payment state (absent for cash orders). payment_ref is the gateway tracker.
+  payment_status?: string;
+  payment_ref?:    string;
   notes:          string | null;
   created_at:     string;
   updated_at:     string;
+}
+
+// Count menu items across the shapes a backend might return (flat array,
+// { items }, { data }, or { categories: [{ items }] }). Used by test-connection.
+function countMenuItems(menu: unknown): number {
+  if (Array.isArray(menu)) return menu.length;
+  if (menu && typeof menu === 'object') {
+    const m = menu as Record<string, unknown>;
+    if (Array.isArray(m.items)) return (m.items as unknown[]).length;
+    if (Array.isArray(m.data))  return (m.data as unknown[]).length;
+    if (Array.isArray(m.categories)) {
+      return (m.categories as Array<Record<string, unknown>>)
+        .reduce((s, c) => s + (Array.isArray(c.items) ? (c.items as unknown[]).length : 0), 0);
+    }
+  }
+  return 0;
+}
+
+// Persist a payment transaction + an orderId → providerRef pointer so webhooks
+// (which only know the gateway ref) and status polls can both find the record.
+type RedisClientT = ReturnType<typeof getRedis>;
+async function savePaymentTxn(redis: RedisClientT, txn: PaymentTransaction): Promise<void> {
+  await redis.set(redisKey.payment(txn.providerRef), txn, { ex: TTL.PAYMENT });
+  await redis.set(redisKey.orderPayment(txn.orderId), txn.providerRef, { ex: TTL.PAYMENT });
 }
 
 // Normalise a string for fuzzy matching: lowercase, strip punctuation, collapse spaces.
@@ -197,6 +230,8 @@ declare global {
       jwtPayload?:  JwtPayload;
       tenantConfig?: TenantConfig;
       adapter?:     IRestaurantAdapter;
+      paymentProvider?: IPaymentProvider;
+      rawBody?:     Buffer;
     }
   }
 }
@@ -308,7 +343,13 @@ async function startServer() {
   // body that may have belonged to a different tenant (this is exactly how
   // Johnny's menu kept appearing under Savour even after the Redis fix).
   app.set('etag', false);
-  app.use(express.json({ limit: '100kb' }));
+  // Capture the raw request body so payment webhooks can verify HMAC signatures
+  // (signatures are computed over the exact bytes the gateway sent, not the
+  // re-serialised JSON). Stashed on req.rawBody; harmless for every other route.
+  app.use(express.json({
+    limit: '100kb',
+    verify: (req, _res, buf) => { (req as Request & { rawBody?: Buffer }).rawBody = buf; },
+  }));
   app.use('/api/', (_req, res, next) => {
     res.set('Cache-Control', 'no-store, must-revalidate');
     next();
@@ -681,52 +722,110 @@ async function startServer() {
   });
 
   // ── Adapter connection test ─────────────────────────────────────────────────
-  // Tries paths in order; a non-5xx response (including 404) proves the server
-  // is reachable. Only ECONNREFUSED / network errors are hard failures.
+  // Exercises the REAL adapter — same path, auth, and injected params the kiosk
+  // will use — and reports an actual menu item count. This makes "connected but
+  // empty" actionable (missing key / filter / wrong path) instead of mysterious.
   app.post('/api/admin/test-connection', requireAuth, async (req: Request, res: Response) => {
-    const { backendUrl } = req.body as { backendUrl?: string };
+    const { tenantId } = req.jwtPayload!;
+    const { backendUrl, apiKey, apiSecret, endpointMappings } = req.body as {
+      backendUrl?: string; apiKey?: string; apiSecret?: string; endpointMappings?: unknown;
+    };
     if (!backendUrl) { res.status(400).json({ error: 'backendUrl is required' }); return; }
+    const base = backendUrl.replace(/\/$/, '');
 
-    const base    = backendUrl.replace(/\/$/, '');
-    const probes  = [
-      `${base}/api/v1/agent/menu-context`,
-      `${base}/api/v1/menu`,
-      `${base}/health`,
-      base,
-    ];
-
-    for (const url of probes) {
+    // If the onboarder didn't re-type the API key, fall back to the saved one.
+    let key = apiKey;
+    let secret = apiSecret;
+    if (!key) {
       try {
-        const result = await axios.get(url, {
-          timeout: 10_000,
-          headers: { 'X-Tenant-ID': req.jwtPayload!.tenantId },
-          // Accept anything < 500 — 404 still proves the server answered
-          validateStatus: s => s < 500,
-        });
+        const blob = await getRedis().get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        if (blob) { const c = decryptCredentials(blob); key = c.apiKey; secret = secret ?? c.apiSecret; }
+      } catch { /* no saved creds */ }
+    }
 
-        if (result.status === 200) {
-          const sample = typeof result.data === 'string'
-            ? result.data.slice(0, 400)
-            : JSON.stringify(result.data).slice(0, 400);
-          res.json({ ok: true, sampleOutput: sample });
-        } else {
-          // Server is reachable but this path doesn't exist for this tenant yet
-          res.json({
-            ok: true,
-            sampleOutput: `Server is reachable (HTTP ${result.status} at ${url}). ` +
-              `The menu-context endpoint will be available once this tenant is provisioned on the backend.`,
-          });
-        }
-        return;
-      } catch (err) {
-        if (!axios.isAxiosError(err) || !err.response) continue; // network error — try next probe
-        // Got a 5xx — server is up but erroring
-        res.json({ ok: false, error: `HTTP ${err.response.status} at ${url}: ${err.message}` });
+    let adapter: IRestaurantAdapter;
+    try {
+      const cfg = parseTenantConfig({
+        tenantId, slug: 'connection-test', restaurantName: 'Connection Test', plan: 'starter',
+        adapter: { type: 'custom_api', endpointMappings: Array.isArray(endpointMappings) ? endpointMappings : undefined },
+        gemini: {}, branding: {}, businessRules: {}, features: {},
+      });
+      adapter = AdapterFactory.create(cfg, { baseUrl: base, apiKey: key, apiSecret: secret });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: `Invalid adapter configuration: ${String(err)}` });
+      return;
+    }
+
+    // 1. Fetch the menu the way the kiosk will, and count what came back.
+    try {
+      const menu  = await adapter.getMenuForUI();
+      const count = countMenuItems(menu);
+      if (count > 0) {
+        res.json({ ok: true, itemCount: count, sampleOutput: `✓ Fetched ${count} menu item(s) from your backend.` });
+      } else {
+        res.json({
+          ok: true, itemCount: 0,
+          sampleOutput:
+            'Connected, but the menu came back empty. This usually means one of:\n' +
+            '•  the endpoint needs an API key — add it above, or\n' +
+            '•  it needs a required filter (e.g. branch_id / location_id), or\n' +
+            '•  the menu lives at a different path.\n' +
+            'Use "Detect requirements" on the Menu / Add to Cart operations to add what it needs, then test again.',
+        });
+      }
+      return;
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response) {
+        const status = err.response.status;
+        const hint =
+          status === 401 || status === 403 ? 'Authentication failed — check your API key.'
+          : status === 404                 ? 'Path not found — check the Menu endpoint path in Advanced settings.'
+          :                                  'The backend errored on this request.';
+        res.json({ ok: status < 500, sampleOutput: `Backend responded HTTP ${status}. ${hint}`,
+          error: status >= 500 ? `Backend error HTTP ${status}` : undefined });
         return;
       }
     }
 
-    res.json({ ok: false, error: 'Could not reach the server. Check the URL and ensure the backend is running.' });
+    // 2. Last resort — is the host even reachable?
+    try {
+      await axios.get(base, { timeout: 8_000, validateStatus: () => true });
+      res.json({ ok: true, sampleOutput: 'Host is reachable, but the menu endpoint returned no data. Check the path, API key, and required filters.' });
+    } catch {
+      res.json({ ok: false, error: 'Could not reach the server. Check the URL and that the backend is running.' });
+    }
+  });
+
+  // ── Endpoint discovery (probe) ──────────────────────────────────────────────
+  // Figures out what a POS endpoint requires (auth, required params/filters) via
+  // OpenAPI import or a live probe, so the onboarding UI can pop input fields.
+  app.post('/api/admin/probe-endpoint', requireAuth, async (req: Request, res: Response) => {
+    const { tenantId } = req.jwtPayload!;
+    const { baseUrl, path, method, apiKey } = req.body as
+      { baseUrl?: string; path?: string; method?: string; apiKey?: string };
+    if (!baseUrl || !path) { res.status(400).json({ error: 'baseUrl and path are required' }); return; }
+
+    const verb = (method ?? 'GET').toUpperCase();
+    const allowed = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+    if (!allowed.includes(verb)) { res.status(400).json({ error: 'Invalid method' }); return; }
+
+    // Use the key the onboarder just typed, else fall back to saved credentials.
+    let key = apiKey;
+    let secret: string | undefined;
+    if (!key) {
+      try {
+        const blob = await getRedis().get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        if (blob) { const c = decryptCredentials(blob); key = c.apiKey; secret = c.apiSecret; }
+      } catch { /* no saved creds — probe unauthenticated */ }
+    }
+
+    try {
+      const result = await probeEndpoint({ baseUrl, path, method: verb as HttpMethod, apiKey: key, apiSecret: secret });
+      res.json(result);
+    } catch (err) {
+      console.error('[PROBE] failed:', err);
+      res.status(502).json({ error: 'Probe failed', message: String(err) });
+    }
   });
 
   // ── Adapter credentials (encrypted at rest) ───────────────────────────────
@@ -738,13 +837,33 @@ async function startServer() {
     if (role !== 'tenant_admin' && role !== 'super_admin') {
       res.status(403).json({ error: 'Forbidden' }); return;
     }
-    const { baseUrl, apiKey, apiSecret } =
-      req.body as { baseUrl?: string; apiKey?: string; apiSecret?: string };
-    if (!baseUrl) { res.status(400).json({ error: 'baseUrl is required' }); return; }
+    const incoming = req.body as Partial<AdapterCredentials>;
+    // Accept POS/backend creds AND payment-gateway creds. At least one connection
+    // identifier must be present so we don't store an empty blob.
+    const hasSomething =
+      incoming.baseUrl || incoming.webhookUrl || incoming.apiKey ||
+      incoming.paymentApiKey || incoming.paymentWebhookSecret;
+    if (!hasSomething) {
+      res.status(400).json({ error: 'baseUrl, webhookUrl, or payment credentials are required' }); return;
+    }
 
     try {
-      const blob  = encryptCredentials({ baseUrl, apiKey, apiSecret });
       const redis = getRedis();
+      // Merge with existing credentials so saving POS keys doesn't wipe payment
+      // keys (and vice-versa). Only fields actually sent are overwritten; an
+      // empty-string field is treated as "clear", undefined as "leave as-is".
+      let existing: AdapterCredentials = {};
+      try {
+        const prevBlob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        if (prevBlob) existing = decryptCredentials(prevBlob);
+      } catch { /* no prior creds — start fresh */ }
+
+      const merged: AdapterCredentials = { ...existing };
+      for (const [k, v] of Object.entries(incoming)) {
+        if (v !== undefined) merged[k] = v === '' ? undefined : v;
+      }
+
+      const blob = encryptCredentials(merged);
       await redis.set(redisKey.credentialsKey(tenantId), blob);
       void writeAuditLog(tenantId, 'credentials_save', req.jwtPayload!.sub);
       void dualWrite('adapter_credentials.upsert', credentialsRepo.upsert(tenantId, blob));
@@ -765,9 +884,9 @@ async function startServer() {
       const redis = getRedis();
       const blob  = await redis.get(redisKey.credentialsKey(tenantId));
       if (!blob) { res.json({ hasCredentials: false }); return; }
-      // Decrypt just to get the baseUrl — never return the key
+      // Decrypt just to get the non-secret URLs — never return the key/secret
       const creds = decryptCredentials(blob as Parameters<typeof decryptCredentials>[0]);
-      res.json({ hasCredentials: true, baseUrl: creds.baseUrl ?? '' });
+      res.json({ hasCredentials: true, baseUrl: creds.baseUrl ?? '', webhookUrl: creds.webhookUrl ?? '' });
     } catch {
       res.json({ hasCredentials: false });
     }
@@ -1279,13 +1398,45 @@ async function startServer() {
             created_at: now, updated_at: now,
           };
 
+          // If this tenant collects payment online, create a checkout session
+          // up-front so the kiosk can redirect the customer. The order stays
+          // 'pending' until the signed webhook confirms capture (truth = webhook,
+          // not the client). Cash tenants skip this entirely — unchanged.
+          let payment: { providerRef: string; redirectUrl?: string; clientToken?: string; status: string } | undefined;
+          if (PaymentProviderFactory.isOnline(cfg) && req.paymentProvider) {
+            try {
+              const amountPaisa = rupeesToPaisa(total);
+              const checkout    = await req.paymentProvider.createCheckout({
+                orderId, amountPaisa, currency: cfg.businessRules.currency,
+                customerName: order.customer_name, customerPhone: order.customer_phone,
+              });
+              order.payment_method = req.paymentProvider.id;
+              order.payment_status = checkout.status;
+              order.payment_ref    = checkout.providerRef;
+              await savePaymentTxn(redis, {
+                providerRef: checkout.providerRef, provider: req.paymentProvider.id,
+                tenantId, orderId, amountPaisa, currency: cfg.businessRules.currency,
+                status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
+              });
+              payment = {
+                providerRef: checkout.providerRef, redirectUrl: checkout.redirectUrl,
+                clientToken: checkout.clientToken, status: checkout.status,
+              };
+            } catch (err) {
+              // Never lose the order over a gateway hiccup — record it unpaid so
+              // staff can collect manually, and surface the failure to the caller.
+              console.error('[PAYMENT] checkout creation failed:', err);
+              order.payment_status = 'failed';
+            }
+          }
+
           await redis.set(redisKey.localOrder(orderId), order, { ex: TTL.LOCAL_ORDER });
           await redis.lpush(redisKey.localOrders(tenantId), orderId);
           await redis.ltrim(redisKey.localOrders(tenantId), 0, 499);
           await redis.del(cartKey);
 
           console.log(`[LOCAL] Order #${orderNum} created for tenant ${tenantId}`);
-          res.status(201).json({ id: orderId, order_id: orderId, order_number: orderNum, total, summary: `Order #${orderNum}` });
+          res.status(201).json({ id: orderId, order_id: orderId, order_number: orderNum, total, summary: `Order #${orderNum}`, payment });
         } catch (err) {
           console.error('[LOCAL] submit-order failed:', err);
           res.status(500).json({ error: 'Failed to submit order' });
@@ -1304,6 +1455,144 @@ async function startServer() {
       });
       res.status(201).json(result);
     } catch (err) { adapterError(res, err); }
+  });
+
+  // ── Payments (Safepay etc.) ─────────────────────────────────────────────────
+  // checkout + status are tenant-scoped (need req.paymentProvider); the webhook
+  // is called server-to-server by the gateway with no auth, so it resolves the
+  // tenant from the stored transaction instead of attachAdapter.
+  app.use('/api/payments/checkout', attachAdapter);
+  app.use('/api/payments/status',   attachAdapter);
+
+  // Create a checkout session for an existing local order. Returns the hosted
+  // checkout URL the kiosk redirects the customer to.
+  app.post('/api/payments/checkout', async (req: Request, res: Response) => {
+    const tenantId = req.tenantConfig?.tenantId;
+    const provider = req.paymentProvider;
+    if (!tenantId || !provider) { res.status(400).json({ error: 'Tenant or payment provider unavailable' }); return; }
+    if (provider.id === 'cash') { res.status(400).json({ error: 'Tenant is not configured for online payment' }); return; }
+
+    const { order_id, redirect_url, cancel_url } = req.body as
+      { order_id?: string; redirect_url?: string; cancel_url?: string };
+    if (!order_id) { res.status(400).json({ error: 'order_id is required' }); return; }
+
+    try {
+      const redis = getRedis();
+      const order = await redis.get<LocalOrder>(redisKey.localOrder(order_id));
+      if (!order || order.tenant_id !== tenantId) { res.status(404).json({ error: 'Order not found' }); return; }
+
+      const amountPaisa = rupeesToPaisa(order.total);
+      const checkout    = await provider.createCheckout({
+        orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
+        customerName: order.customer_name, customerPhone: order.customer_phone,
+        redirectUrl: redirect_url, cancelUrl: cancel_url,
+      });
+
+      const now = new Date().toISOString();
+      order.payment_method = provider.id;
+      order.payment_status = checkout.status;
+      order.payment_ref    = checkout.providerRef;
+      await redis.set(redisKey.localOrder(order_id), order, { ex: TTL.LOCAL_ORDER });
+      await savePaymentTxn(redis, {
+        providerRef: checkout.providerRef, provider: provider.id, tenantId,
+        orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
+        status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
+      });
+
+      res.json({
+        providerRef: checkout.providerRef, redirectUrl: checkout.redirectUrl,
+        clientToken: checkout.clientToken, status: checkout.status,
+      });
+    } catch (err) {
+      console.error('[PAYMENT] checkout failed:', err);
+      res.status(502).json({ error: 'Payment gateway error' });
+    }
+  });
+
+  // Inbound gateway webhook. Public — authenticity is proven by the HMAC
+  // signature, not by a session. Tenant is resolved from the stored transaction.
+  app.post('/api/payments/:provider/webhook', async (req: Request, res: Response) => {
+    const raw = req.rawBody ?? Buffer.from(JSON.stringify(req.body ?? {}), 'utf8');
+
+    // Read the providerRef untrusted, only to locate which tenant's secret to
+    // verify against. The signature check below still validates the full body.
+    let refHint = '';
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+      const data   = (parsed.data ?? {}) as Record<string, unknown>;
+      refHint = String(data.tracker ?? data.token ?? data.reference ?? parsed.tracker ?? parsed.token ?? '');
+    } catch { /* refHint stays empty */ }
+    if (!refHint) { res.status(400).json({ error: 'Missing payment reference' }); return; }
+
+    try {
+      const redis = getRedis();
+      const txn   = await redis.get<PaymentTransaction>(redisKey.payment(refHint));
+      if (!txn) { res.status(404).json({ error: 'Unknown payment reference' }); return; }
+
+      // Rebuild this tenant's provider so verifyWebhook uses the right secret.
+      let credentials: AdapterCredentials = {};
+      try {
+        const blob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(txn.tenantId));
+        if (blob) credentials = decryptCredentials(blob);
+      } catch { /* no creds → verification will fail safely below */ }
+      const provider = PaymentProviderFactory.createById(txn.provider, credentials);
+
+      const result = provider.verifyWebhook(raw, req.headers);
+      if (!result.signatureValid) {
+        console.warn(`[PAYMENT] webhook signature INVALID for ref ${refHint} (tenant ${txn.tenantId})`);
+        res.status(401).json({ error: 'Invalid signature' }); return;
+      }
+
+      // Idempotent: re-deliveries of an already-final state are no-ops.
+      const now = new Date().toISOString();
+      if (txn.status !== result.status) {
+        txn.status    = result.status;
+        txn.updatedAt = now;
+        await redis.set(redisKey.payment(refHint), txn, { ex: TTL.PAYMENT });
+
+        const order = await redis.get<LocalOrder>(redisKey.localOrder(txn.orderId));
+        if (order) {
+          order.payment_status = result.status;
+          order.updated_at     = now;
+          // On capture, advance a still-pending order so the kitchen sees a paid order.
+          if (result.status === 'captured' && order.status === 'pending') order.status = 'confirmed';
+          await redis.set(redisKey.localOrder(txn.orderId), order, { ex: TTL.LOCAL_ORDER });
+        }
+      }
+
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[PAYMENT] webhook handling failed:', err);
+      res.status(500).json({ error: 'Webhook processing failed' });
+    }
+  });
+
+  // Polling fallback for a missed webhook (cold start / network blip).
+  app.get('/api/payments/status/:providerRef', async (req: Request, res: Response) => {
+    const tenantId    = req.tenantConfig?.tenantId;
+    const providerRef = req.params.providerRef;
+    if (!tenantId) { res.status(400).json({ error: 'Tenant unavailable' }); return; }
+    try {
+      const redis = getRedis();
+      const txn   = await redis.get<PaymentTransaction>(redisKey.payment(providerRef));
+      if (!txn || txn.tenantId !== tenantId) { res.status(404).json({ error: 'Payment not found' }); return; }
+
+      // If still open, ask the gateway directly and reconcile.
+      if (req.paymentProvider && txn.status === 'initiated') {
+        try {
+          const live = await req.paymentProvider.getStatus(providerRef);
+          if (live.status !== txn.status) {
+            txn.status = live.status; txn.updatedAt = new Date().toISOString();
+            await redis.set(redisKey.payment(providerRef), txn, { ex: TTL.PAYMENT });
+          }
+        } catch { /* gateway unreachable — return last-known status */ }
+      }
+
+      res.json({ providerRef, status: txn.status, amountRupees: paisaToRupees(txn.amountPaisa) });
+    } catch (err) {
+      console.error('[PAYMENT] status failed:', err);
+      res.status(500).json({ error: 'Failed to read payment status' });
+    }
   });
 
   // ── Menu + Orders routes — also through adapter ─────────────────────────────

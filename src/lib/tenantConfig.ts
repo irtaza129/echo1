@@ -8,6 +8,13 @@ const EndpointMappingSchema = z.object({
   path:        z.string(),
   // Optional field-path overrides: maps our field name → their JSON path (dot notation)
   fieldMappings: z.record(z.string(), z.string()).optional(),
+  // Static params the adapter injects on every call (filters, branch ids, etc.),
+  // discovered by the endpoint probe / OpenAPI import or entered by the onboarder.
+  params: z.object({
+    query:   z.record(z.string(), z.string()).optional(),
+    body:    z.record(z.string(), z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+  }).optional(),
 });
 
 // ── Full TenantConfig schema ──────────────────────────────────────────────────
@@ -39,10 +46,19 @@ export const TenantConfigSchema = z.object({
   businessRules: z.object({
     gstRate:            z.number().min(0).max(1).default(0),
     currencySymbol:     z.string().default('$'),
+    // ISO currency code used for payment gateway calls (display uses the symbol).
+    currency:           z.string().default('PKR'),
     orderStatusMachine: z.array(z.string()).default([
       'pending', 'confirmed', 'preparing', 'ready', 'delivered',
     ]),
   }),
+
+  // Optional so existing configs parse unchanged. Absent → cash (today's behaviour).
+  payments: z.object({
+    provider:        z.enum(['cash', 'safepay']).default('cash'),
+    captureMode:     z.enum(['auto', 'manual']).default('auto'),
+    threeDSRequired: z.boolean().default(true),
+  }).optional(),
 
   features: z.object({
     deliveryOrders:  z.boolean().default(false),
@@ -58,10 +74,19 @@ export type AdapterType       = TenantConfig['adapter']['type'];
 
 // Credentials stored separately (encrypted) — not in TenantConfig
 export interface AdapterCredentials {
+  // Restaurant backend / POS
   apiKey?:    string;
   apiSecret?: string;
   baseUrl?:   string;
   webhookUrl?: string;
+  // Payment gateway (Safepay etc.) — never logged, never returned to the browser
+  paymentApiKey?:        string;
+  paymentSecret?:        string;
+  paymentWebhookSecret?: string;
+  paymentApiBase?:       string;
+  paymentCheckoutBase?:  string;
+  paymentEnvironment?:   string;  // 'sandbox' | 'production'
+  merchantId?:           string;
   [key: string]: string | undefined;
 }
 

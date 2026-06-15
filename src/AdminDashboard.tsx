@@ -1,4 +1,6 @@
 import { useState, useEffect, useId } from 'react';
+import { ENDPOINT_OPERATIONS, RESOLVE_ITEM_MAP_FIELDS, type EndpointParams } from './lib/posPresets';
+import EndpointDiscovery from './EndpointDiscovery';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -22,7 +24,13 @@ interface FullConfig {
   businessRules: {
     gstRate:            number;
     currencySymbol:     string;
+    currency?:          string;
     orderStatusMachine: string[];
+  };
+  payments?: {
+    provider:        string;
+    captureMode?:    string;
+    threeDSRequired?: boolean;
   };
   features: {
     deliveryOrders:   boolean;
@@ -71,24 +79,8 @@ interface EndpointMappingDraft {
   method:        'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path:          string;
   fieldMappings: Record<string, string>;
+  params?:       EndpointParams;
 }
-
-const ENDPOINT_OPERATIONS = [
-  { key: 'getMenuForUI',      label: 'Menu (kiosk display)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/menu' },
-  { key: 'resolveItem',       label: 'Add to Cart',            defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/resolve-item' },
-  { key: 'submitOrder',       label: 'Submit Order',           defaultMethod: 'POST'  as const, defaultPath: '/api/v1/agent/submit-order' },
-  { key: 'getOrders',         label: 'Get Orders (kitchen)',   defaultMethod: 'GET'   as const, defaultPath: '/api/v1/orders' },
-  { key: 'updateOrderStatus', label: 'Update Order Status',    defaultMethod: 'PATCH' as const, defaultPath: '/api/v1/orders' },
-  { key: 'getMenuContext',    label: 'AI Menu Context',        defaultMethod: 'GET'   as const, defaultPath: '/api/v1/agent/menu-context' },
-];
-
-const RESOLVE_ITEM_MAP_FIELDS = [
-  { key: 'status',         hint: '"ok" / "not_found" / "requires_input"' },
-  { key: 'cart_item_id',   hint: 'Unique item ID for remove operations' },
-  { key: 'unit_price',     hint: 'Item price as a number' },
-  { key: 'summary',        hint: 'Item display name / description' },
-  { key: 'ai_instruction', hint: 'Prompt text when requires_input' },
-];
 
 function getEffectiveMappings(adapter: { endpointMappings?: EndpointMappingDraft[] }): EndpointMappingDraft[] {
   return ENDPOINT_OPERATIONS.map(opDef => {
@@ -124,6 +116,14 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   // Credentials (custom_api only) — apiKey is write-only, never returned from server
   const [credBaseUrl,   setCredBaseUrl]   = useState('');
   const [credApiKey,    setCredApiKey]    = useState('');
+  const [credWebhookUrl, setCredWebhookUrl] = useState('');
+  // Payments (Safepay)
+  const [payEnabled,    setPayEnabled]    = useState(false);
+  const [payApiKey,     setPayApiKey]     = useState('');
+  const [payWebhookSec, setPayWebhookSec] = useState('');
+  const [payEnv,        setPayEnv]        = useState('sandbox');
+  const [paySaving,     setPaySaving]     = useState(false);
+  const [payMsg,        setPayMsg]        = useState('');
   const [credSaving,    setCredSaving]    = useState(false);
   const [credMsg,       setCredMsg]       = useState('');
   const [credHas,       setCredHas]       = useState(false);
@@ -258,12 +258,14 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
     const authH = { Authorization: `Bearer ${jwtToken}` };
     Promise.all([
       fetch('/api/admin/my-config',          { headers: authH }).then(r => r.json() as Promise<FullConfig>),
-      fetch('/api/admin/credentials-status', { headers: authH }).then(r => r.json() as Promise<{ hasCredentials: boolean; baseUrl?: string }>),
+      fetch('/api/admin/credentials-status', { headers: authH }).then(r => r.json() as Promise<{ hasCredentials: boolean; baseUrl?: string; webhookUrl?: string }>),
     ])
       .then(([cfg, creds]) => {
         setConfig(cfg); setDraft(cfg); setTestUrl('');
         setCredHas(creds.hasCredentials);
         if (creds.baseUrl) setCredBaseUrl(creds.baseUrl);
+        if (creds.webhookUrl) setCredWebhookUrl(creds.webhookUrl);
+        setPayEnabled(cfg.payments?.provider === 'safepay');
       })
       .catch(() => setSaveMsg('Failed to load config'))
       .finally(() => setLoading(false));
@@ -333,7 +335,11 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
         const r = await fetch('/api/admin/test-connection', {
           method: 'POST',
           headers: authHeaders,
-          body: JSON.stringify({ backendUrl: testUrl }),
+          body: JSON.stringify({
+            backendUrl:       testUrl || credBaseUrl,
+            apiKey:           credApiKey || undefined,
+            endpointMappings: draft ? getEffectiveMappings(draft.adapter) : undefined,
+          }),
         });
         const body = await r.json() as { ok: boolean; sampleOutput?: string; error?: string };
         setTestResult({ ok: body.ok, msg: body.ok ? (body.sampleOutput ?? 'Connected!') : (body.error ?? 'Error') });
@@ -346,14 +352,19 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   };
 
   const handleSaveCredentials = async () => {
-    if (!credBaseUrl) return;
+    const isWebhook = draft?.adapter.type === 'webhook';
+    if (isWebhook ? !credWebhookUrl : !credBaseUrl) return;
     setCredSaving(true);
     setCredMsg('');
     try {
       const r = await fetch('/api/admin/save-credentials', {
         method: 'POST',
         headers: authHeaders,
-        body: JSON.stringify({ baseUrl: credBaseUrl, apiKey: credApiKey || undefined }),
+        body: JSON.stringify({
+          baseUrl:    credBaseUrl    || undefined,
+          apiKey:     credApiKey     || undefined,
+          webhookUrl: credWebhookUrl || undefined,
+        }),
       });
       const body = await r.json() as { ok?: boolean; error?: string };
       if (r.ok && body.ok) { setCredHas(true); setCredApiKey(''); setCredMsg('Saved!'); }
@@ -363,6 +374,54 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
     } finally {
       setCredSaving(false);
       setTimeout(() => setCredMsg(''), 3000);
+    }
+  };
+
+  // Save payment settings: persist gateway keys (encrypted) AND flip the
+  // tenant's payments.provider in config, in one click.
+  const handleSavePayments = async () => {
+    if (!draft) return;
+    setPaySaving(true);
+    setPayMsg('');
+    try {
+      if (payEnabled) {
+        const cr = await fetch('/api/admin/save-credentials', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            paymentApiKey:        payApiKey     || undefined,
+            paymentWebhookSecret: payWebhookSec || undefined,
+            paymentEnvironment:   payEnv,
+          }),
+        });
+        const crBody = await cr.json() as { ok?: boolean; error?: string };
+        if (!cr.ok || !crBody.ok) { setPayMsg(crBody.error ?? 'Failed to save keys'); return; }
+      }
+
+      const nextConfig: FullConfig = {
+        ...draft,
+        payments: payEnabled
+          ? { provider: 'safepay', captureMode: 'auto', threeDSRequired: true }
+          : { provider: 'cash' },
+      };
+      const r = await fetch('/api/admin/save-config', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify(nextConfig),
+      });
+      const body = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && body.ok) {
+        setConfig(nextConfig); setDraft(nextConfig);
+        setPayApiKey(''); setPayWebhookSec('');
+        setPayMsg('Saved!');
+      } else {
+        setPayMsg(body.error ?? 'Save failed');
+      }
+    } catch {
+      setPayMsg('Network error');
+    } finally {
+      setPaySaving(false);
+      setTimeout(() => setPayMsg(m => m === 'Saved!' ? '' : m), 3000);
     }
   };
 
@@ -658,6 +717,33 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
               </Section>
             )}
 
+            {/* Webhook URL — only shown for webhook adapter */}
+            {draft.adapter.type === 'webhook' && (
+              <Section title="Webhook Destination">
+                <p className="text-xs opacity-50 leading-relaxed -mt-1">
+                  We POST each confirmed order to this URL. Build your menu in the Menu tab — the AI uses it directly.
+                  The URL is encrypted with AES-256 and never appears in logs or exports.
+                </p>
+                <Field label="Webhook URL">
+                  <input value={credWebhookUrl} onChange={e => setCredWebhookUrl(e.target.value)}
+                    className={INPUT} placeholder="https://hooks.zapier.com/…" />
+                </Field>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleSaveCredentials} disabled={credSaving || !credWebhookUrl}
+                    className="px-5 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl font-bold text-xs uppercase tracking-widest hover:bg-[#4a4a33] transition disabled:opacity-50 cursor-pointer"
+                  >
+                    {credSaving ? 'Saving…' : 'Save Webhook'}
+                  </button>
+                  {credMsg && (
+                    <span className={`text-sm font-semibold ${credMsg === 'Saved!' ? 'text-green-600' : 'text-red-600'}`}>
+                      {credMsg}
+                    </span>
+                  )}
+                </div>
+              </Section>
+            )}
+
             {/* Endpoint Mapping — only shown for custom_api adapter */}
             {draft.adapter.type === 'custom_api' && (
               <Section title="Endpoint Configuration">
@@ -675,24 +761,36 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                   {ENDPOINT_OPERATIONS.map(opDef => {
                     const m = getEffectiveMappings(draft.adapter).find(x => x.operation === opDef.key)!;
                     return (
-                      <div key={opDef.key} className="grid grid-cols-[144px_80px_1fr] gap-x-2 items-center">
-                        <span className="text-xs font-semibold text-[#5A5A40] opacity-80 leading-tight truncate">
-                          {opDef.label}
-                        </span>
-                        <select
-                          value={m.method}
-                          onChange={e => patchDraftMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
-                          className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none cursor-pointer"
-                        >
-                          {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
-                            <option key={v} value={v}>{v}</option>
-                          ))}
-                        </select>
-                        <input
-                          value={m.path}
-                          onChange={e => patchDraftMapping(opDef.key, { path: e.target.value })}
-                          className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-3 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
-                          placeholder={opDef.defaultPath}
+                      <div key={opDef.key} className="flex flex-col gap-1 border-b border-[#5A5A40]/5 pb-2 last:border-0">
+                        <div className="grid grid-cols-[144px_80px_1fr] gap-x-2 items-center">
+                          <span className="text-xs font-semibold text-[#5A5A40] opacity-80 leading-tight truncate">
+                            {opDef.label}
+                          </span>
+                          <select
+                            value={m.method}
+                            onChange={e => patchDraftMapping(opDef.key, { method: e.target.value as EndpointMappingDraft['method'] })}
+                            className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-2 py-1.5 focus:outline-none cursor-pointer"
+                          >
+                            {(['GET','POST','PUT','PATCH','DELETE'] as const).map(v => (
+                              <option key={v} value={v}>{v}</option>
+                            ))}
+                          </select>
+                          <input
+                            value={m.path}
+                            onChange={e => patchDraftMapping(opDef.key, { path: e.target.value })}
+                            className="text-xs bg-white/80 border border-[#5A5A40]/15 rounded-lg px-3 py-1.5 placeholder:opacity-25 focus:outline-none font-mono"
+                            placeholder={opDef.defaultPath}
+                          />
+                        </div>
+                        <EndpointDiscovery
+                          label={opDef.label}
+                          method={m.method}
+                          path={m.path}
+                          baseUrl={credBaseUrl}
+                          apiKey={credApiKey}
+                          jwtToken={jwtToken}
+                          params={m.params}
+                          onChange={p => patchDraftMapping(opDef.key, { params: p })}
                         />
                       </div>
                     );
@@ -776,6 +874,63 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                   </button>
                 </label>
               ))}
+            </Section>
+
+            {/* Payments (Safepay) */}
+            <Section title="Online Payments">
+              <p className="text-xs opacity-50 leading-relaxed -mt-1">
+                Accept card &amp; wallet payments online via Safepay (Pakistan). Cardholder data and 3-D Secure
+                are handled entirely on Safepay's secure page — keys are encrypted and never appear in logs.
+              </p>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-sm font-semibold text-[#5A5A40]">Accept online card payments (Safepay)</span>
+                <button
+                  type="button"
+                  onClick={() => setPayEnabled(v => !v)}
+                  className={`relative w-10 h-5 rounded-full transition cursor-pointer ${payEnabled ? 'bg-[#5A5A40]' : 'bg-[#5A5A40]/20'}`}
+                >
+                  <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${payEnabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                </button>
+              </label>
+
+              {payEnabled && (
+                <>
+                  <Field label="Safepay API Key" hint="Safepay Dashboard → Developers → API Keys">
+                    <input type="password" value={payApiKey} onChange={e => setPayApiKey(e.target.value)}
+                      className={INPUT} placeholder={config?.payments?.provider === 'safepay' ? '•••••••• (leave blank to keep)' : 'sec_…'} />
+                  </Field>
+                  <Field label="Webhook Signing Secret" hint="Used to verify payment webhooks are genuinely from Safepay">
+                    <input type="password" value={payWebhookSec} onChange={e => setPayWebhookSec(e.target.value)}
+                      className={INPUT} placeholder={config?.payments?.provider === 'safepay' ? '•••••••• (leave blank to keep)' : 'whsec_…'} />
+                  </Field>
+                  <Field label="Environment">
+                    <div className="flex gap-2">
+                      {(['sandbox', 'production'] as const).map(env => (
+                        <button key={env} type="button" onClick={() => setPayEnv(env)}
+                          className={`px-4 py-2 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                            payEnv === env ? 'bg-[#5A5A40] text-[#F8F7F2] border-[#5A5A40]' : 'border-[#5A5A40]/20 text-[#5A5A40] hover:border-[#5A5A40]/50'
+                          }`}>
+                          {env === 'sandbox' ? 'Sandbox (test)' : 'Production (live)'}
+                        </button>
+                      ))}
+                    </div>
+                  </Field>
+                </>
+              )}
+
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleSavePayments} disabled={paySaving}
+                  className="px-5 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl font-bold text-xs uppercase tracking-widest hover:bg-[#4a4a33] transition disabled:opacity-50 cursor-pointer"
+                >
+                  {paySaving ? 'Saving…' : 'Save Payment Settings'}
+                </button>
+                {payMsg && (
+                  <span className={`text-sm font-semibold ${payMsg === 'Saved!' ? 'text-green-600' : 'text-red-600'}`}>
+                    {payMsg}
+                  </span>
+                )}
+              </div>
             </Section>
 
             {/* Save bar */}
