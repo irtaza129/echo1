@@ -1,0 +1,704 @@
+{
+  "categories": [
+    {
+      "id": "cat:food",
+      "name": "Food",
+      "sortOrder": 1
+    },
+    {
+      "id": "cat:savoury-sandwiches",
+      "name": "Savoury Sandwiches",
+      "sortOrder": 2
+    },
+    {
+      "id": "cat:sweet",
+      "name": "Sweet",
+      "sortOrder": 3
+    },
+    {
+      "id": "cat:cakes",
+      "name": "Cakes",
+      "sortOrder": 4
+    },
+    {
+      "id": "cat:alternates",
+      "name": "Alternates",
+      "sortOrder": 5
+    },
+    {
+      "id": "cat:rotating-specials",
+      "name": "Rotating Specials",
+      "sortOrder": 6
+    },
+    {
+      "id": "cat:iced-coffee",
+      "name": "Iced Coffee",
+      "sortOrder": 7
+    },
+    {
+      "id": "cat:matcha--tea-(iced)",
+      "name": "Matcha / Tea (Iced)",
+      "sortOrder": 8
+    },
+    {
+      "id": "cat:coffee-(hot)",
+      "name": "Coffee (Hot)",
+      "sortOrder": 9
+    },
+    {
+      "id": "cat:matcha-(hot)",
+      "name": "Matcha (Hot)",
+      "sortOrder": 10
+    }
+  ],
+  "items": [
+    {
+      "id": "dish:tcc-1",
+      "categoryId": "cat:food",
+      "name": "Bagel",
+      "description": "Freshly baked bagel, perfect with your favorite spread.",
+      "price": 200.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-2",
+      "categoryId": "cat:food",
+      "name": "Butter Croissant",
+      "description": "Flaky, buttery, and freshly baked classic croissant.",
+      "price": 490.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-3",
+      "categoryId": "cat:food",
+      "name": "Cream Cheese",
+      "description": "Rich and creamy cream cheese spread.",
+      "price": 100.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-4",
+      "categoryId": "cat:food",
+      "name": "Fajita Puff",
+      "description": "Savory, golden-brown puff pastry filled with fajita chicken.",
+      "price": 590.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-5",
+      "categoryId": "cat:food",
+      "name": "Feta Brushetta",
+      "description": "Crispy toasted bread topped with savory feta cheese and herbs.",
+      "price": 700.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-6",
+      "categoryId": "cat:food",
+      "name": "Egg & Sausage Bagel",
+      "description": "Hearty breakfast bagel topped with egg and savory sausage.",
+      "price": 600.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-7",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Beef Brisket",
+      "description": "Tender, slow-cooked beef brisket sandwich served on fresh bread.",
+      "price": 840.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-8",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Beef Patty Melt",
+      "description": "Juicy beef patty with melted cheese and grilled onions in toasted bread.",
+      "price": 890.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-9",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Hunter Beef",
+      "description": "Traditional spiced, cured hunter beef sandwich.",
+      "price": 945.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-10",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Beef Pastrami",
+      "description": "Classic beef pastrami sandwich layered with cheese and mustard.",
+      "price": 1190.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-11",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Bacon Grilled Cheese",
+      "description": "Crispy, buttery grilled cheese sandwich with savory bacon.",
+      "price": 850.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-12",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Grilled Chicken & Spinach",
+      "description": "Delicious grilled chicken sandwich.",
+      "price": 850.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-13",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Chicken Pesto",
+      "description": "Grilled chicken sandwich featuring aromatic basil pesto.",
+      "price": 770.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-14",
+      "categoryId": "cat:savoury-sandwiches",
+      "name": "Chicken Jalapeno",
+      "description": "Spicy chicken sandwich topped with sliced jalapenos.",
+      "price": 850.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-15",
+      "categoryId": "cat:sweet",
+      "name": "Almond Croissant",
+      "description": "Flaky croissant filled and topped with sweet almond frangipane.",
+      "price": 600.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-16",
+      "categoryId": "cat:sweet",
+      "name": "Pistachio Croissant",
+      "description": "Delectable flaky croissant filled with rich pistachio cream.",
+      "price": 690.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-17",
+      "categoryId": "cat:sweet",
+      "name": "Pain Au Chocolat",
+      "description": "Classic French pastry filled with rich dark chocolate.",
+      "price": 500.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-18",
+      "categoryId": "cat:sweet",
+      "name": "Banana Bread",
+      "description": "Moist, sweet banana bread slice.",
+      "price": 635.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-19",
+      "categoryId": "cat:sweet",
+      "name": "Chocolate Brownie",
+      "description": "Rich, fudgy chocolate brownie.",
+      "price": 745.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-20",
+      "categoryId": "cat:sweet",
+      "name": "ChocChip Cookie",
+      "description": "Delectable fresh-baked cookie.",
+      "price": 330.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-21",
+      "categoryId": "cat:sweet",
+      "name": "Blueberry Muffin",
+      "description": "Soft, cake-like muffin bursting with sweet blueberries.",
+      "price": 390.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-22",
+      "categoryId": "cat:sweet",
+      "name": "Pistachio Cookie (GF)",
+      "description": "Delectable fresh-baked cookie.",
+      "price": 290.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-23",
+      "categoryId": "cat:cakes",
+      "name": "Pecan Pie",
+      "description": "Classic dessert pie with a sweet filling and crunchy pecans.",
+      "price": 910.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-24",
+      "categoryId": "cat:cakes",
+      "name": "Choc Flourless Cake (GF)",
+      "description": "Decadent flourless chocolate cake, naturally gluten-free.",
+      "price": 790.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-25",
+      "categoryId": "cat:cakes",
+      "name": "Carrot Cake",
+      "description": "Moist carrot cake with rich cream cheese frosting.",
+      "price": 420.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-26",
+      "categoryId": "cat:cakes",
+      "name": "Lisbon Cake (GF)",
+      "description": "Rich chocolate Lisbon cake slice, gluten-free.",
+      "price": 630.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-27",
+      "categoryId": "cat:cakes",
+      "name": "Coffee Cake",
+      "description": "Spiced cake with a crumbly cinnamon streusel topping.",
+      "price": 590.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-28",
+      "categoryId": "cat:cakes",
+      "name": "Matilda Cake",
+      "description": "Show-stopping, multi-layered chocolate cake.",
+      "price": 1250.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-29",
+      "categoryId": "cat:alternates",
+      "name": "Sugar Free Energy Bars",
+      "description": "Healthy, sugar-free energy bar packed with nutrients.",
+      "price": 720.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-30",
+      "categoryId": "cat:alternates",
+      "name": "Macademia Short Bread",
+      "description": "Buttery, crumbly shortbread cookies made with macadamia nuts.",
+      "price": 405.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-31",
+      "categoryId": "cat:alternates",
+      "name": "Date Pudding with Butter Scotch",
+      "description": "Warm date pudding served with sweet butterscotch sauce.",
+      "price": 455.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-32",
+      "categoryId": "cat:rotating-specials",
+      "name": "Keto Brownie",
+      "description": "Rich, fudgy chocolate brownie.",
+      "price": 995.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-33",
+      "categoryId": "cat:rotating-specials",
+      "name": "Banana Bread (SF) (GF)",
+      "description": "Moist, sweet banana bread slice.",
+      "price": 1115.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-34",
+      "categoryId": "cat:rotating-specials",
+      "name": "Protein Bites Box",
+      "description": "Box of nutritious, protein-packed energy bites.",
+      "price": 785.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-35",
+      "categoryId": "cat:rotating-specials",
+      "name": "Chilled Banana Pudding",
+      "description": "Creamy and delicious banana pudding.",
+      "price": 900.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-36",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Espresso",
+      "description": "Intense and concentrated shot of pure, rich coffee.",
+      "price": 490.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-37",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Americano",
+      "description": "Espresso shots diluted with hot water for a smooth, bold flavor.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-38",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Cappuccino",
+      "description": "Classic espresso drink with equal parts espresso, steamed milk, and milk foam.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-39",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Latte",
+      "description": "Rich espresso with steamed milk and a touch of sweetness.",
+      "price": 590.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-40",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Spanish Latte",
+      "description": "Rich espresso with steamed milk and a touch of Spanish sweetness.",
+      "price": 690.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-41",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Honey Latte",
+      "description": "Rich espresso with steamed milk and a touch of Honey sweetness.",
+      "price": 670.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-42",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Vanilla Latte",
+      "description": "Rich espresso with steamed milk and a touch of Vanilla sweetness.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-43",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Caramel Latte",
+      "description": "Rich espresso with steamed milk and a touch of Caramel sweetness.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-44",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Hazelnut Latte",
+      "description": "Rich espresso with steamed milk and a touch of Hazelnut sweetness.",
+      "price": 730.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-45",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Maple Latte",
+      "description": "Rich espresso with steamed milk and a touch of Maple sweetness.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-46",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Mocha",
+      "description": "Decadent combination of espresso, steamed milk, and rich chocolate syrup.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-47",
+      "categoryId": "cat:iced-coffee",
+      "name": "Iced Hot Chocolate",
+      "description": "Rich and creamy steamed milk blended with premium cocoa.",
+      "price": 665.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-48",
+      "categoryId": "cat:iced-coffee",
+      "name": "Affogato",
+      "description": "A scoop of vanilla ice cream drowned in a hot shot of espresso.",
+      "price": 780.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-49",
+      "categoryId": "cat:iced-coffee",
+      "name": "Blended Mocha Frappe",
+      "description": "Decadent combination of espresso, steamed milk, and rich chocolate syrup.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-50",
+      "categoryId": "cat:iced-coffee",
+      "name": "Blended Vanilla Frappe",
+      "description": "Fresh and delicious Blended Vanilla Frappe from our Iced Coffee selection.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-51",
+      "categoryId": "cat:iced-coffee",
+      "name": "Blended Hazelnut Frappe",
+      "description": "Fresh and delicious Blended Hazelnut Frappe from our Iced Coffee selection.",
+      "price": 1010.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-52",
+      "categoryId": "cat:iced-coffee",
+      "name": "Blended Caramel Frappe",
+      "description": "Fresh and delicious Blended Caramel Frappe from our Iced Coffee selection.",
+      "price": 1010.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-53",
+      "categoryId": "cat:iced-coffee",
+      "name": "Espresso Tonic",
+      "description": "Intense and concentrated shot of pure, rich coffee.",
+      "price": 750.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-54",
+      "categoryId": "cat:iced-coffee",
+      "name": "Espresso Soda",
+      "description": "Intense and concentrated shot of pure, rich coffee.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-55",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Iced Matcha Kyoto",
+      "description": "Premium Japanese green tea powder whisked with milk/water, Kyoto style.",
+      "price": 680.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-56",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Iced Matcha Latte",
+      "description": "Rich espresso with steamed milk and a touch of sweetness.",
+      "price": 630.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-57",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Iced Matcha Kobe",
+      "description": "Premium Japanese green tea powder whisked with milk/water, Kobe style.",
+      "price": 660.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-58",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Iced Matcha Americano",
+      "description": "Espresso shots diluted with hot water for a smooth, bold flavor.",
+      "price": 580.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-59",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Peach Iced Tea",
+      "description": "Refreshing iced tea infused with Peach flavor.",
+      "price": 660.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-60",
+      "categoryId": "cat:matcha--tea-(iced)",
+      "name": "Strawberry Iced Tea",
+      "description": "Refreshing iced tea infused with Strawberry flavor.",
+      "price": 660.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-61",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Espresso",
+      "description": "Intense and concentrated shot of pure, rich coffee.",
+      "price": 480.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-62",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Americano",
+      "description": "Espresso shots diluted with hot water for a smooth, bold flavor.",
+      "price": 560.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-63",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Macchiato",
+      "description": "Espresso marked with a small dollop of foamed milk.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-64",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Cappuccino",
+      "description": "Classic espresso drink with equal parts espresso, steamed milk, and milk foam.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-65",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Latte",
+      "description": "Rich espresso with steamed milk and a touch of sweetness.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-66",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Spanish Latte",
+      "description": "Rich espresso with steamed milk and a touch of Spanish sweetness.",
+      "price": 690.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-67",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Honey Latte",
+      "description": "Rich espresso with steamed milk and a touch of Honey sweetness.",
+      "price": 670.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-68",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Vanilla Latte",
+      "description": "Rich espresso with steamed milk and a touch of Vanilla sweetness.",
+      "price": 730.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-69",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Caramel Latte",
+      "description": "Rich espresso with steamed milk and a touch of Caramel sweetness.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-70",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Hazelnut Latte",
+      "description": "Rich espresso with steamed milk and a touch of Hazelnut sweetness.",
+      "price": 730.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-71",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Maple Latte",
+      "description": "Rich espresso with steamed milk and a touch of Maple sweetness.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-72",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Mocha",
+      "description": "Decadent combination of espresso, steamed milk, and rich chocolate syrup.",
+      "price": 760.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-73",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Flat White",
+      "description": "Espresso with microfoam for a smooth, velvet texture.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-74",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Cortado",
+      "description": "Espresso cut with an equal amount of warm milk.",
+      "price": 570.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-75",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Hot Chocolate",
+      "description": "Rich and creamy steamed milk blended with premium cocoa.",
+      "price": 665.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-76",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Extra Espresso",
+      "description": "Intense and concentrated shot of pure, rich coffee.",
+      "price": 380.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-77",
+      "categoryId": "cat:coffee-(hot)",
+      "name": "Decaf",
+      "description": "Smooth decaffeinated hot coffee option.",
+      "price": 600,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-78",
+      "categoryId": "cat:matcha-(hot)",
+      "name": "Matcha Kyoto",
+      "description": "Premium Japanese green tea powder whisked with milk/water, Kyoto style.",
+      "price": 680.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-79",
+      "categoryId": "cat:matcha-(hot)",
+      "name": "Matcha Latte",
+      "description": "Rich espresso with steamed milk and a touch of sweetness.",
+      "price": 630.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-80",
+      "categoryId": "cat:matcha-(hot)",
+      "name": "Matcha Kobe",
+      "description": "Premium Japanese green tea powder whisked with milk/water, Kobe style.",
+      "price": 660.0,
+      "available": true
+    },
+    {
+      "id": "dish:tcc-81",
+      "categoryId": "cat:matcha-(hot)",
+      "name": "Matcha Americano",
+      "description": "Espresso shots diluted with hot water for a smooth, bold flavor.",
+      "price": 580.0,
+      "available": true
+    }
+  ]
+}
