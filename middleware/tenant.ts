@@ -4,6 +4,7 @@ import { parseTenantConfig, type TenantConfig, type AdapterCredentials } from '.
 import { decryptCredentials, type EncryptedBlob } from '../src/lib/crypto.js';
 import { AdapterFactory } from '../adapter/AdapterFactory.js';
 import type { IRestaurantAdapter } from '../adapter/IRestaurantAdapter.js';
+import { PaymentProviderFactory } from '../payments/PaymentProviderFactory.js';
 import { extractJwt } from '../src/lib/jwt.js';
 
 // Savour Foods hard-coded fallback — used when no JWT is present or Redis is
@@ -148,6 +149,15 @@ export async function attachAdapter(
   const adapter: IRestaurantAdapter = AdapterFactory.create(config, credentials);
   req.tenantConfig = config;
   req.adapter      = adapter;
+
+  // Build the payment provider too (cash by default). Guarded: a misconfigured
+  // gateway (e.g. provider set to safepay but no key yet) must not 500 every
+  // agent route — payment routes surface the misconfiguration on use instead.
+  try {
+    req.paymentProvider = PaymentProviderFactory.create(config, credentials);
+  } catch (err) {
+    console.warn(`[PAYMENT] provider init failed for tenant ${config.tenantId}:`, (err as Error).message);
+  }
 
   // Surface the resolved tenant on every tenant-scoped response. Frontends can
   // (and should) cross-check this against the tenantId they expected — catches

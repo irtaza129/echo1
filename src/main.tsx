@@ -45,7 +45,8 @@ type Screen =
   | 'dashboard'
   | 'transcripts'
   | 'admin'
-  | 'super_admin';
+  | 'super_admin'
+  | 'impersonate';
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
@@ -56,12 +57,36 @@ function Root() {
   // Transient state set after signup before onboarding saves to Redis
   const [pendingSlug, setPendingSlug] = useState('');
   const [pendingName, setPendingName] = useState('');
+  // Impersonation state — set when super admin manages a tenant in-app
+  const [impJwt,      setImpJwt]      = useState('');
+  const [impSlug,     setImpSlug]     = useState('');
+  const [impSubScreen, setImpSubScreen] = useState<'admin' | 'orders'>('admin');
 
   const [conversationLog, setConversationLog] = useState<TranscriptTurn[]>([]);
 
   // ── Session restore on load ───────────────────────────────────────────────
 
   useEffect(() => {
+    // Handle the /admin-impersonate?token=...&slug=... URL that older super-admin
+    // code opened in a new tab. Install the token and redirect into the impersonate
+    // screen so the new tab works correctly.
+    const params   = new URLSearchParams(window.location.search);
+    const impToken = params.get('token');
+    const impSlugParam = params.get('slug');
+    if (window.location.pathname === '/admin-impersonate' && impToken) {
+      window.history.replaceState({}, '', '/admin');
+      sessionStorage.setItem(JWT_KEY,    impToken);
+      sessionStorage.setItem(TOKEN_KEY,  impToken);
+      const claims = decodeJwt(impToken);
+      setJwtToken(impToken);
+      setJwtClaims(claims);
+      setImpJwt(impToken);
+      setImpSlug(impSlugParam ?? claims?.slug ?? '');
+      setImpSubScreen('admin');
+      setScreen('impersonate');
+      return;
+    }
+
     const token = sessionStorage.getItem(TOKEN_KEY);
     const jwt   = sessionStorage.getItem(JWT_KEY);
     if (!token) { setScreen('login'); return; }
@@ -123,6 +148,33 @@ function Root() {
     setJwtClaims(null);
     setConversationLog([]);
     setScreen('login');
+  };
+
+  // ── Impersonation ─────────────────────────────────────────────────────────
+  // When the super admin clicks "Manage →" we install the tenant's JWT into
+  // sessionStorage so every tenantFetch call in child components (AdminDashboard,
+  // OrdersDashboard) picks up the right tenant automatically.
+  const handleManageTenant = (jwt: string, slug: string) => {
+    sessionStorage.setItem('sf_imp_backup_jwt',   sessionStorage.getItem('sf_jwt')        ?? '');
+    sessionStorage.setItem('sf_imp_backup_token', sessionStorage.getItem('sf_auth_token') ?? '');
+    sessionStorage.setItem('sf_jwt',        jwt);
+    sessionStorage.setItem('sf_auth_token', jwt);
+    setImpJwt(jwt);
+    setImpSlug(slug);
+    setImpSubScreen('admin');
+    setScreen('impersonate');
+  };
+
+  const handleExitImpersonate = () => {
+    const backupJwt   = sessionStorage.getItem('sf_imp_backup_jwt')   ?? '';
+    const backupToken = sessionStorage.getItem('sf_imp_backup_token') ?? '';
+    sessionStorage.setItem('sf_jwt',        backupJwt);
+    sessionStorage.setItem('sf_auth_token', backupToken);
+    sessionStorage.removeItem('sf_imp_backup_jwt');
+    sessionStorage.removeItem('sf_imp_backup_token');
+    setImpJwt('');
+    setImpSlug('');
+    setScreen('super_admin');
   };
 
   // ── URL sync ─────────────────────────────────────────────────────────────
@@ -194,7 +246,51 @@ function Root() {
       <SuperAdminDashboard
         jwtToken={jwtToken}
         onLogout={handleLogout}
+        onManageTenant={handleManageTenant}
       />
+    );
+  }
+
+  if (screen === 'impersonate') {
+    return (
+      <div className="flex flex-col h-full overflow-hidden">
+        {/* Impersonation banner */}
+        <div className="shrink-0 flex items-center justify-between px-5 py-2.5 bg-amber-50 border-b-2 border-amber-300">
+          <div className="flex items-center gap-3">
+            <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+            <span className="text-xs font-bold text-amber-800 uppercase tracking-widest">Impersonating</span>
+            <span className="text-xs font-mono text-amber-700 bg-amber-100 px-2 py-0.5 rounded-lg border border-amber-200">
+              {impSlug}
+            </span>
+            <span className="text-[10px] text-amber-600 opacity-70 hidden sm:block">
+              Changes you make here affect this tenant's live configuration
+            </span>
+          </div>
+          <button
+            onClick={handleExitImpersonate}
+            className="text-xs font-semibold text-amber-800 hover:text-amber-900 border border-amber-300 rounded-lg px-3 py-1.5 hover:bg-amber-100 transition cursor-pointer shrink-0"
+          >
+            ← Exit to Super Admin
+          </button>
+        </div>
+
+        {/* Impersonated sub-screen */}
+        <div className="flex-1 overflow-hidden">
+          {impSubScreen === 'orders' ? (
+            <OrdersDashboard
+              onBack={() => setImpSubScreen('admin')}
+              onLogout={handleExitImpersonate}
+            />
+          ) : (
+            <AdminDashboard
+              jwtToken={impJwt}
+              onLogout={handleExitImpersonate}
+              onNavigateToKiosk={() => window.open(`/kiosk/${impSlug}`, '_blank')}
+              onNavigateToDashboard={() => setImpSubScreen('orders')}
+            />
+          )}
+        </div>
+      </div>
     );
   }
 
