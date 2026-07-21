@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      # tsc --noEmit. This is the gate that now catches adapter/route/frontend
+      # drift, because the collection-returning adapter methods are typed
+      # (WireOrder[] / WireCartItem[]) instead of `unknown`. Keep them typed —
+      # widening one back to `unknown` silently disables this check.
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+        env:
+          # Build-time only; the real key is never needed to typecheck or bundle.
+          GEMINI_API_KEY: dummy-key-for-build
+
+  # The smoke test needs a live server plus real Redis/Supabase credentials, so
+  # it cannot run on a PR from a fork. Run it against staging after deploy:
+  #
+  #   npm run smoke -- https://staging.example.com <tenant-uuid>
+  #
+  # It is the only check that can catch deployed-schema drift and response-shape
+  # regressions, which tsc cannot see. Wire it up here once staging secrets are
+  # available in the repo.

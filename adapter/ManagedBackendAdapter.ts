@@ -7,7 +7,10 @@ import type {
   SubmitOrderParams,
   OrderResult,
   OrderFilter,
+  WireOrder,
+  WireCartItem,
 } from './IRestaurantAdapter.js';
+import { unwrapCollection } from './IRestaurantAdapter.js';
 
 // Calls our own Render backend, scoped by X-Tenant-ID header.
 // This is the default adapter for all clients who let us manage their backend.
@@ -61,9 +64,9 @@ export class ManagedBackendAdapter implements IRestaurantAdapter {
     await this.client.post('/api/v1/agent/clear-cart', { session_id: sessionId });
   }
 
-  async getCart(sessionId: string): Promise<unknown> {
+  async getCart(sessionId: string): Promise<WireCartItem[]> {
     const res = await this.client.get(`/api/v1/agent/cart/${sessionId}`);
-    return res.data;
+    return unwrapCollection<WireCartItem>(res.data, 'getCart');
   }
 
   // ── Orders ─────────────────────────────────────────────────────────────────
@@ -83,12 +86,12 @@ export class ManagedBackendAdapter implements IRestaurantAdapter {
     return res.data;
   }
 
-  async getOrders(filter?: OrderFilter): Promise<unknown> {
+  async getOrders(filter?: OrderFilter): Promise<WireOrder[]> {
     const params: Record<string, string> = {};
     if (filter?.status)  params.status   = filter.status;
     if (filter?.perPage) params.per_page = String(filter.perPage);
     const res = await this.client.get('/api/v1/orders', { params });
-    return res.data;
+    return unwrapCollection<WireOrder>(res.data, 'getOrders');
   }
 
   async updateOrderStatus(orderId: string, status: string): Promise<unknown> {

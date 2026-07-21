@@ -71,3 +71,45 @@ export async function insert<T extends object>(
     headers: { Prefer: 'return=minimal' },
   });
 }
+
+// ── Boot-time schema assertion ────────────────────────────────────────────────
+// Every column this app writes, per table. Kept next to the write helpers so it
+// is obvious it must be updated when a repo write changes.
+//
+// This exists because audit_log was deployed with (actor_id, payload) while the
+// code wrote (actor, details). Every insert failed with PGRST204, dualWrite()
+// swallowed it, and the audit trail silently recorded nothing for the entire
+// life of the feature. A single startup check would have caught it on day one.
+const EXPECTED_COLUMNS: Record<string, string[]> = {
+  tenants:             ['id', 'slug', 'name', 'plan', 'status'],
+  tenant_configs:      ['tenant_id', 'config', 'updated_by', 'updated_at'],
+  adapter_credentials: ['tenant_id', 'ciphertext', 'iv', 'algorithm', 'updated_at'],
+  platform_users:      ['tenant_id', 'email', 'password_hash', 'role', 'last_login_at'],
+  audit_log:           ['tenant_id', 'actor', 'action', 'details'],
+};
+
+export interface SchemaProblem {
+  table:   string;
+  missing: string[];
+}
+
+// Reads PostgREST's OpenAPI document (one request, no writes) and compares the
+// live columns against EXPECTED_COLUMNS.
+//
+// Returns problems rather than throwing: a schema drift should be loud in the
+// logs but must not stop the server booting, since Redis is the primary store
+// and the kiosk works without Postgres. Callers decide how noisy to be.
+export async function checkSchema(): Promise<SchemaProblem[]> {
+  const res  = await client().get<{ definitions?: Record<string, { properties?: Record<string, unknown> }> }>('/');
+  const defs = res.data?.definitions ?? {};
+  const problems: SchemaProblem[] = [];
+
+  for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
+    const live = defs[table]?.properties;
+    if (!live) { problems.push({ table, missing: ['<table not found>'] }); continue; }
+    const missing = expected.filter(c => !(c in live));
+    if (missing.length) problems.push({ table, missing });
+  }
+
+  return problems;
+}

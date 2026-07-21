@@ -38,6 +38,10 @@ create table if not exists tenant_configs (
 
 -- ── Adapter credentials (encrypted at rest) ──────────────────
 -- AES-256-GCM; credentials_enc + iv stored as hex text
+-- SUPERSEDED by migrations/003_adapter_credentials_ciphertext.sql.
+-- The application writes `ciphertext` and `algorithm`, not `credentials_enc`.
+-- 003 must be run after this file on a fresh database. As with audit_log above,
+-- do not edit this block — 001 is already applied in production.
 create table if not exists adapter_credentials (
   tenant_id        uuid primary key references tenants(id) on delete cascade,
   credentials_enc  text not null,   -- hex-encoded ciphertext
@@ -54,6 +58,12 @@ create table if not exists kiosk_sessions (
 );
 
 -- ── Audit log ────────────────────────────────────────────────
+-- SUPERSEDED by migrations/002_audit_log_actor_details.sql.
+-- The application writes `actor` (opaque text: emails, "super",
+-- "legacy-agent1101") and `details` (text) — not actor_id/payload. Applying 001
+-- to a fresh database still creates these columns, so 002 must be run after it.
+-- Do not "fix" this by editing the block below: 001 has already been applied to
+-- production and editing an applied migration makes environments diverge.
 create table if not exists audit_log (
   id         bigserial primary key,
   tenant_id  uuid references tenants(id),

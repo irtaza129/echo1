@@ -7,7 +7,10 @@ import type {
   SubmitOrderParams,
   OrderResult,
   OrderFilter,
+  WireOrder,
+  WireCartItem,
 } from './IRestaurantAdapter.js';
+import { unwrapCollection } from './IRestaurantAdapter.js';
 
 // Default paths — these mirror what our managed Render backend exposes.
 // Tenants whose own API matches this shape need zero configuration.
@@ -108,10 +111,10 @@ export class CustomApiAdapter implements IRestaurantAdapter {
     await this.client.post(path, { session_id: sessionId });
   }
 
-  async getCart(sessionId: string): Promise<unknown> {
+  async getCart(sessionId: string): Promise<WireCartItem[]> {
     const { path } = this.resolve('getCart');
     const res = await this.client.get(`${path}/${sessionId}`);
-    return res.data;
+    return unwrapCollection<WireCartItem>(res.data, 'getCart');
   }
 
   // ── Orders ───────────────────────────────────────────────────────────────────
@@ -132,13 +135,13 @@ export class CustomApiAdapter implements IRestaurantAdapter {
     return applyFieldMappings(res.data, fieldMappings) as OrderResult;
   }
 
-  async getOrders(filter?: OrderFilter): Promise<unknown> {
+  async getOrders(filter?: OrderFilter): Promise<WireOrder[]> {
     const { path } = this.resolve('getOrders');
     const params: Record<string, string> = {};
     if (filter?.status)  params.status   = filter.status;
     if (filter?.perPage) params.per_page = String(filter.perPage);
     const res = await this.client.get(path, { params });
-    return res.data;
+    return unwrapCollection<WireOrder>(res.data, 'getOrders');
   }
 
   async updateOrderStatus(orderId: string, status: string): Promise<unknown> {

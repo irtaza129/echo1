@@ -1,32 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { tenantFetch, getCurrentTenant } from './lib/apiClient';
+import type { WireOrder } from './lib/types';
 
-type SelectedOption = {
-  option_name: string;
-  choice_name: string;
-};
-
-type OrderItem = {
-  dish_name: string;
-  quantity: number;
-  unit_price: string | number;
-  item_total: string | number;
-  notes?: string | null;
-  selected_options?: SelectedOption[];
-};
-
-type Order = {
-  id: string;
-  customer_name: string;
-  customer_phone: string;
-  order_type: string;
-  status: string;
-  total_amount: string | number;
-  subtotal: string | number;
-  notes?: string | null;
-  created_at: string;
-  items: OrderItem[];
-};
+// Canonical wire shape, shared with the Express routes and every adapter. Do
+// not redeclare it locally — this dashboard and the server drifting apart on
+// field names is what rendered every local order as Rs 0.
+type Order = WireOrder;
 
 // The status we want the order to end up in after clicking the button
 const TARGET_STATUS: Record<string, string> = {
@@ -125,7 +104,7 @@ function OrderCard({
             </div>
             {(item.selected_options || []).map((opt, j) => (
               <p key={j} className="text-[11px] opacity-40 pl-4 leading-snug">
-                {opt.option_name}: {opt.choice_name}
+                {opt.option_name ? `${opt.option_name}: ` : ''}{opt.choice_name}
               </p>
             ))}
             {item.notes && (
@@ -209,17 +188,24 @@ export default function OrdersDashboard({ onBack, onLogout }: { onBack: () => vo
         tenantFetch('/api/orders?status=ready&per_page=50').then(r => r.json()),
       ]);
 
-      const extract = (res: any): Order[] =>
-        (res.items ?? res.orders ?? res.data ?? []) as Order[];
+      // /api/orders always returns a bare array now — adapters unwrap their own
+      // envelope via unwrapCollection(). Anything else means the server returned
+      // an error body, so throw instead of coercing to [] and rendering an
+      // empty board that looks like "no orders".
+      const extract = (res: unknown, label: string): Order[] => {
+        if (Array.isArray(res)) return res as Order[];
+        const msg = (res as { error?: string } | null)?.error ?? `unexpected ${typeof res}`;
+        throw new Error(`${label}: ${msg}`);
+      };
 
       const byTime = (a: Order, b: Order) =>
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
 
       setIncomingOrders(
-        [...extract(pendingRes), ...extract(confirmedRes)].sort(byTime)
+        [...extract(pendingRes, 'pending'), ...extract(confirmedRes, 'confirmed')].sort(byTime)
       );
-      setPreparingOrders(extract(preparingRes).sort(byTime));
-      setReadyOrders(extract(readyRes).sort(byTime));
+      setPreparingOrders(extract(preparingRes, 'preparing').sort(byTime));
+      setReadyOrders(extract(readyRes, 'ready').sort(byTime));
       setLastUpdated(new Date());
     } catch (err: any) {
       setError('Could not fetch orders: ' + err.message);

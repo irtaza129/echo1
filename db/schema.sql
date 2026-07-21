@@ -1,8 +1,32 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Voice Kiosk Platform — Postgres schema (Supabase)
 --
--- Run once in the Supabase SQL editor. Re-runnable: every table/policy uses
--- `if not exists` / `create or replace` so it's idempotent.
+-- ⚠ REFERENCE ONLY — NOT THE SOURCE OF TRUTH. DO NOT RUN THIS ON A LIVE DB.
+--
+-- `migrations/` is canonical. This file is a flattened picture of what the
+-- schema should look like once every migration has been applied; it is useful
+-- for reading, diffing and onboarding, and for nothing else.
+--
+-- Why the split matters
+-- ---------------------
+-- This file and migrations/001 both defined audit_log, and they disagreed
+-- (actor/details here vs actor_id/payload there). The live database followed
+-- the migration, the application code followed this file, and every audit write
+-- failed with PGRST204 for as long as the feature has existed.
+--
+-- Re-running this file would not have fixed it and cannot fix that class of
+-- drift: `create table if not exists` is a no-op against a table that already
+-- exists with a DIFFERENT shape. It never adds a missing column. "Idempotent"
+-- is not "reconciling".
+--
+-- Rules
+-- -----
+-- 1. Schema changes go in a NEW numbered file in migrations/ — never by editing
+--    this file and re-running it.
+-- 2. After writing the migration, update this file to match, so it stays an
+--    accurate flattened view.
+-- 3. Column changes to an already-deployed table require an explicit
+--    `alter table`; see migrations/002_audit_log_actor_details.sql.
 --
 -- Storage model: Postgres is the source of truth for platform metadata
 -- (tenants, configs, credentials, users, audit). Redis remains as a hot cache

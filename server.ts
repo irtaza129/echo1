@@ -13,6 +13,8 @@ import type { TenantConfig } from './src/lib/tenantConfig.js';
 import { getRedis, redisKey, TTL } from './src/lib/redis.js';
 import { attachAdapter } from './middleware/tenant.js';
 import type { IRestaurantAdapter } from './adapter/IRestaurantAdapter.js';
+import type { WireOrder, WireCartItem } from './src/lib/types.js';
+import { checkSchema } from './src/lib/supabaseAdmin.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
 import {
   tenantsRepo,
@@ -86,6 +88,51 @@ interface LocalOrder {
   notes:          string | null;
   created_at:     string;
   updated_at:     string;
+}
+
+// ── Local → wire normalisation ───────────────────────────────────────────────
+// LocalOrder/LocalCartItem are the *storage* shapes in Redis. They are NOT what
+// goes on the wire: the dashboard and the Render backend use `total_amount`,
+// `dish_name` and `item_total`. Render is external so it defines the contract;
+// we translate here on read.
+//
+// Do not "simplify" this by renaming the stored fields — 500 orders already sit
+// in Redis under the old names, and these mappers are what keeps them readable.
+// Returning the storage shape directly is the bug that rendered every order as
+// Rs 0 with blank item names.
+
+function toWireCartItem(i: LocalCartItem): WireCartItem {
+  return {
+    cart_item_id: i.cart_item_id,
+    dish_name:    i.name,
+    quantity:     i.quantity,
+    unit_price:   i.unit_price,
+    summary:      i.summary,
+    notes:        i.notes,
+  };
+}
+
+function toWireOrder(o: LocalOrder): WireOrder {
+  return {
+    id:             o.id,
+    order_number:   o.order_number,
+    customer_name:  o.customer_name,
+    customer_phone: o.customer_phone,
+    order_type:     o.order_type,
+    status:         o.status,
+    total_amount:   o.total,
+    subtotal:       o.subtotal,
+    notes:          o.notes,
+    created_at:     o.created_at,
+    items: o.items.map(i => ({
+      dish_name:  i.name,
+      quantity:   i.quantity,
+      unit_price: i.unit_price,
+      item_total: i.unit_price * i.quantity,
+      notes:      i.notes,
+      selected_options: (i.modifiers ?? []).map(m => ({ choice_name: m })),
+    })),
+  };
 }
 
 // Normalise a string for fuzzy matching: lowercase, strip punctuation, collapse spaces.
@@ -331,6 +378,23 @@ async function startServer() {
   warmupClient.get(`${BACKEND_URL}/api/v1/agent/menu-context`).catch(() =>
     console.warn('[WARMUP] menu-context cold-starting')
   );
+
+  // Verify the deployed Postgres schema matches what repo.ts writes. Non-fatal
+  // (Redis is the primary store), but loud — a mismatch here means dual-writes
+  // are failing silently, which is exactly how the audit_log drift went
+  // unnoticed. Run once at boot; a schema change requires a redeploy anyway.
+  checkSchema()
+    .then(problems => {
+      if (!problems.length) { console.log('[SCHEMA] Postgres schema OK'); return; }
+      for (const p of problems) {
+        console.error(`[SCHEMA] MISMATCH ${p.table}: missing column(s) ${p.missing.join(', ')}`);
+      }
+      console.error(
+        `[SCHEMA] ${problems.length} table(s) drifted — dual-writes to these WILL fail silently. ` +
+        `Apply the pending migration in migrations/.`,
+      );
+    })
+    .catch(err => console.warn('[SCHEMA] Could not verify schema:', err instanceof Error ? err.message : err));
 
   // ── Gemini ephemeral token ──────────────────────────────────────────────────
   app.post('/api/gemini-token', tokenLimiter, async (_req, res: Response) => {
@@ -1219,8 +1283,14 @@ async function startServer() {
       if (menu) {
         try {
           const items = (await getRedis().get<LocalCartItem[]>(redisKey.localCart(tenantId, req.params.sessionId))) ?? [];
-          res.json(items); return;
-        } catch { res.json([]); return; }
+          res.json(items.map(toWireCartItem)); return;
+        } catch (err) {
+          // Previously `res.json([])` — a Redis outage was reported as "cart is
+          // empty" with a 200. An error must never be indistinguishable from an
+          // empty result; fail loudly so the caller can retry or surface it.
+          console.error('[LOCAL] get-cart failed:', err);
+          res.status(500).json({ error: 'Failed to load cart' }); return;
+        }
       }
     }
     try { res.json(await req.adapter!.getCart(req.params.sessionId)); }
@@ -1386,7 +1456,7 @@ async function startServer() {
           const orders   = (await Promise.all(ids.map(id => redis.get<LocalOrder>(redisKey.localOrder(id)).catch(() => null))))
             .filter((o): o is LocalOrder => o !== null);
           const filtered = q.status ? orders.filter(o => o.status === q.status) : orders;
-          res.json(filtered); return;
+          res.json(filtered.map(toWireOrder)); return;
         } catch (err) {
           console.error('[LOCAL] get-orders failed:', err);
           res.status(500).json({ error: 'Failed to load orders' }); return;

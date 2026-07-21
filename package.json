@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "smoke": "tsx --env-file=.env scripts/smoke.mts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
