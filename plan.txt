@@ -1,0 +1,151 @@
+Plan: Phone Calling + WhatsApp Business Integration
+
+Context
+Savour Foods voice kiosk currently works only via browser (Push-to-Talk → Gemini Live API). Customers in Pakistan need to place orders by calling a phone number or messaging on WhatsApp, using the same AI and menu tools. The hard constraint is that latency must not regress vs the browser (~150ms audio chunks, ~35-50ms Gemini roundtrip).
+
+
+---
+
+
+Provider Decisions
+
+| Channel | Provider | Reason |
+
+|---|---|---|
+
+| Phone | Twilio Media Streams | Mumbai PoP (~35-50ms to Pakistan), WebSocket audio bridge API (no SIP server needed), proven TypeScript SDK |
+
+| WhatsApp | Meta Cloud API directly | No BSP middleman, lowest latency, free within 24h session window, supports text + audio media |
+
+
+Do NOT use Africa's Talking (no Pakistan PoP), Gupshup (India BSP, slower webhooks), or Twilio for WhatsApp (centralises risk).
+
+
+---
+
+
+Architecture
+
+plaintext
+
+PHONE
+PSTN → Twilio PoP Mumbai → WS /telephony/twilio/stream/:tenantSlug
+  → TwilioStreamHandler:
+      µ-law decode (lookup table) → 100ms ring buffer (5×20ms frames)
+      → SRC 8kHz→16kHz (node-speex-resampler) → Gemini Live WS (real API key, server-trusted)
+      → tool calls → toolDispatch.ts (in-process, no HTTP hop)
+      → Gemini 24kHz PCM → SRC 24→8kHz → µ-law → Twilio write-back
+WHATSAPP TEXT
+Meta webhook POST /telephony/whatsapp/webhook
+  → WhatsAppHandler → load WA session (Redis) → Gemini generateContent (text, gemini-2.5-flash)
+  → tool loop via toolDispatch.ts → Meta Graph API reply
+WHATSAPP VOICE NOTE
+  → fetch OGG from Meta CDN → ogg-opus-decoder (WASM) → 16kHz PCM
+  → Gemini audio → text reply via Meta Graph API
+
+Latency budget: Phone adds ~85ms output (PSTN egress, unavoidable). Input path equivalent to browser. WhatsApp text is ~1.5-3s total (messaging UX, acceptable).
+
+
+---
+
+
+Phase 1 — Foundation (refactor only, no new external services)
+
+Goal: Extract shared logic so both channels can call it.
+
+
+telephony/toolDispatch.ts — extract from server.ts route closures:
+resolveItemLocal(tenantId, sessionId, params)
+removeItemLocal(tenantId, sessionId, cartItemId)
+clearCartLocal(tenantId, sessionId)
+submitOrderLocal(tenantId, sessionId, params)
+Route handlers in server.ts call these functions (no behaviour change)
+
+telephony/GeminiServerSession.ts — server-side Gemini Live client:
+Uses real GEMINI_API_KEY (server is trusted, no ephemeral token needed)
+sendAudioChunk(pcm16: Buffer), onAudioChunk(cb) for phone
+sendText(text), onFunctionCall(cb) for WhatsApp text
+Wraps @google/genai Live API (same SDK already installed)
+
+src/lib/PromptBuilder.ts — add channel: 'kiosk' | 'phone' | 'whatsapp' to PromptConfig and build():
+Phone: "You are talking on the phone. Do not reference screens. Ask for customer name and phone number at start."
+WhatsApp: "You are responding to a WhatsApp message. Be concise, plain text only."
+
+src/lib/repo.ts — add key builders:
+typescript
+
+   telSession:  (callSid: string) => `tel:session:${callSid}`        // TTL: 1h
+   waSession:   (waNumber, tenantId) => `wa:session:${waNumber}:${tenantId}`  // TTL: 30min
+   waHistory:   (waNumber, tenantId) => `wa:history:${waNumber}:${tenantId}`  // TTL: 30min
+   
+
+src/lib/tenantConfig.ts — add optional channels field to Zod schema:
+typescript
+
+   channels: z.object({
+     phone:     z.object({ enabled: z.boolean().default(false), twilioNumber: z.string().optional() }).optional(),
+     whatsapp:  z.object({ enabled: z.boolean().default(false), wabaPhoneNumberId: z.string().optional() }).optional(),
+   }).optional()
+   
+
+---
+
+
+Phase 2 — Phone Calling (Twilio)
+
+New file: telephony/TwilioStreamHandler.ts
+
+Attach to httpServer (not app) at path /telephony/twilio/stream/:tenantSlug using ws package
+Parse Twilio Media Streams events: start, media, stop
+start: resolve tenant from URL param, create GeminiServerSession, store in Redis tel:session:{callSid}
+media: decode µ-law → int16 PCM (inline 256-entry lookup table), accumulate in ring buffer, flush every 5 frames (100ms) → GeminiServerSession.sendAudioChunk()
+Gemini audio response: SRC 24kHz→8kHz → µ-law encode → write back to Twilio WS
+Tool calls: delegate to toolDispatch.ts
+stop: close Gemini session, delete Redis key
+
+server.ts changes:
+
+Change app.listen(PORT, ...) to const httpServer = app.listen(PORT, ...) and attach TwilioStreamHandler WebSocket server to httpServer
+POST /telephony/twilio/incoming/:tenantSlug — return TwiML:
+Add rate limiter (20 req/min) for /telephony/*
+Validate TWILIO_AUTH_TOKEN, TWILIO_ACCOUNT_SID, PUBLIC_WSS_URL at startup (warn if missing, don't crash)
+
+New deps: ws @types/ws, node-speex-resampler (fallback: @alexanderolsen/libsamplerate-js), twilio
+
+
+---
+
+
+Phase 3 — WhatsApp Business (Meta Cloud API)
+
+New file: telephony/WhatsAppHandler.ts
+
+verifyWebhookSignature(req) — SHA-256 HMAC of body using META_APP_SECRET vs X-Hub-Signature-256 header
+GET /telephony/whatsapp/webhook — Meta verification challenge (respond with hub.challenge)
+POST /telephony/whatsapp/webhook — dispatch by message.type:
+text: load/create WA session → build prompt (PromptBuilder, channel='whatsapp') → Gemini.generateContent() (text, non-streaming) → tool loop → Graph API text reply
+audio: fetch OGG from Meta CDN (GET /{mediaId}) → ogg-opus-decoder → 16kHz PCM → Gemini audio → text reply
+Conversation history: last 10 messages in Redis wa:history:* (30min TTL)
+Meta Graph API send: POST https://graph.facebook.com/v20.0/{META_PHONE_NUMBER_ID}/messages
+
+server.ts changes: Add WhatsApp routes, validate META_APP_SECRET, META_WHATSAPP_TOKEN, META_PHONE_NUMBER_ID, META_WEBHOOK_VERIFY_TOKEN at startup.
+
+
+New dep: ogg-opus-decoder
+
+
+---
+
+
+New Environment Variables
+
+plaintext
+
+TWILIO_ACCOUNT_SID=ACxxx
+TWILIO_AUTH_TOKEN=xxx
+TWILIO_PHONE_NUMBER=+92xxx
+META_APP_SECRET=xxx
+META_WHATSAPP_TOKEN=xxx
+META_PHONE_NUMBER_ID=xxx
+META_WEBHOOK_VERIFY_TOKEN=xxx
+PUBLIC_WSS_URL=wss://your-app.onrender.com

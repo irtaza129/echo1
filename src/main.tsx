@@ -4,7 +4,6 @@ import App from './App.tsx';
 import OrdersDashboard from './OrdersDashboard.tsx';
 import LoginScreen from './LoginScreen.tsx';
 import SignupScreen from './SignupScreen.tsx';
-import OnboardingWizard from './OnboardingWizard.tsx';
 import AdminDashboard from './AdminDashboard.tsx';
 import SuperAdminDashboard from './SuperAdminDashboard.tsx';
 import TranscriptScreen from './TranscriptScreen.tsx';
@@ -40,7 +39,6 @@ type Screen =
   | 'loading'
   | 'login'
   | 'signup'
-  | 'onboarding'
   | 'kiosk'
   | 'dashboard'
   | 'transcripts'
@@ -131,14 +129,7 @@ function Root() {
     setJwtToken(jwt);
     setJwtClaims(claims);
     setPendingSlug(slug);
-    setPendingName(claims?.sub ?? slug);   // sub is the email; name is set properly in onboarding
-    setScreen('onboarding');
-  };
-
-  const handleOnboardingComplete = (kioskUrl: string) => {
-    // kioskUrl is e.g. "/kiosk/my-restaurant" — push slug into claims
-    const slug = kioskUrl.replace('/kiosk/', '');
-    setJwtClaims(prev => prev ? { ...prev, slug } : prev);
+    setPendingName(claims?.sub ?? slug);
     setScreen('admin');
   };
 
@@ -214,18 +205,6 @@ function Root() {
       <SignupScreen
         onSignedUp={handleSignedUp}
         onBackToLogin={() => setScreen('login')}
-      />
-    );
-  }
-
-  if (screen === 'onboarding') {
-    return (
-      <OnboardingWizard
-        jwtToken={jwtToken}
-        initialSlug={pendingSlug}
-        initialName={pendingName || pendingSlug}
-        onComplete={handleOnboardingComplete}
-        onLogout={handleLogout}
       />
     );
   }

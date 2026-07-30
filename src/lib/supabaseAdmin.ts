@@ -39,9 +39,15 @@ export async function upsert<T extends object>(
   row: T,
   onConflict: string,
 ): Promise<void> {
-  await client().post(`/${table}?on_conflict=${onConflict}`, row, {
-    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-  });
+  try {
+    await client().post(`/${table}?on_conflict=${onConflict}`, row, {
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    });
+  } catch (err) {
+    const axiosErr = err as any;
+    const detail = axiosErr?.response?.data?.message || axiosErr?.response?.data?.details || axiosErr?.message;
+    throw new Error(`Upsert ${table} failed: ${detail}`);
+  }
 }
 
 export async function selectOne<T>(
@@ -81,11 +87,11 @@ export async function insert<T extends object>(
 // swallowed it, and the audit trail silently recorded nothing for the entire
 // life of the feature. A single startup check would have caught it on day one.
 const EXPECTED_COLUMNS: Record<string, string[]> = {
-  tenants:             ['id', 'slug', 'name', 'plan', 'status'],
+  tenants:             ['id', 'slug', 'name', 'plan', 'status', 'created_at', 'updated_at'],
   tenant_configs:      ['tenant_id', 'config', 'updated_by', 'updated_at'],
   adapter_credentials: ['tenant_id', 'ciphertext', 'iv', 'algorithm', 'updated_at'],
-  platform_users:      ['tenant_id', 'email', 'password_hash', 'role', 'last_login_at'],
-  audit_log:           ['tenant_id', 'actor', 'action', 'details'],
+  platform_users:      ['tenant_id', 'email', 'password_hash', 'role', 'created_at', 'last_login_at'],
+  audit_log:           ['id', 'tenant_id', 'actor', 'action', 'details', 'created_at'],
 };
 
 export interface SchemaProblem {

@@ -38,6 +38,8 @@ interface PublicTenantConfig extends PromptConfig {
     transcriptScreen: boolean;
     loyaltyPoints:    boolean;
   };
+  setupComplete?: boolean;
+  setupStep?:     number;
 }
 
 // Fallback used while the fetch is in-flight and on fetch failure.
@@ -176,6 +178,8 @@ export default function App({
   const [showMobileCart, setShowMobileCart] = useState(false);
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(false);
   const [manualOrderType, setManualOrderType] = useState<'dine_in' | 'pickup' | 'delivery'>('dine_in');
+  const [setupToast, setSetupToast]     = useState<{ stepName: string; stepsLeft: number } | null>(null);
+  const [toastTimer, setToastTimer]     = useState(15);
 
   const sessionIdRef      = useRef<string>(generateSessionId());
   const tenantConfigRef   = useRef<PublicTenantConfig>(DEFAULT_TENANT_CONFIG);
@@ -201,6 +205,15 @@ export default function App({
 
   // Keep tenantConfigRef in sync for connectToGemini closures (avoids stale config)
   useEffect(() => { tenantConfigRef.current = tenantConfig; }, [tenantConfig]);
+
+  // Countdown timer for setup toast — ticks every second, dismisses at 0
+  useEffect(() => {
+    if (!setupToast) return;
+    if (toastTimer <= 0) { setSetupToast(null); return; }
+    const id = setTimeout(() => setToastTimer(t => t - 1), 1000);
+    return () => clearTimeout(id);
+  }, [setupToast, toastTimer]);
+
 
   // Keep cartRef in sync so the confirm_order closure always sees current cart
   useEffect(() => { cartRef.current = cart; }, [cart]);
@@ -233,6 +246,16 @@ export default function App({
         const tid = cfg.tenantId ?? '';
         tenantIdRef.current = tid;
         if (cfg.features.transcriptScreen) setTranscriptionEnabled(true);
+
+        // Show setup toast only for admin users who haven't finished setup
+        if (onNavigateToAdmin && !cfg.setupComplete) {
+          const STEP_NAMES = ['Restaurant','Plan','Adapter','Test','Menu','AI Persona','Rules','Launch'];
+          const savedStep  = cfg.setupStep ?? 0;
+          const stepName   = STEP_NAMES[savedStep] ?? 'Restaurant';
+          const stepsLeft  = STEP_NAMES.length - savedStep;
+          setSetupToast({ stepName, stepsLeft });
+          setToastTimer(15);
+        }
 
         // Pre-load menu context for Gemini (with tenant header)
         fetchMenuContext(tid).then(ctx => { menuContextRef.current = ctx; });
@@ -1257,6 +1280,54 @@ export default function App({
               >
                 Clear All Items
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Setup incomplete toast ── */}
+      {setupToast && (
+        <div className="fixed bottom-6 right-6 z-[60] w-80 rounded-2xl shadow-2xl overflow-hidden"
+             style={{ background: 'linear-gradient(135deg, #fff8e1 0%, #fff3cd 100%)', border: '1px solid #f59e0b' }}>
+          {/* Progress bar */}
+          <div
+            className="h-1 bg-amber-400 transition-all duration-1000 ease-linear"
+            style={{ width: `${(toastTimer / 15) * 100}%` }}
+          />
+          <div className="p-4">
+            <div className="flex items-start gap-3">
+              <div className="text-2xl shrink-0">⚙️</div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-amber-900 leading-tight">
+                  Setup Incomplete
+                </p>
+                <p className="text-xs text-amber-800 mt-0.5 leading-snug">
+                  Resume from <span className="font-semibold">{setupToast.stepName}</span> —{' '}
+                  {setupToast.stepsLeft} step{setupToast.stepsLeft !== 1 ? 's' : ''} remaining
+                </p>
+              </div>
+              <button
+                onClick={() => setSetupToast(null)}
+                className="shrink-0 text-amber-500 hover:text-amber-700 transition-colors cursor-pointer"
+                aria-label="Dismiss"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M18 6 6 18M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+            <div className="flex items-center gap-2 mt-3">
+              {onNavigateToAdmin && (
+                <button
+                  onClick={() => { setSetupToast(null); onNavigateToAdmin(); }}
+                  className="flex-1 py-2 rounded-xl text-xs font-bold bg-amber-500 text-white hover:bg-amber-600 transition-colors cursor-pointer"
+                >
+                  Complete Setup →
+                </button>
+              )}
+              <span className="text-[10px] text-amber-600 font-mono shrink-0 w-6 text-center">
+                {toastTimer}s
+              </span>
             </div>
           </div>
         </div>

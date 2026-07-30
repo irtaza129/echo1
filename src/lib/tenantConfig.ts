@@ -66,6 +66,19 @@ export const TenantConfigSchema = z.object({
     transcriptScreen: z.boolean().default(false),
     loyaltyPoints:   z.boolean().default(false),
   }),
+
+  // Channel configuration — optional so existing configs parse unchanged
+  channels: z.object({
+    whatsapp: z.object({
+      enabled:           z.boolean().default(false),
+      // WhatsApp Business phone number ID from Meta Developer Console
+      wabaPhoneNumberId: z.string().optional(),
+      displayName:       z.string().optional(),
+    }).optional(),
+  }).optional(),
+
+  setupComplete: z.boolean().default(false),
+  setupStep: z.number().min(0).max(7).default(0),
 });
 
 export type TenantConfig      = z.infer<typeof TenantConfigSchema>;
