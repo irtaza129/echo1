@@ -1,6 +1,7 @@
 import { useState, useEffect, useId } from 'react';
 import { ENDPOINT_OPERATIONS, RESOLVE_ITEM_MAP_FIELDS, type EndpointParams } from './lib/posPresets';
 import EndpointDiscovery from './EndpointDiscovery';
+import SetupWizard from './SetupWizard';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -32,12 +33,21 @@ interface FullConfig {
     captureMode?:    string;
     threeDSRequired?: boolean;
   };
+  channels?: {
+    whatsapp?: {
+      enabled:           boolean;
+      wabaPhoneNumberId?: string;
+      displayName?:      string;
+    };
+  };
   features: {
     deliveryOrders:   boolean;
     tableNumbers:     boolean;
     transcriptScreen: boolean;
     loyaltyPoints:    boolean;
   };
+  setupComplete?: boolean;
+  setupStep?: number;
 }
 
 interface Props {
@@ -103,6 +113,7 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   const [config,      setConfig]      = useState<FullConfig | null>(null);
   const [draft,       setDraft]       = useState<FullConfig | null>(null);
   const [loading,     setLoading]     = useState(true);
+  const [showSetupWizard, setShowSetupWizard] = useState(false);
   const [saving,      setSaving]      = useState(false);
   const [saveMsg,     setSaveMsg]     = useState('');
   const [testUrl,     setTestUrl]     = useState('');
@@ -127,6 +138,12 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
   const [credSaving,    setCredSaving]    = useState(false);
   const [credMsg,       setCredMsg]       = useState('');
   const [credHas,       setCredHas]       = useState(false);
+  // WhatsApp channel
+  const [waEnabled,     setWaEnabled]     = useState(false);
+  const [waPhoneId,     setWaPhoneId]     = useState('');
+  const [waDisplayName, setWaDisplayName] = useState('');
+  const [waSaving,      setWaSaving]      = useState(false);
+  const [waMsg,         setWaMsg]         = useState('');
   // Menu management
   const [menuData,      setMenuData]      = useState<MenuData>({ categories: [], items: [] });
   const [menuLoaded,    setMenuLoaded]    = useState(false);
@@ -266,10 +283,22 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
         if (creds.baseUrl) setCredBaseUrl(creds.baseUrl);
         if (creds.webhookUrl) setCredWebhookUrl(creds.webhookUrl);
         setPayEnabled(cfg.payments?.provider === 'safepay');
+        setWaEnabled(cfg.channels?.whatsapp?.enabled ?? false);
+        setWaPhoneId(cfg.channels?.whatsapp?.wabaPhoneNumberId ?? '');
+        setWaDisplayName(cfg.channels?.whatsapp?.displayName ?? '');
       })
       .catch(() => setSaveMsg('Failed to load config'))
       .finally(() => setLoading(false));
   }, [jwtToken]);
+
+  const handleSetupComplete = () => {
+    setShowSetupWizard(false);
+    const authH = { Authorization: `Bearer ${jwtToken}` };
+    fetch('/api/admin/my-config', { headers: authH })
+      .then(r => r.json() as Promise<FullConfig>)
+      .then(cfg => { setConfig(cfg); setDraft(cfg); })
+      .catch(() => {});
+  };
 
   const patchDraft = <K extends keyof FullConfig>(section: K, updates: Partial<FullConfig[K]>) =>
     setDraft(prev => prev ? { ...prev, [section]: { ...(prev[section] as object), ...updates } } : prev);
@@ -425,6 +454,42 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
     }
   };
 
+  const handleSaveWhatsApp = async () => {
+    if (!draft) return;
+    setWaSaving(true);
+    setWaMsg('');
+    try {
+      const nextConfig: FullConfig = {
+        ...draft,
+        channels: {
+          ...draft.channels,
+          whatsapp: {
+            enabled:           waEnabled,
+            wabaPhoneNumberId: waPhoneId.trim() || undefined,
+            displayName:       waDisplayName.trim() || undefined,
+          },
+        },
+      };
+      const r = await fetch('/api/admin/save-config', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify(nextConfig),
+      });
+      const body = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && body.ok) {
+        setConfig(nextConfig); setDraft(nextConfig);
+        setWaMsg('Saved!');
+      } else {
+        setWaMsg(body.error ?? 'Save failed');
+      }
+    } catch {
+      setWaMsg('Network error');
+    } finally {
+      setWaSaving(false);
+      setTimeout(() => setWaMsg(m => m === 'Saved!' ? '' : m), 3000);
+    }
+  };
+
   const handleTabChange = (t: Tab) => {
     setTab(t);
     if (t === 'usage' && usageData.length === 0) {
@@ -474,10 +539,44 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
     );
   }
 
+  if (showSetupWizard && config) {
+    return (
+      <SetupWizard
+        jwtToken={jwtToken}
+        initialSlug={config.slug}
+        initialName={config.restaurantName}
+        initialConfig={config}
+        initialStep={config.setupStep ?? 0}
+        onComplete={handleSetupComplete}
+        onExit={() => setShowSetupWizard(false)}
+        onLogout={onLogout}
+      />
+    );
+  }
+
   const kioskUrl = `${window.location.origin}/kiosk/${config?.slug ?? ''}`;
 
   return (
     <div className="flex flex-col h-full bg-[#F8F7F2] overflow-hidden">
+
+      {/* ── Setup Incomplete Banner ──────────────────────────────────────────── */}
+      {!config?.setupComplete && (
+        <div className="shrink-0 flex items-center justify-between gap-4 px-5 py-3 bg-blue-50 border-b border-blue-200">
+          <div className="flex items-center gap-3">
+            <span className="text-lg">⚠️</span>
+            <div>
+              <p className="text-sm font-semibold text-blue-900">Setup incomplete</p>
+              <p className="text-xs text-blue-700">Complete restaurant setup to enable kiosk features</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setShowSetupWizard(true)}
+            className="shrink-0 px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition cursor-pointer"
+          >
+            Continue Setup →
+          </button>
+        </div>
+      )}
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
       <header className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-[#5A5A40]/10 bg-white/50">
@@ -556,6 +655,12 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                 className="mt-3 w-full py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-[#4a4a33] transition cursor-pointer"
               >
                 Open Kiosk →
+              </button>
+              <button
+                onClick={() => setShowSetupWizard(true)}
+                className="w-full py-2.5 border border-[#5A5A40]/20 text-[#5A5A40] rounded-xl text-xs font-bold uppercase tracking-widest hover:border-[#5A5A40]/50 transition cursor-pointer"
+              >
+                Edit Setup →
               </button>
             </div>
 
@@ -928,6 +1033,61 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                 {payMsg && (
                   <span className={`text-sm font-semibold ${payMsg === 'Saved!' ? 'text-green-600' : 'text-red-600'}`}>
                     {payMsg}
+                  </span>
+                )}
+              </div>
+            </Section>
+
+            {/* WhatsApp Integration */}
+            <Section title="WhatsApp Integration">
+              <p className="text-xs opacity-50 leading-relaxed -mt-1">
+                Let customers place orders by texting or sending voice notes to your WhatsApp Business number.
+                Find your Phone Number ID in Meta for Developers → WhatsApp → API Setup.
+              </p>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-sm font-semibold text-[#5A5A40]">Enable WhatsApp ordering</span>
+                <button
+                  type="button"
+                  onClick={() => setWaEnabled(v => !v)}
+                  className={`relative w-10 h-5 rounded-full transition cursor-pointer ${waEnabled ? 'bg-[#5A5A40]' : 'bg-[#5A5A40]/20'}`}
+                >
+                  <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${waEnabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                </button>
+              </label>
+
+              {waEnabled && (
+                <>
+                  <Field label="Phone Number ID" hint="Meta for Developers → WhatsApp → API Setup → copy the numeric ID next to your number">
+                    <input
+                      type="text"
+                      value={waPhoneId}
+                      onChange={e => setWaPhoneId(e.target.value)}
+                      className={INPUT}
+                      placeholder="e.g. 493826293710572"
+                    />
+                  </Field>
+                  <Field label="Display Name" hint="Optional label shown in the admin panel — not sent to customers">
+                    <input
+                      type="text"
+                      value={waDisplayName}
+                      onChange={e => setWaDisplayName(e.target.value)}
+                      className={INPUT}
+                      placeholder="e.g. Main Branch WhatsApp"
+                    />
+                  </Field>
+                </>
+              )}
+
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleSaveWhatsApp} disabled={waSaving || (waEnabled && !waPhoneId.trim())}
+                  className="px-5 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl font-bold text-xs uppercase tracking-widest hover:bg-[#4a4a33] transition disabled:opacity-50 cursor-pointer"
+                >
+                  {waSaving ? 'Saving…' : 'Save WhatsApp Settings'}
+                </button>
+                {waMsg && (
+                  <span className={`text-sm font-semibold ${waMsg === 'Saved!' ? 'text-green-600' : 'text-red-600'}`}>
+                    {waMsg}
                   </span>
                 )}
               </div>

@@ -30,6 +30,7 @@ import {
   auditRepo,
   dualWrite,
 } from './src/lib/repo.js';
+import { verifyWebhookSignature, handleWebhook } from './telephony/WhatsAppHandler.js';
 
 dotenv.config();
 
@@ -381,8 +382,11 @@ async function startServer() {
   const app  = express();
   const PORT = 3000;
 
-  if (!process.env.JWT_SECRET)     console.warn('[AUTH] JWT_SECRET not set — JWT auth will fail');
-  if (!process.env.SESSION_SECRET) console.warn('[AUTH] SESSION_SECRET not set — legacy sessions lost on restart');
+  if (!process.env.JWT_SECRET)              console.warn('[AUTH] JWT_SECRET not set — JWT auth will fail');
+  if (!process.env.SESSION_SECRET)          console.warn('[AUTH] SESSION_SECRET not set — legacy sessions lost on restart');
+  if (!process.env.META_APP_SECRET)         console.warn('[WA] META_APP_SECRET not set — WhatsApp webhook verification disabled');
+  if (!process.env.META_WHATSAPP_TOKEN)     console.warn('[WA] META_WHATSAPP_TOKEN not set — WhatsApp replies will fail');
+  if (!process.env.META_WEBHOOK_VERIFY_TOKEN) console.warn('[WA] META_WEBHOOK_VERIFY_TOKEN not set — Meta webhook registration will fail');
 
   app.set('trust proxy', 1);
   // Disable Express's auto-generated ETag for API responses. Tenant-scoped
@@ -403,10 +407,11 @@ async function startServer() {
   });
 
   // ── Rate limiters ───────────────────────────────────────────────────────────
-  const generalLimiter = rateLimit({ windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
-  const agentLimiter   = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
-  const authLimiter    = rateLimit({ windowMs: 15*60*1000, max: 20,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts.' } });
-  const tokenLimiter   = rateLimit({ windowMs: 60*1000,    max: 10,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many token requests.' } });
+  const generalLimiter  = rateLimit({ windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
+  const agentLimiter    = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
+  const authLimiter     = rateLimit({ windowMs: 15*60*1000, max: 20,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts.' } });
+  const tokenLimiter    = rateLimit({ windowMs: 60*1000,    max: 10,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many token requests.' } });
+  const webhookLimiter  = rateLimit({ windowMs: 60*1000,    max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many webhook requests.' } });
 
   app.use('/api/', generalLimiter);
   app.use('/api/agent/', agentLimiter);
@@ -694,6 +699,8 @@ async function startServer() {
           languages:          config.gemini.languages,
           systemPromptExtras: config.gemini.systemPromptExtras,
         },
+        setupComplete: config.setupComplete,
+        setupStep:     config.setupStep,
       });
     } catch (err) {
       console.error('[TENANT] config fetch failed:', err);
@@ -1901,6 +1908,37 @@ async function startServer() {
       console.error('[STAFF] remove failed:', err);
       res.status(500).json({ error: 'Failed to remove staff member' });
     }
+  });
+
+  // ── WhatsApp Business (Meta Cloud API) ──────────────────────────────────────
+  // GET: Meta webhook verification challenge
+  app.get('/telephony/whatsapp/webhook', (req: Request, res: Response) => {
+    const mode      = req.query['hub.mode'];
+    const token     = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+      res.status(200).send(String(challenge));
+    } else {
+      res.sendStatus(403);
+    }
+  });
+
+  // POST: incoming messages — raw body required for HMAC signature verification
+  app.post('/telephony/whatsapp/webhook', webhookLimiter, express.raw({ type: 'application/json' }), (req: Request, res: Response) => {
+    const sig = req.headers['x-hub-signature-256'];
+    if (typeof sig !== 'string' || !verifyWebhookSignature(req.body as Buffer, sig)) {
+      console.warn('[WA] Webhook signature verification failed');
+      res.sendStatus(403); return;
+    }
+    // Respond 200 immediately — Meta requires fast acknowledgement
+    res.sendStatus(200);
+    // Parse and dispatch asynchronously so Meta doesn't time out
+    let payload: unknown;
+    try { payload = JSON.parse((req.body as Buffer).toString('utf8')); }
+    catch { console.error('[WA] Failed to parse webhook payload'); return; }
+    handleWebhook(payload as Parameters<typeof handleWebhook>[0]).catch(err =>
+      console.error('[WA] Webhook processing error:', (err as Error).message)
+    );
   });
 
   // ── Static / SPA ────────────────────────────────────────────────────────────

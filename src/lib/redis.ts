@@ -75,6 +75,13 @@ class MockRedis {
     return list.slice(start, stop === -1 ? undefined : stop + 1);
   }
 
+  async ltrim(key: string, start: number, stop: number): Promise<void> {
+    const entry = this.store.get(key);
+    if (!entry) return;
+    const list = entry.value as unknown[];
+    this.store.set(key, { value: list.slice(start, stop === -1 ? undefined : stop + 1) });
+  }
+
   async smembers(key: string): Promise<string[]> {
     const entry = this.store.get(key);
     if (!entry) return [];
@@ -143,4 +150,14 @@ export const redisKey = {
   // Payments — keyed by gateway providerRef; plus an orderId → providerRef pointer
   payment:           (providerRef: string) => `payment:${providerRef}`,
   orderPayment:      (orderId: string)     => `order:payment:${orderId}`,
+  // WhatsApp channel — session state and conversation history per customer
+  waSession:         (waNumber: string, tenantId: string) => `wa:session:${waNumber}:${tenantId}`,
+  waHistory:         (waNumber: string, tenantId: string) => `wa:history:${waNumber}:${tenantId}`,
+  waRouting:         (phoneNumberId: string) => `wa:routing:${phoneNumberId}`,
+} as const;
+
+export const WA_TTL = {
+  SESSION: 1800,  // 30 min — active ordering session
+  HISTORY: 1800,  // 30 min — conversation history
+  ROUTING: 300,   // 5 min — phoneNumberId → tenantId cache
 } as const;

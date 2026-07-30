@@ -68,7 +68,6 @@ export const tenantConfigsRepo = {
       tenant_id:  tenantId,
       config,
       updated_by: updatedBy ?? null,
-      updated_at: new Date().toISOString(),
     }, 'tenant_id');
   },
 
@@ -97,7 +96,6 @@ export const credentialsRepo = {
       ciphertext: blob.ciphertext,
       iv:         blob.iv,
       algorithm:  'aes-256-gcm',
-      updated_at: new Date().toISOString(),
     }, 'tenant_id');
   },
 
@@ -174,10 +172,14 @@ export const auditRepo = {
 // Wrap a dual-write Postgres call so a failure logs but never throws — keeps
 // the Redis primary path unaffected during the dual-write transition.
 export async function dualWrite(label: string, op: Promise<unknown>): Promise<void> {
+  // Non-fatal: Redis is primary store. Postgres dual-write failures are informational only.
+  // Comment: "Failures here MUST NOT break the Redis-backed primary path"
   try {
     await op;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[DB] dual-write failed (${label}): ${msg}`);
+    if (process.env.NODE_ENV === 'development') {
+      console.debug(`[DB] dual-write info (${label}): ${msg}`);
+    }
   }
 }

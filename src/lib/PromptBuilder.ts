@@ -2,6 +2,8 @@
 // Pure and fast: no I/O, no side-effects. Safe to call on every connectToGemini().
 // Every string that was previously hardcoded for Savour Foods now comes from config.
 
+export type OrderingChannel = 'kiosk' | 'whatsapp';
+
 export interface PromptConfig {
   restaurantName: string;
   gemini: {
@@ -13,6 +15,7 @@ export interface PromptConfig {
   businessRules: {
     gstRate: number;
   };
+  channel?: OrderingChannel;
 }
 
 export class PromptBuilder {
@@ -23,16 +26,30 @@ export class PromptBuilder {
       ? `Never mention GST or tax unless asked (it is ${gstPct}%, added at checkout).`
       : 'Do not mention taxes or surcharges.';
 
-    const extras = gemini.systemPromptExtras.trim();
+    const extras  = gemini.systemPromptExtras.trim();
+    const channel = config.channel ?? 'kiosk';
 
-    return `You are ${gemini.agentName}, the voice-ordering assistant for ${restaurantName}.
+    const channelNote = channel === 'whatsapp'
+      ? `\nCHANNEL: You are responding via WhatsApp. Be concise. Use plain text with line breaks only — no markdown bullets, asterisks, or headers. Never mention screens, touching, or voice interaction. The customer is typing or sending voice notes. If the customer chooses delivery, ask for their full delivery address before calling confirm_order. To reset the conversation, the customer can type "cancel" or "start over".\n`
+      : '';
+
+    return `You are ${gemini.agentName}, the ordering assistant for ${restaurantName}.${channelNote}
 Your ONLY role is to help customers place their order using the OFFICIAL MENU listed below.
 
 ${menuContext}
 
-LANGUAGE:
-- Understand and respond in: ${gemini.languages.join(', ')}.
-- Match the customer's language naturally within the same turn.
+LANGUAGE — CRITICAL:
+For EVERY message from the customer:
+1. Detect the language they used (English, Urdu, Roman Urdu, or other)
+2. Respond ONLY in that detected language for that message
+3. Do NOT use configured languages — detect and match EACH message independently
+4. Examples:
+   - Customer says "Hello, what do you have?" → Respond in English
+   - Next message "Kya khana hai?" → Respond in Urdu
+   - Next message "Kya items hain?" → Respond in Roman Urdu
+   - Next message switches to English → Switch back to English
+5. Switch languages mid-conversation without hesitation or explanation
+6. Supported languages: English, Urdu (اردو), Roman Urdu, Arabic, Spanish, French
 ${extras ? `\nADDITIONAL RULES FROM RESTAURANT:\n${extras}\n` : ''}
 STRICT MENU RULES — follow these without exception:
 1. ONLY offer, discuss, or confirm items that are EXPLICITLY listed in the menu above.
