@@ -7,6 +7,8 @@ import type {
   SubmitOrderParams,
   OrderResult,
   OrderFilter,
+  WireCartItem,
+  WireOrder,
 } from './IRestaurantAdapter.js';
 
 // Sends order events to the tenant's configured webhook URL via HTTP POST.
@@ -81,7 +83,7 @@ export class WebhookAdapter implements IRestaurantAdapter {
 
   async removeItem(_sessionId: string, _cartItemId: string): Promise<void> { /* no-op */ }
   async clearCart(_sessionId: string):                        Promise<void> { /* no-op */ }
-  async getCart(_sessionId: string):                         Promise<unknown> { return []; }
+  async getCart(_sessionId: string):                         Promise<WireCartItem[]> { return []; }
 
   // ── Orders ────────────────────────────────────────────────────────────────
 
@@ -108,7 +110,7 @@ export class WebhookAdapter implements IRestaurantAdapter {
     };
   }
 
-  async getOrders(_filter?: OrderFilter): Promise<unknown> { return []; }
+  async getOrders(_filter?: OrderFilter): Promise<WireOrder[]> { return []; }
 
   async updateOrderStatus(orderId: string, status: string): Promise<unknown> {
     if (!this.webhookUrl) return { id: orderId, status };
