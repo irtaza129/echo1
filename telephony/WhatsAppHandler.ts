@@ -70,6 +70,18 @@ const GEMINI_MODEL    = 'gemini-2.0-flash';
 const META_API_BASE   = 'https://graph.facebook.com/v20.0';
 const MAX_TOOL_TURNS  = 8; // guard against infinite loops
 
+// ── Logging ───────────────────────────────────────────────────────────────────
+// Masks a WA number to the last 4 digits so logs stay traceable without
+// leaking full customer phone numbers.
+function maskPhone(waNumber: string): string {
+  return waNumber.length > 4 ? `***${waNumber.slice(-4)}` : waNumber;
+}
+
+function preview(text: string, max = 80): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
 // ── Tenant routing ────────────────────────────────────────────────────────────
 
 async function findTenantByPhoneNumberId(phoneNumberId: string): Promise<TenantConfig | null> {
@@ -79,23 +91,33 @@ async function findTenantByPhoneNumberId(phoneNumberId: string): Promise<TenantC
   const cachedId = await redis.get<string>(redisKey.waRouting(phoneNumberId)).catch(() => null);
   if (cachedId) {
     const cfg = await redis.get<unknown>(redisKey.tenantConfig(cachedId)).catch(() => null);
-    if (cfg) return parseTenantConfig(cfg);
+    if (cfg) {
+      console.log(`[WA] Tenant routing cache hit: phoneNumberId=${phoneNumberId} → tenant=${cachedId}`);
+      return parseTenantConfig(cfg);
+    }
   }
 
   // 2. Scan all tenant configs for a matching wabaPhoneNumberId.
   //    Tenant count is small so a full scan is acceptable.
+  console.log(`[WA] Tenant routing cache miss for phoneNumberId=${phoneNumberId} — scanning tenant configs`);
   const allIds = await redis.smembers(redisKey.tenantsIndex).catch(() => [] as string[]);
   for (const tenantId of allIds) {
     const raw = await redis.get<unknown>(redisKey.tenantConfig(tenantId)).catch(() => null);
     if (!raw) continue;
     try {
       const cfg = parseTenantConfig(raw);
-      if (cfg.channels?.whatsapp?.wabaPhoneNumberId === phoneNumberId && cfg.channels?.whatsapp?.enabled) {
+      if (cfg.channels?.whatsapp?.wabaPhoneNumberId === phoneNumberId) {
+        if (!cfg.channels.whatsapp.enabled) {
+          console.warn(`[WA] Matched tenant=${tenantId} for phoneNumberId=${phoneNumberId} but WhatsApp channel is disabled in config`);
+          continue;
+        }
+        console.log(`[WA] Resolved phoneNumberId=${phoneNumberId} → tenant=${tenantId} (${cfg.restaurantName})`);
         await redis.set(redisKey.waRouting(phoneNumberId), tenantId, { ex: WA_TTL.ROUTING }).catch(() => undefined);
         return cfg;
       }
     } catch { /* invalid config — skip */ }
   }
+  console.warn(`[WA] No enabled tenant matched phoneNumberId=${phoneNumberId} across ${allIds.length} tenant config(s)`);
   return null;
 }
 
@@ -134,12 +156,22 @@ async function callGemini(
     systemInstruction: { parts: [{ text: systemInstruction }] },
     generationConfig: { temperature: 0.3 },
   };
-  const { data } = await axios.post<GeminiResponse>(
-    `${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent`,
-    body,
-    { headers: { 'x-goog-api-key': apiKey }, timeout: 30_000 },
-  );
-  return data;
+  const start = Date.now();
+  try {
+    const { data } = await axios.post<GeminiResponse>(
+      `${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent`,
+      body,
+      { headers: { 'x-goog-api-key': apiKey }, timeout: 30_000 },
+    );
+    console.log(`[WA] Gemini call ok (${Date.now() - start}ms)`);
+    return data;
+  } catch (err) {
+    const detail = axios.isAxiosError(err)
+      ? `${err.response?.status ?? 'no-response'} ${JSON.stringify(err.response?.data ?? err.message)}`
+      : String(err);
+    console.error(`[WA] Gemini call failed (${Date.now() - start}ms):`, detail);
+    throw err;
+  }
 }
 
 function extractText(response: GeminiResponse): string {
@@ -161,39 +193,48 @@ async function executeTool(
   sessionId: string,
   config: TenantConfig,
 ): Promise<Record<string, unknown>> {
+  const start = Date.now();
   try {
+    let result: Record<string, unknown>;
     switch (name) {
       case 'add_item':
-        return await resolveItemLocal(tenantId, sessionId, {
+        result = await resolveItemLocal(tenantId, sessionId, {
           dish_query: args.dish_query as string,
           modifiers:  args.modifiers  as string[] | undefined,
           quantity:   args.quantity   as number   | undefined,
           notes:      args.notes      as string   | null | undefined,
         }) as unknown as Record<string, unknown>;
+        break;
 
       case 'remove_item':
         await removeItemLocal(tenantId, sessionId, args.cart_item_id as string);
-        return { ok: true };
+        result = { ok: true };
+        break;
 
       case 'clear_cart':
         await clearCartLocal(tenantId, sessionId);
-        return { ok: true };
+        result = { ok: true };
+        break;
 
       case 'confirm_order':
-        return await submitOrderLocal(tenantId, sessionId, {
+        result = await submitOrderLocal(tenantId, sessionId, {
           customer_name:  args.customer_name  as string | undefined,
           customer_phone: args.customer_phone as string | undefined,
           order_type:     args.order_type     as string | undefined,
           instructions:   args.instructions   as string | null | undefined,
           notes:          args.notes          as string | null | undefined,
         }, config) as unknown as Record<string, unknown>;
+        break;
 
       default:
+        console.warn(`[WA] Tool call for unknown tool: ${name}`);
         return { error: `Unknown tool: ${name}` };
     }
+    console.log(`[WA] Tool ${name} ok (${Date.now() - start}ms) args=${JSON.stringify(args)}`);
+    return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[WA] Tool ${name} failed:`, msg);
+    console.error(`[WA] Tool ${name} failed (${Date.now() - start}ms) args=${JSON.stringify(args)}:`, msg);
     return { error: msg };
   }
 }
@@ -226,13 +267,17 @@ async function sendWhatsAppReply(phoneNumberId: string, to: string, text: string
   const token = process.env.META_WHATSAPP_TOKEN;
   if (!token) { console.error('[WA] META_WHATSAPP_TOKEN not set — cannot send reply'); return; }
   try {
-    await axios.post(
+    const { data } = await axios.post<{ messages?: Array<{ id: string }> }>(
       `${META_API_BASE}/${phoneNumberId}/messages`,
       { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
       { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 10_000 },
     );
+    console.log(`[WA] -> reply sent to ${maskPhone(to)} id=${data.messages?.[0]?.id ?? 'unknown'}: "${preview(text)}"`);
   } catch (err) {
-    console.error('[WA] Failed to send reply:', (err as Error).message);
+    const detail = axios.isAxiosError(err)
+      ? `${err.response?.status ?? 'no-response'} ${JSON.stringify(err.response?.data ?? err.message)}`
+      : (err as Error).message;
+    console.error(`[WA] Failed to send reply to ${maskPhone(to)}:`, detail);
   }
 }
 
@@ -251,9 +296,11 @@ async function fetchMediaBuffer(mediaId: string): Promise<{ buffer: Buffer; mime
       responseType: 'arraybuffer',
       timeout: 30_000,
     });
-    return { buffer: Buffer.from(data), mimeType: meta.mime_type.split(';')[0].trim() };
+    const mimeType = meta.mime_type.split(';')[0].trim();
+    console.log(`[WA] Media fetched: id=${mediaId} mimeType=${mimeType} size=${data.byteLength}B`);
+    return { buffer: Buffer.from(data), mimeType };
   } catch (err) {
-    console.error('[WA] Failed to fetch media:', (err as Error).message);
+    console.error(`[WA] Failed to fetch media id=${mediaId}:`, (err as Error).message);
     return null;
   }
 }
@@ -269,6 +316,9 @@ async function handleTextMessage(
 ): Promise<void> {
   const tenantId  = config.tenantId;
   const sessionId = from; // stable per WA number
+  const start     = Date.now();
+
+  console.log(`[WA] <- text from ${maskPhone(from)} tenant=${tenantId}: "${preview(text)}"`);
 
   const menuContext  = await getMenuContextServer(tenantId, config);
   const systemPrompt = PromptBuilder.build({ ...config, channel: 'whatsapp' }, menuContext);
@@ -285,6 +335,7 @@ async function handleTextMessage(
   while (extractFunctionCalls(response).length > 0 && turns < MAX_TOOL_TURNS) {
     turns++;
     const calls = extractFunctionCalls(response);
+    console.log(`[WA] Turn ${turns}: ${calls.map(c => c.name).join(', ')} (${maskPhone(from)})`);
 
     // Append model turn (may have both text and function calls)
     contents.push({ role: 'model', parts: response.candidates![0].content.parts });
@@ -302,6 +353,9 @@ async function handleTextMessage(
 
     response = await callGemini(apiKey, contents, systemPrompt);
   }
+  if (turns >= MAX_TOOL_TURNS) {
+    console.warn(`[WA] Hit MAX_TOOL_TURNS=${MAX_TOOL_TURNS} for ${maskPhone(from)} tenant=${tenantId} — forcing final reply`);
+  }
 
   const reply = extractText(response) || 'Sorry, I could not process your request. Please try again.';
 
@@ -313,6 +367,7 @@ async function handleTextMessage(
   ];
   await saveHistory(from, tenantId, updated);
 
+  console.log(`[WA] Text message handled in ${Date.now() - start}ms (${turns} tool turn(s)) for ${maskPhone(from)}`);
   await sendWhatsAppReply(phoneNumberId, from, reply);
 }
 
@@ -325,9 +380,13 @@ async function handleAudioMessage(
 ): Promise<void> {
   const tenantId  = config.tenantId;
   const sessionId = from;
+  const start     = Date.now();
+
+  console.log(`[WA] <- audio from ${maskPhone(from)} tenant=${tenantId} mediaId=${mediaId}`);
 
   const media = await fetchMediaBuffer(mediaId);
   if (!media) {
+    console.error(`[WA] Audio media fetch failed for ${maskPhone(from)} mediaId=${mediaId} — replying with fallback`);
     await sendWhatsAppReply(phoneNumberId, from, "Sorry, I couldn't process your voice message. Please try typing your order instead.");
     return;
   }
@@ -352,6 +411,7 @@ async function handleAudioMessage(
   while (extractFunctionCalls(response).length > 0 && turns < MAX_TOOL_TURNS) {
     turns++;
     const calls = extractFunctionCalls(response);
+    console.log(`[WA] Turn ${turns}: ${calls.map(c => c.name).join(', ')} (${maskPhone(from)})`);
     contents.push({ role: 'model', parts: response.candidates![0].content.parts });
 
     const toolResponseParts: GeminiPart[] = await Promise.all(
@@ -366,6 +426,9 @@ async function handleAudioMessage(
 
     response = await callGemini(apiKey, contents, systemPrompt);
   }
+  if (turns >= MAX_TOOL_TURNS) {
+    console.warn(`[WA] Hit MAX_TOOL_TURNS=${MAX_TOOL_TURNS} for ${maskPhone(from)} tenant=${tenantId} — forcing final reply`);
+  }
 
   const reply = extractText(response) || 'Sorry, I could not understand your voice message. Please try typing your order.';
 
@@ -376,6 +439,7 @@ async function handleAudioMessage(
   ];
   await saveHistory(from, tenantId, updated);
 
+  console.log(`[WA] Audio message handled in ${Date.now() - start}ms (${turns} tool turn(s)) for ${maskPhone(from)}`);
   await sendWhatsAppReply(phoneNumberId, from, reply);
 }
 
@@ -392,14 +456,21 @@ export function verifyWebhookSignature(rawBody: Buffer, signatureHeader: string)
 
 export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) { console.error('[WA] GEMINI_API_KEY not set'); return; }
+  if (!apiKey) { console.error('[WA] GEMINI_API_KEY not set — dropping webhook payload'); return; }
 
-  for (const entry of payload.entry ?? []) {
+  const entries = payload.entry ?? [];
+  console.log(`[WA] Webhook received: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`);
+
+  for (const entry of entries) {
     for (const change of entry.changes ?? []) {
-      const { metadata, messages } = change.value;
+      const { metadata, messages, statuses } = change.value;
+      if (statuses?.length) {
+        console.log(`[WA] Received ${statuses.length} status update(s) for phoneNumberId=${metadata.phone_number_id} — ignored`);
+      }
       if (!messages?.length) continue;
 
       const phoneNumberId = metadata.phone_number_id;
+      console.log(`[WA] ${messages.length} message(s) for phoneNumberId=${phoneNumberId}`);
 
       let config: TenantConfig | null = null;
       try {
@@ -413,10 +484,12 @@ export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
       }
 
       for (const msg of messages) {
+        console.log(`[WA] Dispatching ${msg.type} message id=${msg.id} from ${maskPhone(msg.from)} → tenant=${config.tenantId}`);
         try {
           if (msg.type === 'text') {
             const body = msg.text.body.trim().toLowerCase();
             if (['cancel', 'restart', 'start over', 'reset', 'new order'].includes(body)) {
+              console.log(`[WA] Reset command "${body}" from ${maskPhone(msg.from)} tenant=${config.tenantId}`);
               await clearCartLocal(config.tenantId, msg.from);
               await saveHistory(msg.from, config.tenantId, []);
               await sendWhatsAppReply(phoneNumberId, msg.from,
@@ -426,10 +499,11 @@ export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
             }
           } else if (msg.type === 'audio') {
             await handleAudioMessage(config, phoneNumberId, msg.from, msg.audio.id, apiKey);
+          } else {
+            console.log(`[WA] Ignoring unsupported message type: ${JSON.stringify(msg)}`);
           }
-          // status updates and other types are silently ignored
         } catch (err) {
-          console.error(`[WA] Failed to handle ${msg.type} from ${msg.from}:`, (err as Error).message);
+          console.error(`[WA] Failed to handle ${msg.type} from ${maskPhone(msg.from)} tenant=${config.tenantId}:`, (err as Error).message);
         }
       }
     }

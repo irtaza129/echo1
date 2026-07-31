@@ -1917,14 +1917,17 @@ async function startServer() {
     const token     = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
     if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+      console.log('[WA] Webhook verification challenge succeeded');
       res.status(200).send(String(challenge));
     } else {
+      console.warn(`[WA] Webhook verification challenge failed: mode=${mode} tokenMatch=${token === process.env.META_WEBHOOK_VERIFY_TOKEN}`);
       res.sendStatus(403);
     }
   });
 
   // POST: incoming messages — raw body required for HMAC signature verification
   app.post('/telephony/whatsapp/webhook', webhookLimiter, express.raw({ type: 'application/json' }), (req: Request, res: Response) => {
+    console.log(`[WA] POST /telephony/whatsapp/webhook received (${(req.body as Buffer)?.length ?? 0} bytes)`);
     const sig = req.headers['x-hub-signature-256'];
     if (typeof sig !== 'string' || !verifyWebhookSignature(req.body as Buffer, sig)) {
       console.warn('[WA] Webhook signature verification failed');
