@@ -778,6 +778,11 @@ async function startServer() {
       const config = parseTenantConfig({ ...req.body, tenantId });
       const redis  = getRedis();
       await redis.set(redisKey.tenantConfig(tenantId), config, { ex: TTL.TENANT_CONFIG });
+      // Ensure this tenant is discoverable by scans (e.g. WhatsApp phoneNumberId
+      // routing), even for legacy tenants like Savour Foods that predate the
+      // signup flow and were never added to the index there. Idempotent — a
+      // no-op if already a member.
+      await redis.sadd(redisKey.tenantsIndex, tenantId).catch(() => undefined);
       // Invalidate stale menu cache so next request re-fetches from backend
       await redis.del(redisKey.menuContext(tenantId)).catch(() => undefined);
       void writeAuditLog(tenantId, 'config_save', req.jwtPayload!.sub);
