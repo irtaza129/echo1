@@ -51,6 +51,25 @@ export const TenantConfigSchema = z.object({
     orderStatusMachine: z.array(z.string()).default([
       'pending', 'confirmed', 'preparing', 'ready', 'delivered',
     ]),
+    // POS-only settings. Always present (default object), unlike `payments`/
+    // `channels` below, because PosAdapter and routes/pos.ts read it directly
+    // without optional chaining.
+    pos: z.object({
+      serviceChargeRate: z.number().min(0).max(1).default(0),
+    }).default({ serviceChargeRate: 0 }),
+    // Reservations-only settings. Same always-present rationale as `pos` above.
+    reservations: z.object({
+      maxPartySize:    z.number().int().min(1).default(20),
+      minLeadMinutes:  z.number().int().min(0).default(30),
+      maxAdvanceDays:  z.number().int().min(1).default(60),
+      defaultDuration: z.number().int().min(15).default(90),
+      slotMinutes:     z.number().int().min(5).default(30),
+      depositRequired: z.boolean().default(false),
+      depositAmount:   z.number().min(0).default(0),
+    }).default({
+      maxPartySize: 20, minLeadMinutes: 30, maxAdvanceDays: 60,
+      defaultDuration: 90, slotMinutes: 30, depositRequired: false, depositAmount: 0,
+    }),
   }),
 
   // Optional so existing configs parse unchanged. Absent → cash (today's behaviour).
@@ -65,6 +84,9 @@ export const TenantConfigSchema = z.object({
     tableNumbers:    z.boolean().default(false),
     transcriptScreen: z.boolean().default(false),
     loyaltyPoints:   z.boolean().default(false),
+    // Independently sellable modules — see requireFeature middleware.
+    pos:             z.boolean().default(false),
+    reservations:    z.boolean().default(false),
   }),
 
   // Channel configuration — optional so existing configs parse unchanged
@@ -84,6 +106,7 @@ export const TenantConfigSchema = z.object({
 export type TenantConfig      = z.infer<typeof TenantConfigSchema>;
 export type EndpointMapping   = z.infer<typeof EndpointMappingSchema>;
 export type AdapterType       = TenantConfig['adapter']['type'];
+export type FeatureModule     = keyof TenantConfig['features'];
 
 // Credentials stored separately (encrypted) — not in TenantConfig
 export interface AdapterCredentials {

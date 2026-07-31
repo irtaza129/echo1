@@ -13,6 +13,19 @@ export interface ResolveItemParams {
   notes?:     string | null;
 }
 
+// One line of an inline cart, used as the fallback source of order items when
+// no Redis cart exists for the session (see PosAdapter.submitOrder). Shaped to
+// match NewOrderItem in posRepo.ts without importing it, so this interface
+// stays independent of any one adapter's storage.
+export interface SubmitOrderCartItem {
+  dishId?:          number | null;
+  dishName:         string;
+  quantity:         number;
+  unitPrice:        number;
+  selectedOptions?: { option_name?: string; choice_name: string }[];
+  notes?:           string | null;
+}
+
 export interface SubmitOrderParams {
   sessionId:      string;
   customerName?:  string;
@@ -23,6 +36,7 @@ export interface SubmitOrderParams {
   discount?:      number;
   instructions?:  string | null;
   notes?:         string | null;
+  cartItems?:     SubmitOrderCartItem[];
 }
 
 export interface OrderFilter {

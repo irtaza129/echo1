@@ -78,6 +78,56 @@ export async function insert<T extends object>(
   });
 }
 
+// Insert one row and get it back with server-generated columns (id, created_at,
+// defaults) populated — used by repos that need the row's id for a follow-up
+// write (e.g. order_items referencing the new order).
+export async function insertReturning<T>(table: string, row: object): Promise<T> {
+  const res = await client().post<T[]>(`/${table}`, row, {
+    headers: { Prefer: 'return=representation' },
+  });
+  const inserted = res.data?.[0];
+  if (!inserted) throw new Error(`Insert into ${table} did not return a row`);
+  return inserted;
+}
+
+// Bulk insert, no rows returned — for child rows the caller already has
+// everything it needs for (order_items, reservation_tables).
+export async function insertMany<T extends object>(table: string, rows: T[]): Promise<void> {
+  if (rows.length === 0) return;
+  await client().post(`/${table}`, rows, {
+    headers: { Prefer: 'return=minimal' },
+  });
+}
+
+// Partial update matching `filters` (PostgREST operator syntax, e.g. { id: 'eq.123' }).
+export async function update(table: string, filters: Record<string, string>, patch: object): Promise<void> {
+  await client().patch(`/${table}`, patch, {
+    params: filters,
+    headers: { Prefer: 'return=minimal' },
+  });
+}
+
+// Same as `update`, but returns the updated row(s) — for callers that need the
+// post-update state (e.g. a computed variance) without a second round trip.
+export async function updateReturning<T>(table: string, filters: Record<string, string>, patch: object): Promise<T[]> {
+  const res = await client().patch<T[]>(`/${table}`, patch, {
+    params: filters,
+    headers: { Prefer: 'return=representation' },
+  });
+  return res.data ?? [];
+}
+
+export async function remove(table: string, filters: Record<string, string>): Promise<void> {
+  await client().delete(`/${table}`, { params: filters });
+}
+
+// Calls a Postgres function exposed by PostgREST at /rpc/<fn> — used for
+// pos_next_order_number, which must allocate atomically under concurrent tills.
+export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<T> {
+  const res = await client().post<T>(`/rpc/${fn}`, args);
+  return res.data;
+}
+
 // ── Boot-time schema assertion ────────────────────────────────────────────────
 // Every column this app writes, per table. Kept next to the write helpers so it
 // is obvious it must be updated when a repo write changes.
