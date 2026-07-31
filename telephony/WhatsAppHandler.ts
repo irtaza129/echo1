@@ -106,6 +106,12 @@ async function findTenantByPhoneNumberId(phoneNumberId: string): Promise<TenantC
     if (!raw) continue;
     try {
       const cfg = parseTenantConfig(raw);
+      // Log every tenant that has a WhatsApp channel configured at all, match
+      // or not — this is what makes an ID-mismatch or a not-actually-enabled
+      // toggle visible instead of a silent "no match" across dozens of tenants.
+      if (cfg.channels?.whatsapp) {
+        console.log(`[WA] Scan: tenant=${tenantId} (${cfg.restaurantName}) has whatsapp channel: enabled=${cfg.channels.whatsapp.enabled} wabaPhoneNumberId=${JSON.stringify(cfg.channels.whatsapp.wabaPhoneNumberId)}`);
+      }
       if (cfg.channels?.whatsapp?.wabaPhoneNumberId === phoneNumberId) {
         if (!cfg.channels.whatsapp.enabled) {
           console.warn(`[WA] Matched tenant=${tenantId} for phoneNumberId=${phoneNumberId} but WhatsApp channel is disabled in config`);
@@ -115,7 +121,9 @@ async function findTenantByPhoneNumberId(phoneNumberId: string): Promise<TenantC
         await redis.set(redisKey.waRouting(phoneNumberId), tenantId, { ex: WA_TTL.ROUTING }).catch(() => undefined);
         return cfg;
       }
-    } catch { /* invalid config — skip */ }
+    } catch (err) {
+      console.warn(`[WA] Skipping tenant=${tenantId} — config failed to parse:`, (err as Error).message);
+    }
   }
   console.warn(`[WA] No enabled tenant matched phoneNumberId=${phoneNumberId} across ${allIds.length} tenant config(s)`);
   return null;
