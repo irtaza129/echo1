@@ -1925,21 +1925,24 @@ async function startServer() {
     }
   });
 
-  // POST: incoming messages — raw body required for HMAC signature verification
-  app.post('/telephony/whatsapp/webhook', webhookLimiter, express.raw({ type: 'application/json' }), (req: Request, res: Response) => {
-    console.log(`[WA] POST /telephony/whatsapp/webhook received (${(req.body as Buffer)?.length ?? 0} bytes)`);
+  // POST: incoming messages — signature is verified against req.rawBody, the
+  // exact bytes Meta sent, captured by the global express.json() verify hook
+  // above (line ~400). Do NOT add express.raw() here: the global json()
+  // parser already consumed the stream by the time any route-level middleware
+  // runs, so a second raw parser finds nothing left to read and leaves
+  // req.body as the already-parsed object instead of a Buffer.
+  app.post('/telephony/whatsapp/webhook', webhookLimiter, (req: Request, res: Response) => {
+    const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+    console.log(`[WA] POST /telephony/whatsapp/webhook received (${rawBody?.length ?? 0} bytes)`);
     const sig = req.headers['x-hub-signature-256'];
-    if (typeof sig !== 'string' || !verifyWebhookSignature(req.body as Buffer, sig)) {
+    if (!rawBody || typeof sig !== 'string' || !verifyWebhookSignature(rawBody, sig)) {
       console.warn('[WA] Webhook signature verification failed');
       res.sendStatus(403); return;
     }
     // Respond 200 immediately — Meta requires fast acknowledgement
     res.sendStatus(200);
-    // Parse and dispatch asynchronously so Meta doesn't time out
-    let payload: unknown;
-    try { payload = JSON.parse((req.body as Buffer).toString('utf8')); }
-    catch { console.error('[WA] Failed to parse webhook payload'); return; }
-    handleWebhook(payload as Parameters<typeof handleWebhook>[0]).catch(err =>
+    // req.body is already the parsed payload (global json() parser handled it)
+    handleWebhook(req.body as Parameters<typeof handleWebhook>[0]).catch(err =>
       console.error('[WA] Webhook processing error:', (err as Error).message)
     );
   });
