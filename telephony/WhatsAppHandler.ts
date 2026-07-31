@@ -66,7 +66,11 @@ interface GeminiResponse {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const GEMINI_MODEL    = 'gemini-2.0-flash';
+// gemini-2.0-flash hit a hard 0-quota free-tier grant on the kiosk's project
+// (generateContent is billed/quota'd separately from the Live API the kiosk
+// uses). gemini-2.5-flash is the current-generation equivalent for this REST
+// tool-calling loop and is expected to have a live free-tier grant.
+const GEMINI_MODEL    = 'gemini-2.5-flash';
 const META_API_BASE   = 'https://graph.facebook.com/v20.0';
 const MAX_TOOL_TURNS  = 8; // guard against infinite loops
 
@@ -463,8 +467,11 @@ export function verifyWebhookSignature(rawBody: Buffer, signatureHeader: string)
 }
 
 export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) { console.error('[WA] GEMINI_API_KEY not set — dropping webhook payload'); return; }
+  // Dedicated key/project for WhatsApp so its generateContent quota is
+  // independent of the kiosk's Live API usage. Falls back to the kiosk's key
+  // so this doesn't hard-fail if GEMINI_API_KEY2 is never set.
+  const apiKey = process.env.GEMINI_API_KEY2 || process.env.GEMINI_API_KEY;
+  if (!apiKey) { console.error('[WA] Neither GEMINI_API_KEY2 nor GEMINI_API_KEY set — dropping webhook payload'); return; }
 
   const entries = payload.entry ?? [];
   console.log(`[WA] Webhook received: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`);
