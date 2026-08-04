@@ -16,9 +16,17 @@ class MockRedis {
     return entry.value as T;
   }
 
-  async set(key: string, value: unknown, opts?: { ex?: number }): Promise<void> {
+  // Returns 'OK' | null to match Upstash. The null-on-nx-conflict result is
+  // what the WhatsApp message de-duplication relies on.
+  async set(key: string, value: unknown, opts?: { ex?: number; nx?: boolean }): Promise<'OK' | null> {
+    if (opts?.nx) {
+      const existing = this.store.get(key);
+      const live = existing && (!existing.expireAt || Date.now() <= existing.expireAt);
+      if (live) return null;
+    }
     const expireAt = opts?.ex ? Date.now() + opts.ex * 1000 : undefined;
     this.store.set(key, { value, expireAt });
+    return 'OK';
   }
 
   async del(key: string): Promise<void> {
@@ -160,4 +168,5 @@ export const WA_TTL = {
   SESSION: 1800,  // 30 min — active ordering session
   HISTORY: 1800,  // 30 min — conversation history
   ROUTING: 300,   // 5 min — phoneNumberId → tenantId cache
+  DEDUPE:  3600,  // 1 h — seen message ids; covers Meta's webhook retry window
 } as const;

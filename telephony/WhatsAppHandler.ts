@@ -9,6 +9,10 @@
  * Supports:
  *   - Text messages  → Gemini text API + tool loop → WhatsApp text reply
  *   - Audio messages → OGG/Opus inline to Gemini audio API → WhatsApp text reply
+ *
+ * Both input types always answer with a TEXT message. This channel never
+ * synthesises or returns audio: a voice note is transcribed and understood by
+ * the model, and the reply goes back as text.
  */
 
 import crypto from 'crypto';
@@ -18,7 +22,7 @@ import { parseTenantConfig, type TenantConfig } from '../src/lib/tenantConfig.js
 import { PromptBuilder } from '../src/lib/PromptBuilder.js';
 import { allTools } from '../src/lib/geminiTools.js';
 import {
-  resolveItemLocal, removeItemLocal, clearCartLocal, submitOrderLocal,
+  resolveItemLocal, removeItemLocal, clearCartLocal, submitOrderLocal, getCartLocal,
   loadAdapterForTenant,
 } from './toolDispatch.js';
 
@@ -49,30 +53,69 @@ interface WaWebhookPayload {
 
 interface WaHistoryEntry { role: 'user' | 'model'; text: string }
 
-// Gemini REST API types (snake_case, matches the API JSON)
+// Gemini REST API types (matches the API JSON)
 interface GeminiPart {
   text?:          string;
+  // Gemini 3 marks internal reasoning parts with thought:true. They must never
+  // be shown to the customer, and thoughtSignature must be echoed back verbatim
+  // in the model turn or multi-step tool calling degrades.
+  thought?:          boolean;
+  thoughtSignature?: string;
   inlineData?:    { mimeType: string; data: string };
-  functionCall?:  { name: string; args: Record<string, unknown> };
-  functionResponse?: { name: string; response: Record<string, unknown> };
+  functionCall?:  { name: string; args: Record<string, unknown>; id?: string };
+  functionResponse?: { name: string; id?: string; response: Record<string, unknown> };
 }
 
 interface GeminiContent { role: string; parts: GeminiPart[] }
 
 interface GeminiResponse {
-  candidates?: Array<{ content: GeminiContent }>;
+  candidates?: Array<{ content?: GeminiContent; finishReason?: string }>;
+  promptFeedback?: { blockReason?: string };
+}
+
+interface FunctionDeclarationLike {
+  name: string;
+  description?: string;
+  parameters?: { type: unknown; properties?: Record<string, unknown>; required?: string[] };
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-// gemini-2.0-flash hit a hard 0-quota free-tier grant on the kiosk's project
-// (generateContent is billed/quota'd separately from the Live API the kiosk
-// uses). gemini-2.5-flash is the current-generation equivalent for this REST
-// tool-calling loop and is expected to have a live free-tier grant.
-const GEMINI_MODEL    = 'gemini-2.5-flash';
-const META_API_BASE   = 'https://graph.facebook.com/v20.0';
-const MAX_TOOL_TURNS  = 8; // guard against infinite loops
+
+/**
+ * The kiosk runs `gemini-3.1-flash-live-preview`. That model is Live-API only
+ * (`bidiGenerateContent`) — calling it over REST `generateContent` returns 404,
+ * so WhatsApp cannot literally share the kiosk's model id. `gemini-3.1-flash`
+ * does not exist; within the 3.1 generation the REST-capable options are
+ * `gemini-3.1-pro-preview` (verified quota-0 on this key, same failure that
+ * pushed this channel off gemini-2.0) and `gemini-3.1-flash-lite`, which is GA,
+ * has a working grant, and handles tool calling plus inline audio. So the
+ * WhatsApp channel runs the same 3.1 generation as the kiosk, flash-lite tier.
+ * Override with WHATSAPP_GEMINI_MODEL if a plain 3.1 flash ships later.
+ */
+const GEMINI_MODEL   = process.env.WHATSAPP_GEMINI_MODEL || 'gemini-3.1-flash-lite';
+const META_API_BASE  = 'https://graph.facebook.com/v20.0';
+const MAX_TOOL_TURNS = 8;      // guard against infinite loops
+const WA_TEXT_LIMIT  = 4096;   // Meta hard limit on a text message body
+const MAX_AUDIO_BYTES = 12 * 1024 * 1024; // base64 inflates ~33%; keeps request under the 20 MB inline cap
+
+// Tool declarations for this channel. The kiosk's declarations require
+// session_id because the browser passes one; on WhatsApp the session is the
+// customer's phone number and is injected server-side, so leaving session_id in
+// the schema only forces the model to invent a value on every call.
+const waTools: FunctionDeclarationLike[] = (allTools as unknown as FunctionDeclarationLike[]).map(tool => {
+  if (!tool.parameters?.properties) return tool;
+  const { session_id: _omit, ...properties } = tool.parameters.properties;
+  return {
+    ...tool,
+    parameters: {
+      ...tool.parameters,
+      properties,
+      required: (tool.parameters.required ?? []).filter(r => r !== 'session_id'),
+    },
+  };
+});
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 // Masks a WA number to the last 4 digits so logs stay traceable without
@@ -133,6 +176,21 @@ async function findTenantByPhoneNumberId(phoneNumberId: string): Promise<TenantC
   return null;
 }
 
+// ── Message de-duplication ────────────────────────────────────────────────────
+// Meta delivers webhooks at least once: any slow/failed ack is retried with the
+// same message id. Without this guard a retry re-runs the tool loop and can add
+// an item — or submit an order — twice.
+
+async function claimMessage(messageId: string): Promise<boolean> {
+  try {
+    const res = await getRedis().set(`wa:msg:${messageId}`, '1', { nx: true, ex: WA_TTL.DEDUPE });
+    return res !== null;
+  } catch {
+    // Redis unavailable — process the message rather than silently dropping it.
+    return true;
+  }
+}
+
 // ── Menu context (server-side) ────────────────────────────────────────────────
 
 async function getMenuContextServer(tenantId: string, config: TenantConfig): Promise<string> {
@@ -155,18 +213,37 @@ async function getMenuContextServer(tenantId: string, config: TenantConfig): Pro
   return `# ${config.restaurantName} Menu\n\n(Menu temporarily unavailable)`;
 }
 
+// ── Cart snapshot ─────────────────────────────────────────────────────────────
+
+async function buildCartSnapshot(tenantId: string, sessionId: string): Promise<string> {
+  try {
+    const items = await getCartLocal(tenantId, sessionId);
+    if (items.length === 0) return '\nCURRENT CART: empty.\n';
+    const lines = items.map(i => `- ${i.summary} (cart_item_id: ${i.cart_item_id}, unit_price: ${i.unit_price})`);
+    return `\nCURRENT CART (already added — do NOT re-add these; use the cart_item_id values for remove_item):\n${lines.join('\n')}\n`;
+  } catch (err) {
+    console.warn(`[WA] Cart snapshot unavailable for tenant=${tenantId}:`, (err as Error).message);
+    return '';
+  }
+}
+
 // ── Gemini text API ───────────────────────────────────────────────────────────
 
 async function callGemini(
   apiKey: string,
   contents: GeminiContent[],
   systemInstruction: string,
+  opts: { withTools: boolean } = { withTools: true },
 ): Promise<GeminiResponse> {
   const body = {
     contents,
-    tools: [{ functionDeclarations: allTools }],
+    ...(opts.withTools ? { tools: [{ functionDeclarations: waTools }] } : {}),
     systemInstruction: { parts: [{ text: systemInstruction }] },
-    generationConfig: { temperature: 0.3 },
+    generationConfig: {
+      temperature: 0.3,
+      // Ordering is a shallow task; low thinking keeps WhatsApp latency down.
+      thinkingConfig: { thinkingLevel: 'low' },
+    },
   };
   const start = Date.now();
   try {
@@ -175,25 +252,61 @@ async function callGemini(
       body,
       { headers: { 'x-goog-api-key': apiKey }, timeout: 30_000 },
     );
-    console.log(`[WA] Gemini call ok (${Date.now() - start}ms)`);
+    const finish = data.candidates?.[0]?.finishReason;
+    if (finish && finish !== 'STOP') {
+      console.warn(`[WA] Gemini finishReason=${finish} blockReason=${data.promptFeedback?.blockReason ?? 'none'}`);
+    }
+    console.log(`[WA] Gemini call ok (${Date.now() - start}ms) model=${GEMINI_MODEL} tools=${opts.withTools}`);
     return data;
   } catch (err) {
     const detail = axios.isAxiosError(err)
       ? `${err.response?.status ?? 'no-response'} ${JSON.stringify(err.response?.data ?? err.message)}`
       : String(err);
-    console.error(`[WA] Gemini call failed (${Date.now() - start}ms):`, detail);
+    console.error(`[WA] Gemini call failed (${Date.now() - start}ms) model=${GEMINI_MODEL}:`, detail);
     throw err;
   }
 }
 
+// Customer-visible text only — reasoning parts (thought:true) are excluded.
 function extractText(response: GeminiResponse): string {
   const parts = response.candidates?.[0]?.content?.parts ?? [];
-  return parts.filter(p => p.text).map(p => p.text!).join('').trim();
+  return parts.filter(p => p.text && p.thought !== true).map(p => p.text!).join('').trim();
 }
 
-function extractFunctionCalls(response: GeminiResponse): Array<{ name: string; args: Record<string, unknown> }> {
+function extractFunctionCalls(response: GeminiResponse): Array<{ name: string; args: Record<string, unknown>; id?: string }> {
   const parts = response.candidates?.[0]?.content?.parts ?? [];
   return parts.filter(p => p.functionCall).map(p => p.functionCall!);
+}
+
+// ── Reply formatting ──────────────────────────────────────────────────────────
+
+// Gemini emits markdown by default; WhatsApp renders none of it. Convert what
+// maps cleanly (**bold** → *bold*) and strip the rest so customers do not see
+// raw asterisks and hash marks.
+function formatForWhatsApp(text: string): string {
+  return text
+    .replace(/```[a-z]*\n?/gi, '')
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '• ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function chunkForWhatsApp(text: string): string[] {
+  if (text.length <= WA_TEXT_LIMIT) return [text];
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > WA_TEXT_LIMIT) {
+    // Prefer a paragraph/line boundary so a chunk never splits mid-word.
+    const window = rest.slice(0, WA_TEXT_LIMIT);
+    const cut = Math.max(window.lastIndexOf('\n'), window.lastIndexOf(' '));
+    const at  = cut > WA_TEXT_LIMIT * 0.5 ? cut : WA_TEXT_LIMIT;
+    chunks.push(rest.slice(0, at).trim());
+    rest = rest.slice(at).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
 }
 
 // ── Tool execution ────────────────────────────────────────────────────────────
@@ -278,18 +391,26 @@ function historyToContents(history: WaHistoryEntry[]): GeminiContent[] {
 async function sendWhatsAppReply(phoneNumberId: string, to: string, text: string): Promise<void> {
   const token = process.env.META_WHATSAPP_TOKEN;
   if (!token) { console.error('[WA] META_WHATSAPP_TOKEN not set — cannot send reply'); return; }
-  try {
-    const { data } = await axios.post<{ messages?: Array<{ id: string }> }>(
-      `${META_API_BASE}/${phoneNumberId}/messages`,
-      { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 10_000 },
-    );
-    console.log(`[WA] -> reply sent to ${maskPhone(to)} id=${data.messages?.[0]?.id ?? 'unknown'}: "${preview(text)}"`);
-  } catch (err) {
-    const detail = axios.isAxiosError(err)
-      ? `${err.response?.status ?? 'no-response'} ${JSON.stringify(err.response?.data ?? err.message)}`
-      : (err as Error).message;
-    console.error(`[WA] Failed to send reply to ${maskPhone(to)}:`, detail);
+
+  const body = text.trim();
+  if (!body) { console.warn(`[WA] Refusing to send empty reply to ${maskPhone(to)}`); return; }
+
+  // Meta rejects bodies over 4096 chars outright, so a long reply must be split.
+  for (const chunk of chunkForWhatsApp(body)) {
+    try {
+      const { data } = await axios.post<{ messages?: Array<{ id: string }> }>(
+        `${META_API_BASE}/${phoneNumberId}/messages`,
+        { messaging_product: 'whatsapp', to, type: 'text', text: { body: chunk } },
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 10_000 },
+      );
+      console.log(`[WA] -> reply sent to ${maskPhone(to)} id=${data.messages?.[0]?.id ?? 'unknown'}: "${preview(chunk)}"`);
+    } catch (err) {
+      const detail = axios.isAxiosError(err)
+        ? `${err.response?.status ?? 'no-response'} ${JSON.stringify(err.response?.data ?? err.message)}`
+        : (err as Error).message;
+      console.error(`[WA] Failed to send reply to ${maskPhone(to)}:`, detail);
+      return; // don't fire later chunks out of order after a failure
+    }
   }
 }
 
@@ -307,7 +428,12 @@ async function fetchMediaBuffer(mediaId: string): Promise<{ buffer: Buffer; mime
       headers: { Authorization: `Bearer ${token}` },
       responseType: 'arraybuffer',
       timeout: 30_000,
+      maxContentLength: MAX_AUDIO_BYTES,
     });
+    if (data.byteLength > MAX_AUDIO_BYTES) {
+      console.error(`[WA] Media id=${mediaId} too large (${data.byteLength}B > ${MAX_AUDIO_BYTES}B) — rejecting`);
+      return null;
+    }
     const mimeType = meta.mime_type.split(';')[0].trim();
     console.log(`[WA] Media fetched: id=${mediaId} mimeType=${mimeType} size=${data.byteLength}B`);
     return { buffer: Buffer.from(data), mimeType };
@@ -317,28 +443,34 @@ async function fetchMediaBuffer(mediaId: string): Promise<{ buffer: Buffer; mime
   }
 }
 
-// ── Message handlers ──────────────────────────────────────────────────────────
+// ── Agent turn ────────────────────────────────────────────────────────────────
+// One implementation for both text and voice notes: they differ only in the
+// user part sent to Gemini and in what gets written to history. Both always
+// answer with text.
 
-async function handleTextMessage(
+async function runAgentTurn(
   config: TenantConfig,
   phoneNumberId: string,
   from: string,
-  text: string,
   apiKey: string,
+  userPart: GeminiPart,
+  historyText: string,
+  fallbackReply: string,
 ): Promise<void> {
   const tenantId  = config.tenantId;
   const sessionId = from; // stable per WA number
   const start     = Date.now();
 
-  console.log(`[WA] <- text from ${maskPhone(from)} tenant=${tenantId}: "${preview(text)}"`);
-
-  const menuContext  = await getMenuContextServer(tenantId, config);
-  const systemPrompt = PromptBuilder.build({ ...config, channel: 'whatsapp' }, menuContext);
+  const [menuContext, cartSnapshot] = await Promise.all([
+    getMenuContextServer(tenantId, config),
+    buildCartSnapshot(tenantId, sessionId),
+  ]);
+  const systemPrompt = PromptBuilder.build({ ...config, channel: 'whatsapp' }, menuContext) + cartSnapshot;
 
   const history  = await loadHistory(from, tenantId);
   const contents: GeminiContent[] = [
     ...historyToContents(history),
-    { role: 'user', parts: [{ text }] },
+    { role: 'user', parts: [userPart] },
   ];
 
   let response = await callGemini(apiKey, contents, systemPrompt);
@@ -349,52 +481,72 @@ async function handleTextMessage(
     const calls = extractFunctionCalls(response);
     console.log(`[WA] Turn ${turns}: ${calls.map(c => c.name).join(', ')} (${maskPhone(from)})`);
 
-    // Append model turn (may have both text and function calls)
-    contents.push({ role: 'model', parts: response.candidates![0].content.parts });
+    // Echo the model turn back verbatim — this carries thoughtSignature, which
+    // Gemini 3 requires to keep reasoning continuity across tool steps.
+    contents.push({ role: 'model', parts: response.candidates![0].content!.parts });
 
-    // Execute all tool calls and collect responses
-    const toolResponseParts: GeminiPart[] = await Promise.all(
-      calls.map(async fc => ({
+    // Execute sequentially, not with Promise.all: these tools mutate one shared
+    // cart, and a model that emits add_item twice in a turn would otherwise
+    // race two read-modify-writes and silently drop an item. Order also matters
+    // (add-then-remove must not reorder). There is nothing to gain from
+    // parallelism here — each call is a millisecond-scale Redis write.
+    const toolResponseParts: GeminiPart[] = [];
+    for (const fc of calls) {
+      toolResponseParts.push({
         functionResponse: {
           name:     fc.name,
+          ...(fc.id ? { id: fc.id } : {}),
           response: await executeTool(fc.name, fc.args, tenantId, sessionId, config),
         },
-      })),
-    );
+      });
+    }
     contents.push({ role: 'user', parts: toolResponseParts });
 
     response = await callGemini(apiKey, contents, systemPrompt);
   }
-  if (turns >= MAX_TOOL_TURNS) {
-    console.warn(`[WA] Hit MAX_TOOL_TURNS=${MAX_TOOL_TURNS} for ${maskPhone(from)} tenant=${tenantId} — forcing final reply`);
+
+  // Loop exhausted while the model was still calling tools: it never produced a
+  // customer-facing reply. Ask once more with tools disabled so the customer
+  // gets a real answer instead of the generic fallback.
+  if (turns >= MAX_TOOL_TURNS && extractFunctionCalls(response).length > 0) {
+    console.warn(`[WA] Hit MAX_TOOL_TURNS=${MAX_TOOL_TURNS} for ${maskPhone(from)} tenant=${tenantId} — forcing a text-only reply`);
+    contents.push({ role: 'model', parts: response.candidates![0].content!.parts });
+    contents.push({ role: 'user', parts: [{ text: 'Summarise the order status for the customer now, in plain text. Do not call any tools.' }] });
+    try {
+      response = await callGemini(apiKey, contents, systemPrompt, { withTools: false });
+    } catch { /* fall through to the fallback reply */ }
   }
 
-  const reply = extractText(response) || 'Sorry, I could not process your request. Please try again.';
+  const reply = formatForWhatsApp(extractText(response)) || fallbackReply;
 
-  // Persist condensed history (text only — tool mechanics not stored)
-  const updated: WaHistoryEntry[] = [
+  // Persist condensed history (text only — tool mechanics not stored; the cart
+  // snapshot above is what carries cart state between messages)
+  await saveHistory(from, tenantId, [
     ...history,
-    { role: 'user',  text },
+    { role: 'user',  text: historyText },
     { role: 'model', text: reply },
-  ];
-  await saveHistory(from, tenantId, updated);
+  ]);
 
-  console.log(`[WA] Text message handled in ${Date.now() - start}ms (${turns} tool turn(s)) for ${maskPhone(from)}`);
+  console.log(`[WA] Message handled in ${Date.now() - start}ms (${turns} tool turn(s)) for ${maskPhone(from)}`);
   await sendWhatsAppReply(phoneNumberId, from, reply);
 }
 
-async function handleAudioMessage(
-  config: TenantConfig,
-  phoneNumberId: string,
-  from: string,
-  mediaId: string,
-  apiKey: string,
+async function handleTextMessage(
+  config: TenantConfig, phoneNumberId: string, from: string, text: string, apiKey: string,
 ): Promise<void> {
-  const tenantId  = config.tenantId;
-  const sessionId = from;
-  const start     = Date.now();
+  console.log(`[WA] <- text from ${maskPhone(from)} tenant=${config.tenantId}: "${preview(text)}"`);
+  await runAgentTurn(
+    config, phoneNumberId, from, apiKey,
+    { text },
+    text,
+    'Sorry, I could not process your request. Please try again.',
+  );
+}
 
-  console.log(`[WA] <- audio from ${maskPhone(from)} tenant=${tenantId} mediaId=${mediaId}`);
+async function handleAudioMessage(
+  config: TenantConfig, phoneNumberId: string, from: string, mediaId: string, apiKey: string,
+): Promise<void> {
+  console.log(`[WA] <- audio from ${maskPhone(from)} tenant=${config.tenantId} mediaId=${mediaId}`);
 
   const media = await fetchMediaBuffer(mediaId);
   if (!media) {
@@ -403,56 +555,12 @@ async function handleAudioMessage(
     return;
   }
 
-  const menuContext  = await getMenuContextServer(tenantId, config);
-  const systemPrompt = PromptBuilder.build({ ...config, channel: 'whatsapp' }, menuContext);
-
-  const history  = await loadHistory(from, tenantId);
-  const contents: GeminiContent[] = [
-    ...historyToContents(history),
-    {
-      role: 'user',
-      parts: [{
-        inlineData: { mimeType: media.mimeType, data: media.buffer.toString('base64') },
-      }],
-    },
-  ];
-
-  let response = await callGemini(apiKey, contents, systemPrompt);
-  let turns = 0;
-
-  while (extractFunctionCalls(response).length > 0 && turns < MAX_TOOL_TURNS) {
-    turns++;
-    const calls = extractFunctionCalls(response);
-    console.log(`[WA] Turn ${turns}: ${calls.map(c => c.name).join(', ')} (${maskPhone(from)})`);
-    contents.push({ role: 'model', parts: response.candidates![0].content.parts });
-
-    const toolResponseParts: GeminiPart[] = await Promise.all(
-      calls.map(async fc => ({
-        functionResponse: {
-          name:     fc.name,
-          response: await executeTool(fc.name, fc.args, tenantId, sessionId, config),
-        },
-      })),
-    );
-    contents.push({ role: 'user', parts: toolResponseParts });
-
-    response = await callGemini(apiKey, contents, systemPrompt);
-  }
-  if (turns >= MAX_TOOL_TURNS) {
-    console.warn(`[WA] Hit MAX_TOOL_TURNS=${MAX_TOOL_TURNS} for ${maskPhone(from)} tenant=${tenantId} — forcing final reply`);
-  }
-
-  const reply = extractText(response) || 'Sorry, I could not understand your voice message. Please try typing your order.';
-
-  const updated: WaHistoryEntry[] = [
-    ...history,
-    { role: 'user',  text: '[voice note]' },
-    { role: 'model', text: reply },
-  ];
-  await saveHistory(from, tenantId, updated);
-
-  console.log(`[WA] Audio message handled in ${Date.now() - start}ms (${turns} tool turn(s)) for ${maskPhone(from)}`);
-  await sendWhatsAppReply(phoneNumberId, from, reply);
+  await runAgentTurn(
+    config, phoneNumberId, from, apiKey,
+    { inlineData: { mimeType: media.mimeType, data: media.buffer.toString('base64') } },
+    '[voice note]',
+    'Sorry, I could not understand your voice message. Please try typing your order.',
+  );
 }
 
 // ── Public webhook handler ────────────────────────────────────────────────────
@@ -467,11 +575,11 @@ export function verifyWebhookSignature(rawBody: Buffer, signatureHeader: string)
 }
 
 export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
-  // Dedicated key/project for WhatsApp so its generateContent quota is
-  // independent of the kiosk's Live API usage. Falls back to the kiosk's key
-  // so this doesn't hard-fail if GEMINI_API_KEY2 is never set.
-  const apiKey = process.env.GEMINI_API_KEY2 || process.env.GEMINI_API_KEY;
-  if (!apiKey) { console.error('[WA] Neither GEMINI_API_KEY2 nor GEMINI_API_KEY set — dropping webhook payload'); return; }
+  // Same key as the kiosk interface, by design: one project, one quota, one
+  // place to rotate. (A previous GEMINI_API_KEY2 split existed only to dodge a
+  // gemini-2.0 free-tier quota grant of 0 — the 3.1 model does not need it.)
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) { console.error('[WA] GEMINI_API_KEY not set — dropping webhook payload'); return; }
 
   const entries = payload.entry ?? [];
   console.log(`[WA] Webhook received: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`);
@@ -499,7 +607,14 @@ export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
       }
 
       for (const msg of messages) {
-        console.log(`[WA] Dispatching ${msg.type} message id=${msg.id} from ${maskPhone(msg.from)} → tenant=${config.tenantId}`);
+        // Hoisted: inside the type-narrowed branches below `msg` narrows to
+        // `never` in the unsupported-type case, so read the common fields once.
+        const msgFrom = msg.from;
+        if (!(await claimMessage(msg.id))) {
+          console.log(`[WA] Duplicate delivery of message id=${msg.id} — skipped`);
+          continue;
+        }
+        console.log(`[WA] Dispatching ${msg.type} message id=${msg.id} from ${maskPhone(msgFrom)} → tenant=${config.tenantId}`);
         try {
           if (msg.type === 'text') {
             const body = msg.text.body.trim().toLowerCase();
@@ -516,9 +631,13 @@ export async function handleWebhook(payload: WaWebhookPayload): Promise<void> {
             await handleAudioMessage(config, phoneNumberId, msg.from, msg.audio.id, apiKey);
           } else {
             console.log(`[WA] Ignoring unsupported message type: ${JSON.stringify(msg)}`);
+            await sendWhatsAppReply(phoneNumberId, msgFrom,
+              'I can only read text messages and voice notes. Please type your order or send a voice note.');
           }
         } catch (err) {
-          console.error(`[WA] Failed to handle ${msg.type} from ${maskPhone(msg.from)} tenant=${config.tenantId}:`, (err as Error).message);
+          console.error(`[WA] Failed to handle message from ${maskPhone(msgFrom)} tenant=${config.tenantId}:`, (err as Error).message);
+          await sendWhatsAppReply(phoneNumberId, msgFrom,
+            'Sorry, something went wrong on our side. Please try again in a moment.');
         }
       }
     }

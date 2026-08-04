@@ -46,6 +46,30 @@ export async function loadAdapterForTenant(tenantId: string): Promise<{ config: 
   return { config, adapter: AdapterFactory.create(config, credentials) };
 }
 
+// ── Cart mutation serialisation ───────────────────────────────────────────────
+// The cart lives under a single Redis key and every mutation is a
+// read-modify-write. Two concurrent writers both read the pre-state and the
+// second write silently discards the first item — which is exactly what happens
+// when a model emits two add_item calls in one turn. Chain mutations per
+// (tenant, session) so they apply in order.
+//
+// This is per-process. It fully covers the dominant case (several tool calls in
+// one turn, one request, one process). Multi-instance deployments would need a
+// Redis lock or a Lua CAS; noted rather than silently assumed away.
+
+const cartLocks = new Map<string, Promise<unknown>>();
+
+function withCartLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+  const prev = cartLocks.get(lockKey) ?? Promise.resolve();
+  const run  = prev.then(fn, fn);           // run regardless of how the previous one settled
+  const tail = run.then(() => undefined, () => undefined);
+  cartLocks.set(lockKey, tail);
+  void tail.then(() => {
+    if (cartLocks.get(lockKey) === tail) cartLocks.delete(lockKey); // bound the map
+  });
+  return run;
+}
+
 // ── Tool implementations ──────────────────────────────────────────────────────
 
 export async function resolveItemLocal(
@@ -72,13 +96,15 @@ export async function resolveItemLocal(
     const cartItemId = crypto.randomUUID();
 
     try {
-      const redis    = getRedis();
-      const cartKey  = redisKey.localCart(tenantId, sessionId);
-      const existing = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
-      await redis.set(cartKey, [...existing, {
-        cart_item_id: cartItemId, name: match.name, category: cat?.name ?? '',
-        summary, quantity: qty, unit_price: match.price, modifiers: mods, notes: params.notes ?? null,
-      }], { ex: TTL.LOCAL_CART });
+      const cartKey = redisKey.localCart(tenantId, sessionId);
+      await withCartLock(cartKey, async () => {
+        const redis    = getRedis();
+        const existing = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
+        await redis.set(cartKey, [...existing, {
+          cart_item_id: cartItemId, name: match.name, category: cat?.name ?? '',
+          summary, quantity: qty, unit_price: match.price, modifiers: mods, notes: params.notes ?? null,
+        }], { ex: TTL.LOCAL_CART });
+      });
     } catch { /* non-fatal */ }
 
     console.log(`[DISPATCH] resolve-item: "${params.dish_query}" → "${match.name}" for tenant ${tenantId}`);
@@ -93,6 +119,42 @@ export async function resolveItemLocal(
   }) as ResolveItemResponse;
 }
 
+/**
+ * Read the current cart for a session, normalised to the local shape.
+ *
+ * WhatsApp needs this because its conversation history is persisted as plain
+ * text only — the model never sees the cart_item_id values that earlier
+ * add_item calls returned. Without a cart snapshot in the system prompt it
+ * cannot satisfy "remove the pulao" on any message after the one that added it.
+ */
+export async function getCartLocal(
+  tenantId: string,
+  sessionId: string,
+): Promise<Array<{ cart_item_id: string; summary: string; quantity: number; unit_price: number }>> {
+  const menu = await getLocalMenu(tenantId);
+
+  if (menu) {
+    const items = await getRedis()
+      .get<LocalCartItem[]>(redisKey.localCart(tenantId, sessionId))
+      .catch(() => null) ?? [];
+    return items.map(i => ({
+      cart_item_id: i.cart_item_id,
+      summary:      i.summary,
+      quantity:     i.quantity,
+      unit_price:   i.unit_price,
+    }));
+  }
+
+  const { adapter } = await loadAdapterForTenant(tenantId);
+  const items = await adapter.getCart(sessionId);
+  return items.map(i => ({
+    cart_item_id: i.cart_item_id,
+    summary:      i.summary ?? i.dish_name,
+    quantity:     i.quantity,
+    unit_price:   typeof i.unit_price === 'number' ? i.unit_price : Number(i.unit_price) || 0,
+  }));
+}
+
 export async function removeItemLocal(
   tenantId: string,
   sessionId: string,
@@ -102,10 +164,12 @@ export async function removeItemLocal(
 
   if (menu) {
     try {
-      const redis   = getRedis();
       const cartKey = redisKey.localCart(tenantId, sessionId);
-      const items   = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
-      await redis.set(cartKey, items.filter(i => i.cart_item_id !== cartItemId), { ex: TTL.LOCAL_CART });
+      await withCartLock(cartKey, async () => {
+        const redis = getRedis();
+        const items = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
+        await redis.set(cartKey, items.filter(i => i.cart_item_id !== cartItemId), { ex: TTL.LOCAL_CART });
+      });
     } catch { /* non-fatal */ }
     return;
   }
@@ -118,7 +182,8 @@ export async function clearCartLocal(tenantId: string, sessionId: string): Promi
   const menu = await getLocalMenu(tenantId);
 
   if (menu) {
-    try { await getRedis().del(redisKey.localCart(tenantId, sessionId)); } catch { /* non-fatal */ }
+    const cartKey = redisKey.localCart(tenantId, sessionId);
+    try { await withCartLock(cartKey, async () => { await getRedis().del(cartKey); }); } catch { /* non-fatal */ }
     return;
   }
 
@@ -143,7 +208,10 @@ export async function submitOrderLocal(
   if (menu) {
     const redis   = getRedis();
     const cartKey = redisKey.localCart(tenantId, sessionId);
-    const items   = await redis.get<LocalCartItem[]>(cartKey).catch(() => null) ?? [];
+    // Under the lock: an add_item still in flight must land before we snapshot
+    // the cart, or the customer is charged for an order missing an item.
+    const items   = await withCartLock(cartKey, async () =>
+      await redis.get<LocalCartItem[]>(cartKey).catch(() => null) ?? []);
 
     if (items.length === 0) throw new Error('Cart is empty');
 
