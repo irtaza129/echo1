@@ -191,3 +191,79 @@ create trigger tenant_configs_touch_updated before update on public.tenant_confi
 drop trigger if exists adapter_credentials_touch_updated on public.adapter_credentials;
 create trigger adapter_credentials_touch_updated before update on public.adapter_credentials
   for each row execute function public.touch_updated_at();
+
+-- ── billing_* (Paddle mirror) ────────────────────────────────────────────────
+-- Canonical DDL lives in migrations/008_billing_paddle.sql. Mirrored from
+-- verified Paddle webhooks; Paddle remains the source of truth. See
+-- src/lib/billingRepo.ts for the access-gating rules that read `status`.
+--
+-- `billing_customers.email` is nullable on purpose — an out-of-order
+-- subscription.created has to be able to stub the parent row before
+-- customer.created supplies the email. See the migration for the full note.
+create table if not exists public.billing_customers (
+  customer_id  text primary key,
+  tenant_id    uuid references public.tenants(id) on delete set null,
+  email        text,
+  status       text,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+
+create index if not exists billing_customers_email_idx  on public.billing_customers (lower(email));
+create index if not exists billing_customers_tenant_idx on public.billing_customers (tenant_id);
+
+create table if not exists public.billing_subscriptions (
+  subscription_id         text primary key,
+  customer_id             text not null references public.billing_customers(customer_id) on delete cascade,
+  tenant_id               uuid references public.tenants(id) on delete set null,
+  status                  text not null,
+  price_id                text not null default '',
+  product_id              text not null default '',
+  items                   jsonb not null default '[]'::jsonb,
+  collection_mode         text,
+  currency_code           text,
+  scheduled_change_action text,
+  scheduled_change_at     timestamptz,
+  current_period_ends_at  timestamptz,
+  canceled_at             timestamptz,
+  last_event_at           timestamptz,
+  created_at              timestamptz not null default now(),
+  updated_at              timestamptz not null default now()
+);
+
+create index if not exists billing_subscriptions_customer_idx on public.billing_subscriptions (customer_id);
+create index if not exists billing_subscriptions_tenant_idx   on public.billing_subscriptions (tenant_id);
+create index if not exists billing_subscriptions_status_idx   on public.billing_subscriptions (status);
+
+create table if not exists public.billing_transactions (
+  transaction_id  text primary key,
+  customer_id     text references public.billing_customers(customer_id) on delete set null,
+  subscription_id text,
+  tenant_id       uuid references public.tenants(id) on delete set null,
+  status          text not null,
+  currency_code   text,
+  total           text,
+  tax             text,
+  billed_at       timestamptz,
+  invoice_number  text,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+
+create index if not exists billing_transactions_customer_idx     on public.billing_transactions (customer_id);
+create index if not exists billing_transactions_subscription_idx on public.billing_transactions (subscription_id);
+create index if not exists billing_transactions_tenant_idx       on public.billing_transactions (tenant_id);
+
+create table if not exists public.billing_webhook_events (
+  event_id     text primary key,
+  event_type   text not null,
+  occurred_at  timestamptz,
+  processed_at timestamptz not null default now()
+);
+
+create index if not exists billing_webhook_events_type_idx on public.billing_webhook_events (event_type, processed_at desc);
+
+alter table public.billing_customers      enable row level security;
+alter table public.billing_subscriptions  enable row level security;
+alter table public.billing_transactions   enable row level security;
+alter table public.billing_webhook_events enable row level security;

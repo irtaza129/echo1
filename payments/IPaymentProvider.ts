@@ -9,7 +9,7 @@
 // the Pakistan market but kept as a field so the contract stays general.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type PaymentProviderId = 'cash' | 'safepay';
+export type PaymentProviderId = 'cash' | 'safepay' | 'paddle';
 
 // Lifecycle of a single payment attempt. Distinct from the kitchen order status
 // machine — money state ≠ preparation state.
@@ -33,6 +33,17 @@ export interface CheckoutParams {
   redirectUrl?: string;
   /** Where the gateway returns the customer if they cancel. */
   cancelUrl?:   string;
+  /**
+   * Tenant the money is being collected for. Providers that route the payment
+   * through a platform-level account (Paddle) must stamp this onto the gateway
+   * transaction, because the webhook comes back with no other way to tell which
+   * tenant an order belonged to.
+   */
+  tenantId?:    string;
+  /** Human-readable line-item label, e.g. "Savour Foods — Order #1042". */
+  description?: string;
+  /** Customer email, when known. Paddle requires one to open a checkout. */
+  customerEmail?: string;
 }
 
 export interface CheckoutResult {

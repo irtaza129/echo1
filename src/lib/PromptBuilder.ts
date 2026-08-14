@@ -16,6 +16,12 @@ export interface PromptConfig {
     gstRate: number;
   };
   channel?: OrderingChannel;
+  /**
+   * Whether this tenant can take card payments. False for cash-only tenants and
+   * for tenants whose currency no gateway supports — the agent must not offer a
+   * payment method the order flow cannot actually fulfil.
+   */
+  acceptsCard?: boolean;
 }
 
 export class PromptBuilder {
@@ -28,6 +34,21 @@ export class PromptBuilder {
 
     const extras  = gemini.systemPromptExtras.trim();
     const channel = config.channel ?? 'kiosk';
+
+    // Cash-only tenants must never be offered card: the order would be created
+    // with payment_method="card" and then have no gateway to send it to, which
+    // strands the customer at a checkout that cannot open.
+    const paymentStep = config.acceptsCard
+      ? `Ask: "Will you pay by cash or card?" — wait for the customer's answer.
+   - "cash" / "cash pe" / "naqad" → payment_method = "cash"
+   - "card" / "card se" / "credit card" / "debit card" → payment_method = "card"
+   If they choose card, tell them a secure payment window will open after they confirm.`
+      : `Do NOT ask how they want to pay — this restaurant takes cash at the counter only.
+   Always pass payment_method = "cash".`;
+
+    const paymentPassNote = config.acceptsCard
+      ? `\n   Also pass the payment_method they chose.`
+      : '';
 
     const channelNote = channel === 'whatsapp'
       ? `
@@ -82,9 +103,10 @@ ORDERING FLOW:
    - "dine in" / "yahan khaana" / "table pe" → order_type = "dine_in"
    - "pickup" / "le jaana" / "parcel" → order_type = "pickup"
    - "delivery" / "ghar bhejdo" / "deliver karo" → order_type = "delivery"
-6. Only call confirm_order after they explicitly confirm (yes, okay, theek hai, haan, or equivalent).
-   Pass the order_type they specified; default to "dine_in" if unclear.
-7. ${gstLine}
+6. ${paymentStep}
+7. Only call confirm_order after they explicitly confirm (yes, okay, theek hai, haan, or equivalent).
+   Pass the order_type they specified; default to "dine_in" if unclear.${paymentPassNote}
+8. ${gstLine}
 `;
   }
 }

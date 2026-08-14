@@ -12,6 +12,7 @@ import {
   fetchMenuContext,
 } from './lib/geminiTools';
 import { tenantFetch } from './lib/apiClient';
+import { openOrderCheckout } from './lib/paddleCheckout';
 import { PromptBuilder } from './lib/PromptBuilder';
 import type { PromptConfig } from './lib/PromptBuilder';
 import type { TranscriptTurn, ToolCallRecord } from './lib/types';
@@ -37,6 +38,11 @@ interface PublicTenantConfig extends PromptConfig {
     tableNumbers:     boolean;
     transcriptScreen: boolean;
     loyaltyPoints:    boolean;
+  };
+  // Non-secret half of the tenant's payment settings — just which gateway, so
+  // the kiosk knows whether card is offerable. Gateway keys stay server-side.
+  payments?: {
+    provider: 'cash' | 'safepay' | 'paddle';
   };
   setupComplete?: boolean;
   setupStep?:     number;
@@ -114,6 +120,15 @@ interface SubmitOrderResponse {
   summary?: string;
   total?: number;
   error?: string;
+  // Present only when the tenant collects online and the order was placed as
+  // card. `clientToken` is the Paddle transaction id to open in the overlay;
+  // `redirectUrl` is the hosted-checkout fallback for redirect-based gateways.
+  payment?: {
+    providerRef:  string;
+    redirectUrl?: string;
+    clientToken?: string;
+    status:       string;
+  };
 }
 
 // Structural interface covering only the session methods this component calls.
@@ -137,15 +152,19 @@ type AppStatus =
   | 'SPEAKING'
   | 'ORDER_CONFIRMED'
   | 'SUBMITTING'
+  | 'AWAITING_PAYMENT'
+  | 'PAYMENT_PROCESSING'
   | string;
 
 const STATUS_LABEL: Record<string, string> = {
-  IDLE:            'Tap the mic to speak your order',
-  CONNECTING:      'Connecting to AI...',
-  RECORDING:       'Recording — tap to stop',
-  SPEAKING:        'Responding...',
-  ORDER_CONFIRMED: 'Order confirmed!',
-  SUBMITTING:      'Submitting order...',
+  IDLE:               'Tap the mic to speak your order',
+  CONNECTING:         'Connecting to AI...',
+  RECORDING:          'Recording — tap to stop',
+  SPEAKING:           'Responding...',
+  ORDER_CONFIRMED:    'Order confirmed!',
+  SUBMITTING:         'Submitting order...',
+  AWAITING_PAYMENT:   'Complete your card payment in the window',
+  PAYMENT_PROCESSING: 'Confirming payment...',
 };
 
 function getStatusLabel(status: AppStatus): string {
@@ -326,7 +345,15 @@ export default function App({
     if (!menuContextRef.current) {
       menuContextRef.current = await fetchMenuContext(tenantIdRef.current || undefined);
     }
-    const sysInstruction = PromptBuilder.build(tenantConfigRef.current, menuContextRef.current);
+    const tcfg = tenantConfigRef.current;
+    const sysInstruction = PromptBuilder.build(
+      {
+        ...tcfg,
+        // The agent only offers card when a gateway is actually configured.
+        acceptsCard: Boolean(tcfg.payments && tcfg.payments.provider !== 'cash'),
+      },
+      menuContextRef.current,
+    );
 
     // Ephemeral tokens only work with v1alpha of the Gemini Live API.
     const ai = new GoogleGenAI({ apiKey: ephemeralToken, httpOptions: { apiVersion: 'v1alpha' } });
@@ -548,6 +575,14 @@ export default function App({
                         const gst  = Math.round(sub * cfg.businessRules.gstRate);
                         const tot  = sub + gst;
 
+                        // Only honour "card" if this tenant actually has an online
+                        // gateway configured. Otherwise the order would be created
+                        // as card with nothing to open, stranding the customer.
+                        const wantsCard = String(args.payment_method ?? '').toLowerCase() === 'card';
+                        const payMethod = wantsCard && cfg.payments?.provider && cfg.payments.provider !== 'cash'
+                          ? 'card'
+                          : 'cash';
+
                         const raw = await tenantFetch('/api/agent/submit-order', {
                           method: 'POST',
                           headers: agentH,
@@ -564,7 +599,7 @@ export default function App({
                             customer_name:  args.customer_name  || 'Guest',
                             customer_phone: args.customer_phone || '0000000000',
                             order_type:     args.order_type     || 'dine_in',
-                            payment_method: 'cash',
+                            payment_method: payMethod,
                             delivery_fee:   0,
                             discount:       0,
                             instructions:   (args.instructions as string) || null,
@@ -578,9 +613,48 @@ export default function App({
                             `${i.summary}${i.quantity > 1 ? ` x${i.quantity}` : ''}`
                           ).join(', ');
                           const gstLabel = gst > 0 ? ` GST ${cur} ${gst},` : '';
+                          const totals =
+                            `Subtotal ${cur} ${sub},${gstLabel} Total ${cur} ${tot}`;
+
+                          // Card orders are NOT confirmed here. The order is
+                          // created unpaid and only becomes confirmed when the
+                          // signed transaction.completed webhook arrives — so the
+                          // agent must not tell the customer their order is placed
+                          // before any money has actually moved.
+                          const txnId = res.payment?.clientToken;
+                          if (payMethod === 'card' && txnId) {
+                            setStatus('AWAITING_PAYMENT');
+                            void openOrderCheckout(txnId, {
+                              onClosed: () => setStatus('IDLE'),
+                              // Deliberately does NOT clear the cart or mark the
+                              // order confirmed: checkout.completed means the form
+                              // was submitted, not that the payment settled.
+                              onCompleted: () => setStatus('PAYMENT_PROCESSING'),
+                            }).catch((err: unknown) => {
+                              console.error('[PADDLE] could not open checkout:', err);
+                              setStatus('IDLE');
+                            });
+
+                            return { id: call.id, name: call.name, response: {
+                              result: `Order number ${orderId}. ${lines}. ${totals}. ` +
+                                `Please complete the payment in the window that just opened. ` +
+                                `I'll confirm as soon as the payment goes through.`,
+                            }};
+                          }
+
+                          if (payMethod === 'card' && !txnId) {
+                            // Gateway failed at checkout creation — server already
+                            // recorded the order unpaid so staff can collect
+                            // manually. Say so rather than claiming it's confirmed.
+                            console.error('[PADDLE] card order created without a checkout token', res.payment);
+                            return { id: call.id, name: call.name, response: {
+                              result: `Order number ${orderId} is saved, but the card payment could not be ` +
+                                `started. Please pay at the counter.`,
+                            }};
+                          }
+
                           const confirmMsg =
-                            `Order confirmed! Order number ${orderId}. ${lines}. ` +
-                            `Subtotal ${cur} ${sub},${gstLabel} Total ${cur} ${tot}. Shukriya!`;
+                            `Order confirmed! Order number ${orderId}. ${lines}. ${totals}. Shukriya!`;
                           setCart([]);
                           setStatus('ORDER_CONFIRMED');
                           setTimeout(() => setStatus('IDLE'), 5000);

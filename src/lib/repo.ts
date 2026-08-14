@@ -142,6 +142,12 @@ export const usersRepo = {
     });
   },
 
+  // Lookup by the user UUID carried in the JWT `sub` claim, for routes that
+  // have a session but not an email (see routes/billing.ts).
+  findById(id: string): Promise<PlatformUserRow | null> {
+    return db.selectOne<PlatformUserRow>('platform_users', { id: `eq.${id}` });
+  },
+
   async touchLastLogin(email: string): Promise<void> {
     await db.upsert('platform_users', {
       email:         email.toLowerCase(),

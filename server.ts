@@ -20,6 +20,11 @@ import { PaymentProviderFactory } from './payments/PaymentProviderFactory.js';
 import type { IPaymentProvider, PaymentTransaction } from './payments/IPaymentProvider.js';
 import { rupeesToPaisa, paisaToRupees } from './payments/money.js';
 import { probeEndpoint } from './adapter/probeEndpoint.js';
+import {
+  webhookRouter as billingWebhookRouter,
+  billingRouter,
+  billingPublicRouter,
+} from './routes/billing.js';
 import type { HttpMethod } from './src/lib/posPresets.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
 import {
@@ -413,7 +418,18 @@ async function startServer() {
   const tokenLimiter    = rateLimit({ windowMs: 60*1000,    max: 10,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many token requests.' } });
   const webhookLimiter  = rateLimit({ windowMs: 60*1000,    max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many webhook requests.' } });
 
+  // Paddle webhook goes on BEFORE the general limiter. Paddle can deliver a
+  // burst (transaction.completed + subscription.created + customer.created all
+  // land together after one checkout), and a 429 counts as a failed delivery
+  // that burns a retry attempt. It gets the looser webhookLimiter instead, and
+  // proves itself with an HMAC signature rather than a session.
+  app.use('/api/billing/webhook', webhookLimiter, billingWebhookRouter);
+
   app.use('/api/', generalLimiter);
+  // Paddle.js bootstrap config. Public and unauthenticated — the kiosk needs the
+  // publishable client token before anyone signs in — but behind the general
+  // limiter, unlike the webhook above.
+  app.use('/api/billing', billingPublicRouter);
   app.use('/api/agent/', agentLimiter);
   app.use('/api/auth/', authLimiter);
 
@@ -699,6 +715,10 @@ async function startServer() {
           languages:          config.gemini.languages,
           systemPromptExtras: config.gemini.systemPromptExtras,
         },
+        // Only the provider id — never captureMode/threeDSRequired and never any
+        // gateway credential. The kiosk needs this single field to decide whether
+        // the agent may offer "cash or card"; everything else stays server-side.
+        payments: { provider: config.payments?.provider ?? 'cash' },
         setupComplete: config.setupComplete,
         setupStep:     config.setupStep,
       });
@@ -1262,6 +1282,13 @@ async function startServer() {
   });
 
   // ── Agent routes — all go through the adapter ───────────────────────────────
+  // ── Billing (Paddle) ────────────────────────────────────────────────────────
+  // Authenticated tenant self-service: portal session + subscription state.
+  // requireAuth runs first so every handler in the router can assume a session;
+  // the router resolves the Paddle customer from that session and never from
+  // the request body.
+  app.use('/api/billing', requireAuth, billingRouter);
+
   app.use('/api/agent/', attachAdapter);
 
   app.get('/api/agent/menu-context', async (req: Request, res: Response) => {

@@ -2,6 +2,7 @@ import type { TenantConfig, AdapterCredentials } from '../src/lib/tenantConfig.j
 import type { IPaymentProvider, PaymentProviderId } from './IPaymentProvider.js';
 import { SafepayProvider } from './SafepayProvider.js';
 import { CashProvider }    from './CashProvider.js';
+import { PaddleProvider }  from './PaddleProvider.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Selects the payment provider for a tenant. Mirrors adapter/AdapterFactory.ts.
@@ -22,6 +23,11 @@ export class PaymentProviderFactory {
     switch (provider) {
       case 'safepay':
         return new SafepayProvider(credentials);
+      // Paddle takes no per-tenant credentials: it is a single platform-level
+      // merchant-of-record account keyed by the server's PADDLE_API_KEY, unlike
+      // Safepay where each tenant brings their own merchant keys.
+      case 'paddle':
+        return new PaddleProvider();
       case 'cash':
       default:
         return new CashProvider();

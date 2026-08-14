@@ -1,4 +1,6 @@
 import { z } from 'zod';
+// Pure, import-free module — safe to pull into browser-side onboarding code.
+import { PADDLE_CURRENCIES, isPaddleCurrency } from '../../payments/paddleCurrency.js';
 
 // ── Endpoint mapping (for CustomApiAdapter) ───────────────────────────────────
 const EndpointMappingSchema = z.object({
@@ -73,8 +75,15 @@ export const TenantConfigSchema = z.object({
   }),
 
   // Optional so existing configs parse unchanged. Absent → cash (today's behaviour).
+  //
+  // Choosing `paddle` is only valid when businessRules.currency is one of the 33
+  // currencies Paddle accepts — it rejects PKR outright. That pairing is checked
+  // by validatePaymentConfig() at onboarding/save time rather than as a schema
+  // refinement, because a refinement runs on every parse — including every read
+  // — and one bad stored config would then throw the tenant's kiosk offline
+  // instead of merely blocking card payments.
   payments: z.object({
-    provider:        z.enum(['cash', 'safepay']).default('cash'),
+    provider:        z.enum(['cash', 'safepay', 'paddle']).default('cash'),
     captureMode:     z.enum(['auto', 'manual']).default('auto'),
     threeDSRequired: z.boolean().default(true),
   }).optional(),
@@ -107,6 +116,30 @@ export type TenantConfig      = z.infer<typeof TenantConfigSchema>;
 export type EndpointMapping   = z.infer<typeof EndpointMappingSchema>;
 export type AdapterType       = TenantConfig['adapter']['type'];
 export type FeatureModule     = keyof TenantConfig['features'];
+
+// ── payment/currency compatibility ───────────────────────────────────────────
+
+// Call this wherever a tenant's payment settings are SAVED (onboarding wizard,
+// settings screen, seed scripts) — not on read. Returns an error string to show
+// the onboarder, or null when the combination is valid.
+//
+// The rule exists because the choice of currency and the choice of gateway are
+// not independent: Paddle accepts 33 currencies and PKR is not among them, so a
+// Pakistani tenant who picks Paddle would have every single card order rejected
+// at the gateway with no way to recover at runtime.
+export function validatePaymentConfig(
+  provider: 'cash' | 'safepay' | 'paddle',
+  currency: string,
+): string | null {
+  if (provider !== 'paddle') return null;
+
+  const upper = currency.toUpperCase();
+  if (isPaddleCurrency(upper)) return null;
+
+  return `Paddle cannot collect in ${upper}. Choose a currency Paddle supports ` +
+         `(${PADDLE_CURRENCIES.slice(0, 8).join(', ')}, …), or select ` +
+         `cash${upper === 'PKR' ? ' — Safepay support for PKR is planned' : ''}.`;
+}
 
 // Credentials stored separately (encrypted) — not in TenantConfig
 export interface AdapterCredentials {

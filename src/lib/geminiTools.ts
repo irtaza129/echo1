@@ -104,6 +104,12 @@ export const confirm_order: FunctionDeclaration = {
         type: Type.STRING,
         description: "One of: dine_in, pickup, delivery. Default: dine_in.",
       },
+      payment_method: {
+        type: Type.STRING,
+        description: "How the customer chose to pay: 'cash' or 'card'. Default 'cash'. " +
+          "Only pass 'card' if the customer explicitly asked to pay by card — a card order " +
+          "opens a payment window and is not sent to the kitchen until payment succeeds.",
+      },
       instructions: {
         type: Type.STRING,
         description: "Special cooking or dietary instructions for the entire order (e.g. 'extra spicy', 'no onions', 'allergy to nuts').",

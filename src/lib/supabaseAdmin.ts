@@ -142,6 +142,16 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   adapter_credentials: ['tenant_id', 'ciphertext', 'iv', 'algorithm', 'updated_at'],
   platform_users:      ['tenant_id', 'email', 'password_hash', 'role', 'created_at', 'last_login_at'],
   audit_log:           ['id', 'tenant_id', 'actor', 'action', 'details', 'created_at'],
+  // Paddle mirror (migrations/008_billing_paddle.sql). Drift here is worse than
+  // elsewhere: these rows are the only local record of what a customer is
+  // entitled to, and a failed write means a paid customer silently loses access.
+  billing_customers:     ['customer_id', 'tenant_id', 'email', 'status', 'created_at', 'updated_at'],
+  billing_subscriptions: ['subscription_id', 'customer_id', 'tenant_id', 'status', 'price_id',
+                          'product_id', 'items', 'scheduled_change_action', 'scheduled_change_at',
+                          'current_period_ends_at', 'last_event_at', 'created_at', 'updated_at'],
+  billing_transactions:  ['transaction_id', 'customer_id', 'subscription_id', 'tenant_id',
+                          'status', 'currency_code', 'total', 'billed_at'],
+  billing_webhook_events: ['event_id', 'event_type', 'occurred_at', 'processed_at'],
 };
 
 export interface SchemaProblem {
