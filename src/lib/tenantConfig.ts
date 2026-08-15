@@ -24,7 +24,12 @@ export const TenantConfigSchema = z.object({
   tenantId:       z.string().uuid(),
   slug:           z.string().min(1).max(64).regex(/^[a-z0-9-]+$/),
   restaurantName: z.string().min(1).max(255),
-  plan:           z.enum(['starter', 'growth', 'enterprise']),
+  // 'starter' | 'pro' | 'advanced' are the tiers sold today, named to match the
+  // Paddle catalogue (see src/lib/plans.ts). 'growth' and 'enterprise' predate
+  // it and are kept ONLY so stored configs written before the catalogue existed
+  // still parse — dropping them would throw on read and take those tenants'
+  // kiosks offline. They are not offered in onboarding.
+  plan:           z.enum(['starter', 'pro', 'advanced', 'growth', 'enterprise']),
 
   adapter: z.object({
     type:             z.enum(['managed', 'custom_api', 'webhook']),
@@ -49,7 +54,17 @@ export const TenantConfigSchema = z.object({
     gstRate:            z.number().min(0).max(1).default(0),
     currencySymbol:     z.string().default('$'),
     // ISO currency code used for payment gateway calls (display uses the symbol).
+    //
+    // The default is PKR for the legacy Savour Foods config, which predates this
+    // field. Onboarding now always sets it explicitly from the chosen country
+    // (src/lib/countries.ts) — relying on this default for a new tenant is a bug,
+    // because it silently makes every non-Pakistani restaurant PKR and therefore
+    // ineligible for Paddle.
     currency:           z.string().default('PKR'),
+    // ISO 3166-1 alpha-2 of the restaurant's country. Optional because configs
+    // written before onboarding collected it have no value to migrate from;
+    // `currency` remains the field the gateway actually reads.
+    country:            z.string().length(2).optional(),
     orderStatusMachine: z.array(z.string()).default([
       'pending', 'confirmed', 'preparing', 'ready', 'delivered',
     ]),

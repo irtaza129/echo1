@@ -578,8 +578,17 @@ export default function App({
                         // Only honour "card" if this tenant actually has an online
                         // gateway configured. Otherwise the order would be created
                         // as card with nothing to open, stranding the customer.
+                        //
+                        // Delivery is excluded here as well as in the prompt.
+                        // The prompt is guidance the model can ignore; this is the
+                        // check that actually holds, and it matters because a
+                        // delivery order paid online would then be collected again
+                        // by the rider.
+                        const orderType = String(args.order_type ?? 'dine_in').toLowerCase();
                         const wantsCard = String(args.payment_method ?? '').toLowerCase() === 'card';
-                        const payMethod = wantsCard && cfg.payments?.provider && cfg.payments.provider !== 'cash'
+                        const payMethod = wantsCard
+                          && orderType !== 'delivery'
+                          && cfg.payments?.provider && cfg.payments.provider !== 'cash'
                           ? 'card'
                           : 'cash';
 

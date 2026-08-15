@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { issueJwt, extractJwt, type JwtPayload, type UserRole } from './src/lib/jwt.js';
 import { encryptCredentials, decryptCredentials, type EncryptedBlob } from './src/lib/crypto.js';
-import { parseTenantConfig } from './src/lib/tenantConfig.js';
+import { parseTenantConfig, validatePaymentConfig } from './src/lib/tenantConfig.js';
 import type { TenantConfig, AdapterCredentials } from './src/lib/tenantConfig.js';
 import { getRedis, redisKey, TTL } from './src/lib/redis.js';
 import { attachAdapter } from './middleware/tenant.js';
@@ -601,7 +601,10 @@ async function startServer() {
         tenantId,
         slug,
         restaurantName,
-        plan: ['starter','growth','enterprise'].includes(plan ?? '') ? plan : 'starter',
+        // Signup only records the tier the visitor clicked; nothing is charged
+        // until they complete checkout in the wizard. Legacy ids stay accepted
+        // so an older signup screen still posts a value that parses.
+        plan: ['starter','pro','advanced','growth','enterprise'].includes(plan ?? '') ? plan : 'starter',
         adapter: { type: 'managed' },
         gemini: {
           agentName:          `${restaurantName} Assistant`,
@@ -796,6 +799,20 @@ async function startServer() {
     try {
       // Force tenantId from JWT — never trust the body for this
       const config = parseTenantConfig({ ...req.body, tenantId });
+
+      // Gateway/currency compatibility is enforced HERE rather than as a schema
+      // refinement, because a refinement runs on every parse — including every
+      // kiosk read — so one bad stored config would take the tenant offline
+      // instead of merely blocking card payments. The wizard checks this too,
+      // but the wizard is not the security boundary: this endpoint accepts any
+      // body from an authenticated admin, and an unsupported pairing (Paddle +
+      // PKR) would otherwise be stored and then fail on every single order at
+      // the gateway, with no way to recover at runtime.
+      if (config.payments && config.payments.provider !== 'cash') {
+        const incompatible = validatePaymentConfig(config.payments.provider, config.businessRules.currency);
+        if (incompatible) { res.status(400).json({ error: incompatible }); return; }
+      }
+
       const redis  = getRedis();
       await redis.set(redisKey.tenantConfig(tenantId), config, { ex: TTL.TENANT_CONFIG });
       // Ensure this tenant is discoverable by scans (e.g. WhatsApp phoneNumberId

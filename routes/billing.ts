@@ -11,6 +11,7 @@ import {
   type BillingSubscriptionRow,
 } from '../src/lib/billingRepo.js';
 import { usersRepo } from '../src/lib/repo.js';
+import { PLAN_COPY, type PlanId, type PlanOffer } from '../src/lib/plans.js';
 
 // Paddle billing. Two routers because the two halves have opposite trust models
 // and must sit on opposite sides of the rate limiters in server.ts:
@@ -135,6 +136,72 @@ billingPublicRouter.get('/client-config', (_req: Request, res: Response) => {
   }
 
   res.json({ environment: paddleEnv(), token });
+});
+
+// The purchasable plan catalogue, resolved from Paddle at request time.
+//
+// Price ids are NOT hardcoded in the client bundle: sandbox and live are
+// separate Paddle accounts whose pri_ ids differ, so a bundled id breaks
+// silently the moment PADDLE_ENV flips — the checkout would open against a
+// price that does not exist on the active account. Same reasoning as the client
+// token above.
+//
+// Tiers are matched to PLAN_COPY by product name, case-insensitively: Paddle
+// product "Starter" → tier 'starter'. A product with no matching copy is
+// ignored rather than rendered nameless, so an experiment created in the Paddle
+// dashboard cannot appear in onboarding by accident.
+//
+// Unauthenticated: pricing is public information, and the signup flow needs it
+// before a tenant exists.
+billingPublicRouter.get('/plans', async (_req: Request, res: Response) => {
+  if (!isBillingConfigured()) {
+    res.status(503).json({ error: 'Billing not configured', code: 'no_api_key' });
+    return;
+  }
+
+  try {
+    const paddle = getPaddle();
+
+    const products = new Map<string, PlanId>();
+    for await (const product of paddle.products.list({ status: ['active'] })) {
+      const match = PLAN_COPY.find(p => p.name.toLowerCase() === product.name.trim().toLowerCase());
+      if (match) products.set(product.id, match.id);
+    }
+
+    // Preserve PLAN_COPY order — that is the order tiers are presented in, and
+    // Paddle returns products newest-first, which would shuffle the pricing
+    // table between deploys.
+    const offers = new Map<PlanId, PlanOffer>(
+      PLAN_COPY
+        .filter(c => [...products.values()].includes(c.id))
+        .map(c => [c.id, { id: c.id, name: c.name }]),
+    );
+
+    for await (const price of paddle.prices.list({ status: ['active'] })) {
+      const tier = products.get(price.productId);
+      const offer = tier && offers.get(tier);
+      if (!offer) continue;
+
+      const slot: 'monthly' | 'annual' | null =
+        price.billingCycle?.interval === 'month' ? 'monthly'
+        : price.billingCycle?.interval === 'year' ? 'annual'
+        : null;                       // one-time prices are not subscriptions
+      if (!slot) continue;
+
+      offer[slot] = {
+        priceId:  price.id,
+        // Verbatim string in the lowest denomination — parsing to a float here
+        // is how currencies with no minor unit end up 100× wrong.
+        amount:   price.unitPrice.amount,
+        currency: price.unitPrice.currencyCode,
+      };
+    }
+
+    res.json({ environment: paddleEnv(), plans: [...offers.values()] });
+  } catch (err) {
+    console.error('[BILLING] plan catalogue lookup failed:', err instanceof Error ? err.message : err);
+    res.status(502).json({ error: 'Could not load plans' });
+  }
 });
 
 // ── Authenticated tenant routes ──────────────────────────────────────────────

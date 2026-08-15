@@ -5,6 +5,11 @@ import {
   type EndpointMapping, type PresetAdapterType,
 } from './lib/posPresets';
 import EndpointDiscovery from './EndpointDiscovery';
+import { COUNTRIES, countryByCode } from './lib/countries';
+import { PLAN_COPY, formatPlanPrice, type PlanOffer, type BillingInterval } from './lib/plans';
+import { openSubscriptionCheckout } from './lib/paddleCheckout';
+import { tenantIdFromToken } from './lib/apiClient';
+import { isPaddleCurrency } from '../payments/paddleCurrency';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -38,6 +43,14 @@ interface WizardConfig {
   businessRules: {
     gstRate:        number;
     currencySymbol: string;
+    // ISO 4217, derived from `country`. Sent to the gateway; decides whether
+    // card payments are possible at all.
+    currency:       string;
+    // ISO 3166-1 alpha-2.
+    country:        string;
+  };
+  payments: {
+    provider: 'cash' | 'paddle';
   };
   features: {
     deliveryOrders:   boolean;
@@ -81,29 +94,9 @@ const STEPS = [
   'Launch',
 ] as const;
 
-const PLANS = [
-  {
-    id:    'starter' as const,
-    name:  'Starter',
-    price: 'Free',
-    desc:  'Perfect for a single-location restaurant getting started with voice ordering.',
-    features: ['1 kiosk URL', 'Managed backend', 'Basic AI persona', 'Email support'],
-  },
-  {
-    id:    'growth' as const,
-    name:  'Growth',
-    price: '$49 / mo',
-    desc:  'For growing restaurants that need custom branding and multi-language support.',
-    features: ['3 kiosk URLs', 'Custom API adapter', 'All AI persona options', 'Transcript screen', 'Priority support'],
-  },
-  {
-    id:    'enterprise' as const,
-    name:  'Enterprise',
-    price: 'Contact us',
-    desc:  'Full platform access for chains, franchises, and enterprise deployments.',
-    features: ['Unlimited kiosks', 'Webhook adapter', 'White-label branding', 'Dedicated support', 'SLA guarantee'],
-  },
-] as const;
+// Plan copy now lives in src/lib/plans.ts and prices come from Paddle at
+// runtime (GET /api/billing/plans) — see the note there on why ids are never
+// hardcoded in the bundle.
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -136,7 +129,17 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
       logoUrl:      '',
       kioskTitle:   `Welcome to ${initialName}`,
     },
-    businessRules: initialConfig?.businessRules ?? { gstRate: 0, currencySymbol: '$' },
+    businessRules: {
+      gstRate:        0,
+      currencySymbol: '$',
+      currency:       'USD',
+      country:        'US',
+      ...(initialConfig?.businessRules ?? {}),
+    },
+    // Cash is the correct default: a tenant that has not chosen a gateway must
+    // never have the agent offer card, or the order is created with nothing to
+    // open (see PromptBuilder acceptsCard).
+    payments: initialConfig?.payments ?? { provider: 'cash' },
     features: initialConfig?.features ?? { deliveryOrders: false, tableNumbers: false, transcriptScreen: false, loyaltyPoints: false },
   });
 
@@ -144,6 +147,120 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
   const [showEpConfig,  setShowEpConfig]  = useState(false);
   const [showFieldMap,  setShowFieldMap]  = useState(false);
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+
+  // ── Billing ────────────────────────────────────────────────────────────────
+  const [plans,        setPlans]        = useState<PlanOffer[] | null>(null);
+  const [plansError,   setPlansError]   = useState('');
+  // NOT named `interval`/`setInterval` — that shadows the global setInterval
+  // inside this component, so a later polling effect would silently call the
+  // state setter instead of scheduling a timer.
+  const [billingInterval, setBillingInterval] = useState<BillingInterval>('month');
+  const [subscribed,   setSubscribed]   = useState(false);
+  const [checkingSub,  setCheckingSub]  = useState(false);
+
+  const tenantId = tenantIdFromToken(jwtToken);
+
+  // Whether Paddle can collect in this tenant's currency at all. Everything
+  // card-related keys off this one derived value rather than off the country,
+  // so adding a currency to Paddle's list needs no change here.
+  const cardEligible = isPaddleCurrency(cfg.businessRules.currency);
+
+  // A tenant whose country rules out card must not keep a stale 'paddle'
+  // provider from an earlier country choice — that pairing is rejected by
+  // save-config, which would block the whole wizard on an unrelated step.
+  useEffect(() => {
+    if (!cardEligible && cfg.payments.provider !== 'cash') {
+      setCfg(p => ({ ...p, payments: { provider: 'cash' } }));
+    }
+  }, [cardEligible, cfg.payments.provider]);
+
+  // Plan catalogue comes from the server so price ids always match the active
+  // Paddle environment. Fetched once — prices do not change mid-wizard.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch('/api/billing/plans');
+        const body = await r.json() as { plans?: PlanOffer[]; error?: string };
+        if (cancelled) return;
+        if (!r.ok || !body.plans) { setPlansError(body.error ?? 'Could not load plans'); return; }
+        setPlans(body.plans);
+      } catch {
+        if (!cancelled) setPlansError('Could not reach the billing service');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Read our own mirror, never the checkout callback: checkout.completed fires
+  // when the customer finishes the FORM, which is not proof of payment. The
+  // subscription only counts once the signed webhook has been processed.
+  const refreshSubscription = async (): Promise<boolean> => {
+    try {
+      const r = await fetch('/api/billing/subscription', {
+        headers: { Authorization: `Bearer ${jwtToken}` },
+      });
+      if (!r.ok) return false;
+      const body = await r.json() as { access?: { granted?: boolean } };
+      const granted = Boolean(body.access?.granted);
+      setSubscribed(granted);
+      return granted;
+    } catch {
+      return false;
+    }
+  };
+
+  useEffect(() => { void refreshSubscription(); }, []);
+
+  // Poll after checkout closes. Webhook delivery is typically ~1-2s but is not
+  // synchronous with the overlay, so a single immediate read would usually miss
+  // it. Bounded so a failed delivery surfaces as "not confirmed" rather than
+  // spinning forever.
+  const pollForSubscription = async () => {
+    setCheckingSub(true);
+    try {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        if (await refreshSubscription()) return;
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    } finally {
+      setCheckingSub(false);
+    }
+  };
+
+  const startCheckout = async (offer: PlanOffer) => {
+    const price = billingInterval === 'month' ? offer.monthly : offer.annual;
+    if (!price) return;
+    setError('');
+    setCfg(p => ({ ...p, plan: offer.id }));
+    try {
+      await openSubscriptionCheckout(price.priceId, {
+        tenantId: tenantId ?? undefined,
+        onClosed:    () => { void pollForSubscription(); },
+        onCompleted: () => { void pollForSubscription(); },
+      });
+    } catch {
+      setError('Could not open checkout — please try again');
+    }
+  };
+
+  // One country choice drives three fields. The symbol stays editable
+  // afterwards (a restaurant may prefer "Rs" over "Rs."), but the ISO code is
+  // not editable: it is what the gateway sees, and letting it drift from the
+  // country is exactly how a tenant ends up with an uncollectable currency.
+  const selectCountry = (code: string) => {
+    const country = countryByCode(code);
+    if (!country) return;
+    setCfg(p => ({
+      ...p,
+      businessRules: {
+        ...p.businessRules,
+        country:        country.code,
+        currency:       country.currency,
+        currencySymbol: country.symbol,
+      },
+    }));
+  };
 
   // Load saved config and resume from last step on mount
   useEffect(() => {
@@ -159,7 +276,11 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
       adapter: initialConfig.adapter ?? prev.adapter,
       gemini: initialConfig.gemini ?? prev.gemini,
       branding: initialConfig.branding ?? prev.branding,
-      businessRules: initialConfig.businessRules ?? prev.businessRules,
+      // Merged, not replaced: a config saved before country/currency existed has
+      // neither key, and replacing wholesale would put `undefined` into a
+      // <select value> and make it an uncontrolled input.
+      businessRules: { ...prev.businessRules, ...(initialConfig.businessRules ?? {}) },
+      payments: initialConfig.payments ?? prev.payments,
       features: initialConfig.features ?? prev.features,
     }));
 
@@ -340,8 +461,13 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
         businessRules: {
           gstRate:            cfg.businessRules.gstRate,
           currencySymbol:     cfg.businessRules.currencySymbol,
+          currency:           cfg.businessRules.currency,
+          country:            cfg.businessRules.country,
           orderStatusMachine: ['pending','confirmed','preparing','ready','delivered'],
         },
+        // Sent on every save, including partial ones, so the agent's
+        // cash-or-card behaviour matches the wizard the moment it is toggled.
+        payments: cfg.payments,
         features: cfg.features,
         setupComplete: true,
         setupStep: STEPS.length - 1,
@@ -406,8 +532,13 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
         businessRules: {
           gstRate:            cfg.businessRules.gstRate,
           currencySymbol:     cfg.businessRules.currencySymbol,
+          currency:           cfg.businessRules.currency,
+          country:            cfg.businessRules.country,
           orderStatusMachine: ['pending','confirmed','preparing','ready','delivered'],
         },
+        // Sent on every save, including partial ones, so the agent's
+        // cash-or-card behaviour matches the wizard the moment it is toggled.
+        payments: cfg.payments,
         features: cfg.features,
         setupComplete: false,
         setupStep: step,
@@ -437,7 +568,24 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
     }
   };
 
-  const next = () => { setError(''); setStep(s => s + 1); };
+  // A tenant setting up for the FIRST time must subscribe before continuing past
+  // the plan step — that is the point at which they start paying us.
+  //
+  // Deliberately scoped to first-time setup. SetupWizard is also how an existing
+  // tenant edits its configuration (AdminDashboard "Setup" button), and every
+  // tenant onboarded before billing existed has no subscription — gating them
+  // too would lock them out of their own settings entirely.
+  const firstTimeSetup = !initialConfig?.setupComplete;
+  const paywalled      = firstTimeSetup && step === 1 && !subscribed;
+
+  const next = () => {
+    if (paywalled) {
+      setError('Choose a plan and complete payment to continue.');
+      return;
+    }
+    setError('');
+    setStep(s => s + 1);
+  };
   const back = () => { setError(''); setStep(s => s - 1); };
 
   return (
@@ -515,6 +663,17 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
                   onChange={e => patch('branding', { logoUrl: e.target.value })}
                   className={INPUT} placeholder="https://…/logo.png" />
               </Field>
+              <Field label="Country" hint="Sets your currency and determines whether you can take card payments">
+                <select
+                  value={cfg.businessRules.country}
+                  onChange={e => selectCountry(e.target.value)}
+                  className={INPUT + ' cursor-pointer'}
+                >
+                  {COUNTRIES.map(c => (
+                    <option key={c.code} value={c.code}>{c.name}</option>
+                  ))}
+                </select>
+              </Field>
               <div className="flex gap-4">
                 <Field label="Brand Colour">
                   <div className="flex items-center gap-3">
@@ -524,12 +683,22 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
                     <span className="text-sm font-mono opacity-60">{cfg.branding.primaryColor}</span>
                   </div>
                 </Field>
-                <Field label="Currency Symbol">
+                <Field label="Currency Symbol" hint="Display only">
                   <input value={cfg.businessRules.currencySymbol}
                     onChange={e => patch('businessRules', { currencySymbol: e.target.value })}
                     className={INPUT + ' max-w-[80px]'} placeholder="$" maxLength={4} />
                 </Field>
+                <Field label="Currency" hint="Sent to the payment gateway">
+                  <p className="text-sm font-mono font-semibold text-[#5A5A40] pt-2">
+                    {cfg.businessRules.currency}
+                  </p>
+                </Field>
               </div>
+              <p className="text-[11px] opacity-45 leading-relaxed">
+                {cardEligible
+                  ? `Card payments are available in ${countryByCode(cfg.businessRules.country)?.name ?? 'your country'} — you can turn them on under Rules.`
+                  : `Card payments aren't available in ${countryByCode(cfg.businessRules.country)?.name ?? 'your country'} yet, so orders will be cash only. Everything else works normally.`}
+              </p>
             </div>
           )}
 
@@ -537,41 +706,110 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
           {step === 1 && (
             <div className="flex flex-col gap-4">
               <p className="text-sm opacity-60 leading-relaxed">
-                Choose the plan that fits your restaurant. You can upgrade at any time from the Admin Dashboard.
+                Choose the plan that fits your restaurant. You can change it later from the Admin Dashboard.
               </p>
-              <div className="flex flex-col gap-3">
-                {PLANS.map(plan => (
-                  <button
-                    key={plan.id}
-                    type="button"
-                    onClick={() => setCfg(p => ({ ...p, plan: plan.id }))}
-                    className={`rounded-2xl border p-4 text-left transition-all cursor-pointer ${
-                      cfg.plan === plan.id
-                        ? 'border-[#5A5A40] bg-[#5A5A40]/6 ring-1 ring-[#5A5A40]/20'
-                        : 'border-[#5A5A40]/15 hover:border-[#5A5A40]/30'
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="font-bold text-sm text-[#5A5A40]">{plan.name}</p>
-                        <p className="text-xs opacity-55 mt-1 leading-relaxed">{plan.desc}</p>
-                        <ul className="mt-2 flex flex-col gap-0.5">
-                          {plan.features.map(f => (
-                            <li key={f} className="text-xs opacity-50 flex items-center gap-1.5">
-                              <span className="text-[#5A5A40] font-bold">·</span> {f}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                      <span className={`shrink-0 text-sm font-bold whitespace-nowrap ${
-                        cfg.plan === plan.id ? 'text-[#5A5A40]' : 'opacity-40'
-                      }`}>{plan.price}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
+
+              {subscribed && (
+                <div className="rounded-2xl border border-[#5A5A40]/25 bg-[#5A5A40]/6 p-4">
+                  <p className="text-sm font-bold text-[#5A5A40]">Subscription active</p>
+                  <p className="text-xs opacity-55 mt-1">
+                    Your payment is confirmed. Continue setting up your kiosk.
+                  </p>
+                </div>
+              )}
+
+              {plansError && (
+                <div className="rounded-2xl border border-red-300/50 bg-red-50/50 p-4">
+                  <p className="text-sm font-semibold text-red-800">{plansError}</p>
+                  <p className="text-xs text-red-700/70 mt-1">
+                    You can continue setting up and subscribe later from the Admin Dashboard.
+                  </p>
+                </div>
+              )}
+
+              {!plans && !plansError && (
+                <p className="text-sm opacity-50">Loading plans…</p>
+              )}
+
+              {plans && plans.length > 0 && (
+                <>
+                  {/* Monthly/annual is a property of the PRICE, not the tier —
+                      each tier carries both, so switching must not reset the
+                      chosen plan. */}
+                  <div className="flex gap-1 p-1 rounded-xl bg-[#5A5A40]/8 self-start">
+                    {(['month', 'year'] as const).map(iv => (
+                      <button
+                        key={iv}
+                        type="button"
+                        onClick={() => setBillingInterval(iv)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                          billingInterval === iv ? 'bg-white text-[#5A5A40] shadow-sm' : 'opacity-50'
+                        }`}
+                      >
+                        {iv === 'month' ? 'Monthly' : 'Annual'}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-col gap-3">
+                    {plans.map(offer => {
+                      const copy  = PLAN_COPY.find(c => c.id === offer.id);
+                      const price = billingInterval === 'month' ? offer.monthly : offer.annual;
+                      const selected = cfg.plan === offer.id;
+                      return (
+                        <div
+                          key={offer.id}
+                          className={`rounded-2xl border p-4 transition-all ${
+                            selected
+                              ? 'border-[#5A5A40] bg-[#5A5A40]/6 ring-1 ring-[#5A5A40]/20'
+                              : 'border-[#5A5A40]/15'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="font-bold text-sm text-[#5A5A40]">{offer.name}</p>
+                              <p className="text-xs opacity-55 mt-1 leading-relaxed">{copy?.desc}</p>
+                              <ul className="mt-2 flex flex-col gap-0.5">
+                                {copy?.features.map(f => (
+                                  <li key={f} className="text-xs opacity-50 flex items-center gap-1.5">
+                                    <span className="text-[#5A5A40] font-bold">·</span> {f}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <p className="text-sm font-bold whitespace-nowrap text-[#5A5A40]">
+                                {price ? formatPlanPrice(price.amount, price.currency) : '—'}
+                              </p>
+                              <p className="text-[10px] opacity-40">
+                                {billingInterval === 'month' ? 'per month' : 'per year'}
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!price || busy || checkingSub || subscribed}
+                            onClick={() => void startCheckout(offer)}
+                            className="mt-3 w-full py-2 rounded-xl bg-[#5A5A40] text-white text-xs font-bold tracking-wide disabled:opacity-35 cursor-pointer disabled:cursor-not-allowed"
+                          >
+                            {subscribed ? 'Subscribed' : !price ? 'Unavailable' : `Subscribe to ${offer.name}`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              {checkingSub && (
+                <p className="text-xs opacity-55">
+                  Confirming your payment… this takes a few seconds.
+                </p>
+              )}
+
               <p className="text-[10px] opacity-40 leading-relaxed">
-                Billing is handled separately — selecting a plan here sets your feature tier. Contact us to activate paid plans.
+                Plans are billed in USD. Your restaurant's own currency
+                ({cfg.businessRules.currency}) is unaffected — it applies to your diners' orders.
               </p>
             </div>
           )}
@@ -930,11 +1168,49 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
                     className={INPUT + ' max-w-[100px]'} placeholder="0"
                   />
                 </Field>
-                <Field label="Currency Symbol">
+                <Field label="Currency Symbol" hint="Display only">
                   <input value={cfg.businessRules.currencySymbol}
                     onChange={e => patch('businessRules', { currencySymbol: e.target.value })}
                     className={INPUT + ' max-w-[80px]'} placeholder="$" maxLength={4} />
                 </Field>
+              </div>
+
+              <div className="bg-white/40 rounded-2xl border border-[#5A5A40]/10 p-4 flex flex-col gap-3">
+                <p className="text-[11px] uppercase tracking-widest opacity-40 font-semibold">Payments</p>
+                {cardEligible ? (
+                  <label className="flex items-center justify-between gap-3 cursor-pointer">
+                    <span>
+                      <p className="text-sm font-semibold text-[#5A5A40]">Accept Card Payments</p>
+                      <p className="text-[11px] opacity-45">
+                        The assistant asks every customer “cash or card?”. Card orders open a secure
+                        payment window and are only confirmed once payment clears.
+                      </p>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setCfg(p => ({
+                        ...p,
+                        payments: { provider: p.payments.provider === 'paddle' ? 'cash' : 'paddle' },
+                      }))}
+                      className={`relative w-10 h-5 rounded-full transition-colors cursor-pointer shrink-0 ${
+                        cfg.payments.provider === 'paddle' ? 'bg-[#5A5A40]' : 'bg-[#5A5A40]/20'
+                      }`}
+                    >
+                      <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${
+                        cfg.payments.provider === 'paddle' ? 'translate-x-5' : 'translate-x-0.5'
+                      }`} />
+                    </button>
+                  </label>
+                ) : (
+                  <div>
+                    <p className="text-sm font-semibold text-[#5A5A40]">Cash only</p>
+                    <p className="text-[11px] opacity-45 leading-relaxed">
+                      Our card processor can't collect in {cfg.businessRules.currency} yet, so the
+                      assistant will take every order as cash and won't ask how customers want to pay.
+                      Change your country under Restaurant if this isn't right.
+                    </p>
+                  </div>
+                )}
               </div>
 
               <div className="bg-white/40 rounded-2xl border border-[#5A5A40]/10 p-4 flex flex-col gap-3">
@@ -1022,7 +1298,9 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
             {step < STEPS.length - 1 && (
               <button
                 onClick={next}
-                className="px-5 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl text-sm font-semibold hover:bg-[#4a4a33] active:scale-95 transition cursor-pointer"
+                disabled={paywalled}
+                title={paywalled ? 'Complete payment to continue' : undefined}
+                className="px-5 py-2.5 bg-[#5A5A40] text-[#F8F7F2] rounded-xl text-sm font-semibold hover:bg-[#4a4a33] active:scale-95 transition cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:bg-[#5A5A40] disabled:active:scale-100"
               >
                 Next →
               </button>

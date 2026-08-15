@@ -36,6 +36,17 @@ export function getCurrentTenant(): { jwt: string | null; tenantId: string | nul
   return { jwt, tenantId: claims?.tenantId ?? null };
 }
 
+// Same claim, but from a token the caller already holds rather than from
+// sessionStorage — the setup wizard receives its JWT as a prop and must not
+// depend on the session having been written yet.
+//
+// The claim is read for ATTRIBUTION only (Paddle checkout custom_data). It is
+// never a permission check: the JWT is unverified here, so anything that grants
+// access must re-derive the tenant server-side from the verified token.
+export function tenantIdFromToken(token: string): string | null {
+  return decodeJwt(token)?.tenantId ?? null;
+}
+
 export interface TenantFetchOptions extends RequestInit {
   // Anonymous kiosk pages (customer URLs without a login) won't have a JWT.
   // Pass the tenantId resolved from /api/tenant-config/:slug here so the

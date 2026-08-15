@@ -38,11 +38,15 @@ export class PromptBuilder {
     // Cash-only tenants must never be offered card: the order would be created
     // with payment_method="card" and then have no gateway to send it to, which
     // strands the customer at a checkout that cannot open.
+    // Asked for dine-in and pickup only. A delivery order is paid at the door to
+    // the rider, so opening a card checkout for one would take the money twice —
+    // the customer pays here and is asked again on arrival.
     const paymentStep = config.acceptsCard
-      ? `Ask: "Will you pay by cash or card?" — wait for the customer's answer.
+      ? `For dine-in and pickup orders, ask: "Will you pay by cash or card?" — wait for the customer's answer.
    - "cash" / "cash pe" / "naqad" → payment_method = "cash"
    - "card" / "card se" / "credit card" / "debit card" → payment_method = "card"
-   If they choose card, tell them a secure payment window will open after they confirm.`
+   If they choose card, tell them a secure payment window will open after they confirm.
+   For DELIVERY orders do not ask — payment is collected on delivery. Always pass payment_method = "cash".`
       : `Do NOT ask how they want to pay — this restaurant takes cash at the counter only.
    Always pass payment_method = "cash".`;
 
