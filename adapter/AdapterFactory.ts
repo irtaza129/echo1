@@ -3,6 +3,7 @@ import type { IRestaurantAdapter } from './IRestaurantAdapter.js';
 import { ManagedBackendAdapter } from './ManagedBackendAdapter.js';
 import { CustomApiAdapter }      from './CustomApiAdapter.js';
 import { WebhookAdapter }        from './WebhookAdapter.js';
+import { PosAdapter }            from './PosAdapter.js';
 
 const DEFAULT_BACKEND_URL = process.env.BACKEND_URL ?? 'https://voiceai-hzyb.onrender.com';
 
@@ -20,6 +21,11 @@ export class AdapterFactory {
 
       case 'webhook':
         return new WebhookAdapter(config, credentials);
+
+      // Native POS: no upstream, no credentials. Menu and orders come from our
+      // own Postgres, carts from Redis.
+      case 'pos':
+        return new PosAdapter(config);
     }
   }
 }

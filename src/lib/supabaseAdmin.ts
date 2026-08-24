@@ -152,6 +152,32 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_transactions:  ['transaction_id', 'customer_id', 'subscription_id', 'tenant_id',
                           'status', 'currency_code', 'total', 'billed_at'],
   billing_webhook_events: ['event_id', 'event_type', 'occurred_at', 'processed_at'],
+  // POS ledger (migrations 004/005/007/009). Every channel now writes orders
+  // here, so drift on these tables loses sales rather than log lines — the
+  // loudest possible reason to check them at boot.
+  //
+  // `orders` is SHARED with the FastAPI backend: these are the columns WE write,
+  // not the full table. `payment_ref` and `instructions` in particular exist only
+  // because migration 009 added them — migration 002 tried to `create table if
+  // not exists orders` against a table that already had a different shape, which
+  // added nothing at all.
+  orders:       ['id', 'tenant_id', 'order_number', 'status', 'order_type', 'source',
+                 'customer_name', 'customer_phone', 'subtotal', 'discount', 'delivery_fee',
+                 'tax_total', 'service_charge', 'total_amount', 'payment_method',
+                 'payment_status', 'payment_ref', 'instructions', 'notes',
+                 'table_id', 'shift_id', 'staff_id', 'customer_id',
+                 'opened_at', 'closed_at', 'voided_at', 'void_reason',
+                 'created_at', 'updated_at'],
+  order_items:  ['id', 'tenant_id', 'order_id', 'dish_id', 'dish_name', 'quantity',
+                 'unit_price', 'item_total', 'line_discount', 'selected_options',
+                 'notes', 'seat_no', 'course', 'voided_at', 'void_reason'],
+  venue_tables: ['id', 'tenant_id', 'area', 'label', 'seats', 'x', 'y', 'status'],
+  pos_payments: ['id', 'tenant_id', 'order_id', 'shift_id', 'method', 'amount',
+                 'tendered', 'change_due', 'tip', 'status', 'refunded_amount',
+                 'reference', 'staff_id', 'created_at'],
+  pos_shifts:   ['id', 'tenant_id', 'opened_by', 'opened_at', 'opening_float',
+                 'closed_by', 'closed_at', 'declared_cash', 'expected_cash',
+                 'variance', 'note', 'status'],
 };
 
 export interface SchemaProblem {

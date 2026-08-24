@@ -1,5 +1,8 @@
 {
-  "include": ["src", "server.ts", "api", "adapter", "middleware", "payments"],
+  "include": [
+    "src", "server.ts", "adapter", "middleware", "payments",
+    "routes", "telephony", "scripts"
+  ],
   "compilerOptions": {
     "strict": true,
     "target": "ES2022",

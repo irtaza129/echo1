@@ -297,7 +297,10 @@ export const ordersRepo = {
       quantity:         i.quantity,
       unit_price:       i.unitPrice,
       line_discount:    i.lineDiscount ?? 0,
-      item_total:       Math.round((i.unitPrice * i.quantity - (i.lineDiscount ?? 0)) * 100) / 100,
+      // item_total is deliberately absent: it is a GENERATED ALWAYS column
+      // (quantity * unit_price - line_discount) and Postgres REJECTS an insert
+      // that supplies it. Sending it failed every order write with
+      // "cannot insert a non-DEFAULT value into column item_total".
       selected_options: i.selectedOptions ?? [],
       notes:            i.notes   ?? null,
       seat_no:          i.seatNo  ?? null,
@@ -369,6 +372,272 @@ export const ordersRepo = {
     await db.update('orders', { id: `eq.${orderId}`, tenant_id: `eq.${tenantId}` }, {
       table_id: tableId, updated_at: new Date().toISOString(),
     });
+  },
+
+  // Tenant-less lookup by primary key, for callers that genuinely have no tenant
+  // context. Today that is exactly one: a payment-gateway webhook, which arrives
+  // server-to-server with no session and no X-Tenant-ID.
+  //
+  // Every other read MUST go through findById with its tenant filter. Order ids
+  // are uuids, so this cannot be walked, but it is still the one hole in tenant
+  // scoping and should not grow more callers.
+  findByIdUnscoped(orderId: string): Promise<OrderRow | null> {
+    return db.selectOne<OrderRow>('orders', { id: `eq.${orderId}` });
+  },
+
+  /**
+   * Record the outcome of a gateway payment against an order.
+   *
+   * Writes absolute values derived from the event rather than mutating
+   * relatively, so a webhook redelivery converges on the same result — Paddle
+   * retries for up to three days, so this WILL be called more than once.
+   *
+   * Returns the updated row, or null when no such order exists (an order that
+   * predates the Postgres cutover, or a transaction that was never ours).
+   */
+  async applyPayment(
+    orderId: string,
+    p: { paymentStatus: string; paymentRef: string; paymentMethod: string },
+  ): Promise<OrderRow | null> {
+    const existing = await this.findByIdUnscoped(orderId);
+    if (!existing) return null;
+
+    const patch: Record<string, unknown> = {
+      payment_status: p.paymentStatus,
+      payment_ref:    p.paymentRef,
+      payment_method: p.paymentMethod,
+      updated_at:     new Date().toISOString(),
+    };
+
+    // Only a captured payment advances the kitchen. A pending order that has
+    // been paid becomes confirmed so it shows on the board as a real, paid
+    // order. A voided order is never resurrected by a late webhook.
+    if (p.paymentStatus === 'captured' && existing.status === 'pending' && !existing.voided_at) {
+      patch.status = 'confirmed';
+    }
+
+    const rows = await db.updateReturning<OrderRow>('orders', { id: `eq.${orderId}` }, patch);
+    return rows[0] ?? null;
+  },
+
+  // ── Amending an open tab ───────────────────────────────────────────────────
+  // create() writes an order whole, which suits a kiosk: the customer finishes
+  // ordering, then it is saved. A dine-in tab is the opposite — it grows over
+  // an hour, a round at a time — so these exist to change an order that is
+  // already open, and every one of them re-derives the money afterwards.
+
+  /**
+   * Recompute an order's totals from its live lines.
+   *
+   * The stored totals are never patched incrementally. Adding a line's value to
+   * total_amount looks cheaper, but every rounding decision and every rate
+   * change then depends on the order the edits happened in, and a tab that was
+   * amended four times drifts from a tab that was rung in once. Reading the
+   * lines back and recomputing is the only version that always agrees with the
+   * receipt.
+   *
+   * Voided lines are excluded here but stay in the table — the Z-report still
+   * has to see them.
+   */
+  async recomputeTotals(
+    tenantId: string,
+    orderId:  string,
+    rates:    { gstRate: number; serviceChargeRate?: number },
+  ): Promise<{ order: OrderRow; totals: OrderTotals }> {
+    const order = await ordersRepo.findById(tenantId, orderId);
+    if (!order) throw new Error(`[POS] order ${orderId} not found`);
+
+    const items = await ordersRepo.items(orderId);
+    const live: NewOrderItem[] = items
+      .filter(i => i.voided_at === null)
+      .map(i => ({
+        dishName:     i.dish_name,
+        quantity:     i.quantity,
+        unitPrice:    num(i.unit_price),
+        lineDiscount: num(i.line_discount),
+      }));
+
+    const totals = computeTotals(live, rates.gstRate, {
+      discount:          num(order.discount),
+      deliveryFee:       num(order.delivery_fee),
+      serviceChargeRate: rates.serviceChargeRate,
+    });
+
+    const rows = await db.updateReturning<OrderRow>('orders', {
+      id: `eq.${orderId}`, tenant_id: `eq.${tenantId}`,
+    }, {
+      subtotal:       totals.subtotal,
+      discount:       totals.discount,
+      service_charge: totals.serviceCharge,
+      tax_total:      totals.tax,
+      total_amount:   totals.total,
+      updated_at:     new Date().toISOString(),
+    });
+
+    return { order: rows[0], totals };
+  },
+
+  /**
+   * What the totals WOULD be if this line were voided — computed without
+   * writing anything.
+   *
+   * The alternative is to void, then check, then un-void on refusal. That
+   * leaves a window where the order is wrong, and an un-void is not a real
+   * operation: the row already carries a void reason and an approver by then.
+   * Refusing before any write means a rejected void changes nothing at all.
+   */
+  async previewVoidItem(
+    tenantId: string,
+    orderId:  string,
+    itemId:   string,
+    rates:    { gstRate: number; serviceChargeRate?: number },
+  ): Promise<OrderTotals> {
+    const order = await ordersRepo.findById(tenantId, orderId);
+    if (!order) throw new Error(`[POS] order ${orderId} not found`);
+
+    const items = await ordersRepo.items(orderId);
+    const live: NewOrderItem[] = items
+      .filter(i => i.voided_at === null && i.id !== itemId)
+      .map(i => ({
+        dishName:     i.dish_name,
+        quantity:     i.quantity,
+        unitPrice:    num(i.unit_price),
+        lineDiscount: num(i.line_discount),
+      }));
+
+    return computeTotals(live, rates.gstRate, {
+      discount:          num(order.discount),
+      deliveryFee:       num(order.delivery_fee),
+      serviceChargeRate: rates.serviceChargeRate,
+    });
+  },
+
+  /** What the totals WOULD be at this discount. Same no-write rationale. */
+  async previewDiscount(
+    tenantId: string,
+    orderId:  string,
+    discount: number,
+    rates:    { gstRate: number; serviceChargeRate?: number },
+  ): Promise<OrderTotals> {
+    const order = await ordersRepo.findById(tenantId, orderId);
+    if (!order) throw new Error(`[POS] order ${orderId} not found`);
+
+    const items = await ordersRepo.items(orderId);
+    const live: NewOrderItem[] = items
+      .filter(i => i.voided_at === null)
+      .map(i => ({
+        dishName:     i.dish_name,
+        quantity:     i.quantity,
+        unitPrice:    num(i.unit_price),
+        lineDiscount: num(i.line_discount),
+      }));
+
+    return computeTotals(live, rates.gstRate, {
+      discount,
+      deliveryFee:       num(order.delivery_fee),
+      serviceChargeRate: rates.serviceChargeRate,
+    });
+  },
+  /**
+   * Tie an order to the dine-in visit that produced it.
+   *
+   * Written after the order exists rather than as part of create(), because
+   * SubmitOrderParams is the shared adapter contract and a dine_session_id is
+   * meaningless to the managed and custom_api adapters. Best-effort at the call
+   * site: the sale is already recorded, and failing to decorate it must not
+   * undo it.
+   */
+  async setDineSession(tenantId: string, orderId: string, dineSessionId: string): Promise<void> {
+    await db.update('orders', { id: `eq.${orderId}`, tenant_id: `eq.${tenantId}` }, {
+      dine_session_id: dineSessionId,
+    });
+  },
+
+  /** Every order this table has placed during the current visit. */
+  forDineSession(tenantId: string, dineSessionId: string): Promise<OrderRow[]> {
+    return db.selectMany<OrderRow>('orders', {
+      tenant_id:       `eq.${tenantId}`,
+      dine_session_id: `eq.${dineSessionId}`,
+      order:           'created_at.asc',
+    });
+  },
+
+  /** Append a round to an open tab. */
+  async addItems(
+    tenantId: string,
+    orderId:  string,
+    items:    NewOrderItem[],
+    rates:    { gstRate: number; serviceChargeRate?: number },
+  ): Promise<{ order: OrderRow; totals: OrderTotals }> {
+    if (items.length === 0) throw new Error('[POS] refusing to add an empty round');
+
+    const order = await ordersRepo.findById(tenantId, orderId);
+    if (!order)           throw new Error(`[POS] order ${orderId} not found`);
+    if (order.voided_at)  throw new Error('[POS] cannot add items to a voided order');
+    // A closed tab has been settled. Re-opening it by adding a line would leave
+    // the order owing money nobody is standing there to pay.
+    if (order.closed_at)  throw new Error('[POS] this order is already closed — start a new one');
+
+    await db.insertMany('order_items', items.map(i => ({
+      tenant_id:        tenantId,
+      order_id:         orderId,
+      dish_id:          i.dishId ?? null,
+      dish_name:        i.dishName,
+      quantity:         i.quantity,
+      unit_price:       i.unitPrice,
+      line_discount:    i.lineDiscount ?? 0,
+      // item_total omitted — GENERATED ALWAYS (see migration 010).
+      selected_options: i.selectedOptions ?? [],
+      notes:            i.notes   ?? null,
+      seat_no:          i.seatNo  ?? null,
+      course:           i.course  ?? null,
+    })));
+
+    return ordersRepo.recomputeTotals(tenantId, orderId, rates);
+  },
+
+  /** Void one line. The row is kept so the Z-report and any audit still see it. */
+  async voidItem(
+    tenantId: string,
+    orderId:  string,
+    itemId:   string,
+    reason:   string,
+    byStaffId: string | null,
+    rates:    { gstRate: number; serviceChargeRate?: number },
+  ): Promise<{ order: OrderRow; totals: OrderTotals }> {
+    const items = await ordersRepo.items(orderId);
+    const line  = items.find(i => i.id === itemId);
+    if (!line)            throw new Error(`[POS] line ${itemId} not found on this order`);
+    if (line.voided_at)   throw new Error('[POS] that line is already voided');
+
+    await db.update('order_items', { id: `eq.${itemId}`, tenant_id: `eq.${tenantId}` }, {
+      voided_at:   new Date().toISOString(),
+      void_reason: reason,
+      void_by:     byStaffId,
+    });
+
+    return ordersRepo.recomputeTotals(tenantId, orderId, rates);
+  },
+
+  /** Set an order-level discount. Stored with its reason and who approved it. */
+  async applyDiscount(
+    tenantId:  string,
+    orderId:   string,
+    discount:  number,
+    reason:    string,
+    byStaffId: string | null,
+    rates:     { gstRate: number; serviceChargeRate?: number },
+  ): Promise<{ order: OrderRow; totals: OrderTotals }> {
+    const order = await ordersRepo.findById(tenantId, orderId);
+    if (!order)          throw new Error(`[POS] order ${orderId} not found`);
+    if (order.voided_at) throw new Error('[POS] cannot discount a voided order');
+    if (order.closed_at) throw new Error('[POS] cannot discount an order that is already settled');
+
+    await db.update('orders', { id: `eq.${orderId}`, tenant_id: `eq.${tenantId}` }, {
+      discount, discount_reason: reason, discount_by: byStaffId,
+    });
+
+    return ordersRepo.recomputeTotals(tenantId, orderId, rates);
   },
 };
 
@@ -481,6 +750,21 @@ export interface CashMovementRow {
   created_at: string;
 }
 
+export interface ShiftReport {
+  shiftId:      string;
+  openedAt:     string;
+  closedAt:     string | null;
+  openingFloat: number;
+  orders:       { total: number; voided: number };
+  sales:        { subtotal: number; discount: number; serviceCharge: number; tax: number; total: number };
+  tenders:      Array<{ method: string; gross: number; refunded: number; net: number; count: number }>;
+  movements:    Array<{ type: string; amount: number; count: number }>;
+  expectedCash: number;
+  /** Null until the shift is closed — an X report has nothing counted yet. */
+  declaredCash: number | null;
+  variance:     number | null;
+}
+
 export const shiftsRepo = {
   current(tenantId: string): Promise<ShiftRow | null> {
     return db.selectOne<ShiftRow>('pos_shifts', {
@@ -500,6 +784,13 @@ export const shiftsRepo = {
     });
   },
 
+  // Any shift by id, open or closed — current() only ever returns the open one,
+  // and a Z report is read from a shift that has just been closed.
+  byId(tenantId: string, shiftId: string): Promise<ShiftRow | null> {
+    return db.selectOne<ShiftRow>('pos_shifts', {
+      id: `eq.${shiftId}`, tenant_id: `eq.${tenantId}`,
+    });
+  },
   movements(shiftId: string): Promise<CashMovementRow[]> {
     return db.selectMany<CashMovementRow>('pos_cash_movements', {
       shift_id: `eq.${shiftId}`, order: 'created_at.asc',
@@ -543,6 +834,97 @@ export const shiftsRepo = {
     }, 0);
 
     return Math.round((num(shift.opening_float) + cashSales + movementNet) * 100) / 100;
+  },
+
+  /**
+   * The numbers behind an X or a Z report.
+   *
+   * X = read the figures mid-shift, drawer stays open. Z = the same figures at
+   * close, after which the shift is finished. They are the SAME computation on
+   * purpose: a Z that is derived differently from the X staff read an hour
+   * earlier is a Z nobody trusts.
+   *
+   * Tender is grouped by method and reported gross, refunded and net, because
+   * "we took 40,000 today" and "we took 40,000 and refunded 3,000" are very
+   * different days and a single net figure hides which one happened.
+   */
+  async report(tenantId: string, shift: ShiftRow): Promise<ShiftReport> {
+    const [orders, payments, movements, expectedCash] = await Promise.all([
+      db.selectMany<OrderRow>('orders', {
+        tenant_id: `eq.${tenantId}`, shift_id: `eq.${shift.id}`,
+      }),
+      db.selectMany<PaymentRow>('pos_payments', {
+        tenant_id: `eq.${tenantId}`, shift_id: `eq.${shift.id}`,
+      }),
+      shiftsRepo.movements(shift.id),
+      shiftsRepo.expectedCash(tenantId, shift),
+    ]);
+
+    // Voided orders are counted but contribute no money. They still have to be
+    // visible: a shift with thirty voids is telling you something, and a report
+    // that silently drops them is the one that hides it.
+    const live = orders.filter(o => o.voided_at === null);
+
+    const sales = live.reduce((acc, o) => ({
+      subtotal:      acc.subtotal      + num(o.subtotal),
+      discount:      acc.discount      + num(o.discount),
+      serviceCharge: acc.serviceCharge + num(o.service_charge),
+      tax:           acc.tax           + num(o.tax_total),
+      total:         acc.total         + num(o.total_amount),
+    }), { subtotal: 0, discount: 0, serviceCharge: 0, tax: 0, total: 0 });
+
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+
+    const byMethod = new Map<string, { gross: number; refunded: number; count: number }>();
+    for (const pay of payments) {
+      if (pay.status === 'voided') continue;
+      const e = byMethod.get(pay.method) ?? { gross: 0, refunded: 0, count: 0 };
+      e.gross    += num(pay.amount);
+      e.refunded += num(pay.refunded_amount);
+      e.count    += 1;
+      byMethod.set(pay.method, e);
+    }
+
+    const byType = new Map<string, { amount: number; count: number }>();
+    for (const m of movements) {
+      const e = byType.get(m.type) ?? { amount: 0, count: 0 };
+      e.amount += num(m.amount);
+      e.count  += 1;
+      byType.set(m.type, e);
+    }
+
+    return {
+      shiftId:      shift.id,
+      openedAt:     shift.opened_at,
+      closedAt:     shift.closed_at,
+      openingFloat: num(shift.opening_float),
+      orders: {
+        total:  orders.length,
+        voided: orders.length - live.length,
+      },
+      sales: {
+        subtotal:      r2(sales.subtotal),
+        discount:      r2(sales.discount),
+        serviceCharge: r2(sales.serviceCharge),
+        tax:           r2(sales.tax),
+        total:         r2(sales.total),
+      },
+      tenders: [...byMethod.entries()]
+        .map(([method, v]) => ({
+          method,
+          gross:    r2(v.gross),
+          refunded: r2(v.refunded),
+          net:      r2(v.gross - v.refunded),
+          count:    v.count,
+        }))
+        .sort((a, b) => b.net - a.net),
+      movements: [...byType.entries()]
+        .map(([type, v]) => ({ type, amount: r2(v.amount), count: v.count }))
+        .sort((a, b) => a.type.localeCompare(b.type)),
+      expectedCash,
+      declaredCash: shift.declared_cash === null ? null : num(shift.declared_cash),
+      variance:     shift.variance      === null ? null : num(shift.variance),
+    };
   },
 
   async close(

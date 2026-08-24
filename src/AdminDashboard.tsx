@@ -2,6 +2,9 @@ import { useState, useEffect, useId } from 'react';
 import { ENDPOINT_OPERATIONS, RESOLVE_ITEM_MAP_FIELDS, type EndpointParams } from './lib/posPresets';
 import EndpointDiscovery from './EndpointDiscovery';
 import SetupWizard from './SetupWizard';
+import SetupStaff from './pos/SetupStaff';
+import SetupTables from './pos/SetupTables';
+import EnablePosGate from './pos/EnablePosGate';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -45,6 +48,7 @@ interface FullConfig {
     tableNumbers:     boolean;
     transcriptScreen: boolean;
     loyaltyPoints:    boolean;
+    pos?:             boolean;
   };
   setupComplete?: boolean;
   setupStep?: number;
@@ -57,7 +61,7 @@ interface Props {
   onNavigateToDashboard: () => void;
 }
 
-type Tab = 'overview' | 'config' | 'menu' | 'connection' | 'usage' | 'audit' | 'staff';
+type Tab = 'overview' | 'config' | 'menu' | 'connection' | 'usage' | 'audit' | 'staff' | 'tables';
 
 interface StaffMember {
   email: string;
@@ -612,7 +616,7 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
 
       {/* ── Tabs ────────────────────────────────────────────────────────────── */}
       <nav className="shrink-0 flex gap-0 border-b border-[#5A5A40]/10 px-5 bg-white/30 overflow-x-auto">
-        {(['overview', 'config', 'menu', 'staff', 'usage', 'audit', 'connection'] as Tab[]).map(t => (
+        {(['overview', 'config', 'menu', 'staff', 'tables', 'usage', 'audit', 'connection'] as Tab[]).map(t => (
           <button
             key={t}
             onClick={() => handleTabChange(t)}
@@ -626,6 +630,7 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
               : t === 'config'   ? 'Configuration'
               : t === 'menu'     ? 'Menu'
               : t === 'staff'    ? 'Staff'
+              : t === 'tables'   ? 'Tables & QR'
               : t === 'usage'    ? 'Usage'
               : t === 'audit'    ? 'Audit Log'
               : 'Connection Test'}
@@ -1375,6 +1380,44 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
                 </table>
               )}
             </div>
+
+            {/* Till PINs — separate from the invite above on purpose. Inviting
+                creates the login; the PIN is what that person types AT THE
+                TERMINAL, and it cannot be set until they exist as a row, which
+                is why this sits below the list rather than in the invite form. */}
+            <div>
+              <p className="text-[10px] uppercase tracking-widest opacity-40 font-semibold mb-2">
+                Till PINs
+              </p>
+              <p className="text-sm opacity-60 leading-relaxed mb-3">
+                Give each person a 4-digit PIN for the till, and tick what they are
+                allowed to do there — void a line, give a discount, close the shift.
+                A PIN is not their login password; it only identifies who is at the
+                terminal.
+              </p>
+              {config?.features.pos
+                ? <SetupStaff />
+                : <EnablePosGate
+                    currentAdapterType={config?.adapter.type ?? ''}
+                    onEnabled={() => setConfig(c => c && { ...c, features: { ...c.features, pos: true }, adapter: { ...c.adapter, type: 'pos' } })}
+                  />}
+            </div>
+          </div>
+        )}
+
+        {/* Tables & QR */}
+        {tab === 'tables' && (
+          <div className="flex flex-col gap-5">
+            <p className="text-sm opacity-60 leading-relaxed">
+              Each table gets its own QR code and PIN. Diners scan the code, enter
+              the PIN printed beside it, and order by voice from their own phone.
+            </p>
+            {config?.features.pos
+              ? <SetupTables />
+              : <EnablePosGate
+                  currentAdapterType={config?.adapter.type ?? ''}
+                  onEnabled={() => setConfig(c => c && { ...c, features: { ...c.features, pos: true }, adapter: { ...c.adapter, type: 'pos' } })}
+                />}
           </div>
         )}
 

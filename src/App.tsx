@@ -175,6 +175,7 @@ function getStatusLabel(status: AppStatus): string {
 
 export default function App({
   tenantSlug,
+  onNavigateToPos,
   onNavigateToDashboard,
   onNavigateToTranscripts,
   onNavigateToAdmin,
@@ -182,6 +183,7 @@ export default function App({
   onTurnComplete,
 }: {
   tenantSlug?:              string;
+  onNavigateToPos?:        () => void;
   onNavigateToDashboard?:  () => void;
   onNavigateToTranscripts?: () => void;
   onNavigateToAdmin?:       () => void;
@@ -958,6 +960,17 @@ export default function App({
             ))
           )}
         </div>
+
+        {onNavigateToPos && (
+          <div className="px-3 pb-1 shrink-0">
+            <button
+              onClick={onNavigateToPos}
+              className="w-full py-2.5 glass-panel rounded-xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
+            >
+              Till →
+            </button>
+          </div>
+        )}
 
         {onNavigateToDashboard && (
           <div className="px-3 pb-1 shrink-0">

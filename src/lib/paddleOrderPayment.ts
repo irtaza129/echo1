@@ -1,5 +1,5 @@
 import { getRedis, redisKey, TTL } from './redis.js';
-import type { LocalOrder } from './localMenuUtils.js';
+import { ordersRepo } from './posRepo.js';
 import { mapStatus } from '../../payments/PaddleProvider.js';
 import { fromPaddleAmount } from '../../payments/paddleCurrency.js';
 import type { PaymentTransaction } from '../../payments/IPaymentProvider.js';
@@ -15,10 +15,11 @@ import type { PaymentTransaction } from '../../payments/IPaymentProvider.js';
 //   kind === 'order_payment'  → a diner paying a tenant for food  (here)
 //   otherwise                 → a tenant paying US for a plan     (paddleWebhook.ts)
 //
-// Order state lives in Redis, not the Supabase billing mirror. Keeping diner
-// payments out of billing_transactions is deliberate: that table feeds SaaS
-// revenue reporting, and mixing per-order food revenue into it would make MRR
-// meaningless.
+// The order itself lives in Postgres `orders` (the single ledger every channel
+// writes to); the payment attempt stays in Redis under `payment:<ref>` as a hot
+// record. Neither goes into the Supabase billing mirror, deliberately: that
+// table feeds SaaS revenue reporting, and mixing per-order food revenue into it
+// would make MRR meaningless.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface OrderPaymentResult {
@@ -91,30 +92,24 @@ export async function applyOrderPayment(
                  `updating order ${orderId} anyway`);
   }
 
-  const order = await redis.get<LocalOrder>(redisKey.localOrder(orderId));
-  if (!order) {
-    // The order expired (30-day TTL) or never existed. The money is still
-    // Paddle's record of truth; nothing here can be fixed by a retry, so report
-    // it as handled rather than forcing 3 days of redeliveries.
+  // The order lives in Postgres. applyPayment writes absolute values and only
+  // advances a still-pending order to 'confirmed' on capture, mirroring exactly
+  // what the Safepay webhook path does.
+  const updated = await ordersRepo.applyPayment(orderId, {
+    paymentStatus: status,
+    paymentRef:    data.id,
+    paymentMethod: 'paddle',
+  });
+
+  if (!updated) {
+    // Nothing here can be fixed by a retry — the order was never ours, or it
+    // predates the Postgres ledger. Report it handled rather than forcing three
+    // days of Paddle redeliveries. The money remains Paddle's record of truth.
     return { applied: false, reason: `order ${orderId} not found`, orderId, status };
   }
 
-  order.payment_status = status;
-  order.payment_ref    = data.id;
-  order.payment_method = 'paddle';
-  order.updated_at     = now;
-
-  // Only a captured payment advances the kitchen. A `pending` order that has
-  // been paid becomes `confirmed` so it shows up on the dashboard as a real,
-  // paid order — mirroring exactly what the Safepay webhook path does.
-  if (status === 'captured' && order.status === 'pending') {
-    order.status = 'confirmed';
-  }
-
-  await redis.set(redisKey.localOrder(orderId), order, { ex: TTL.LOCAL_ORDER });
-
   console.log(`[BILLING] order payment ${data.id} → order ${orderId} ` +
-              `payment=${status} status=${order.status}`);
+              `payment=${status} status=${updated.status}`);
 
   return { applied: true, reason: `order ${orderId} → ${status}`, orderId, status };
 }

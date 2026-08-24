@@ -31,8 +31,12 @@ export const TenantConfigSchema = z.object({
   // kiosks offline. They are not offered in onboarding.
   plan:           z.enum(['starter', 'pro', 'advanced', 'growth', 'enterprise']),
 
+  // 'pos' is the native point-of-sale adapter: menu, cart and orders served
+  // from this app's own Postgres with no upstream at all (adapter/PosAdapter.ts).
+  // It is what a tenant running our POS uses; 'managed' remains the Render/
+  // FastAPI backend, and the other two are third-party integrations.
   adapter: z.object({
-    type:             z.enum(['managed', 'custom_api', 'webhook']),
+    type:             z.enum(['managed', 'custom_api', 'webhook', 'pos']),
     endpointMappings: z.array(EndpointMappingSchema).optional(),
   }),
 
@@ -73,7 +77,15 @@ export const TenantConfigSchema = z.object({
     // without optional chaining.
     pos: z.object({
       serviceChargeRate: z.number().min(0).max(1).default(0),
-    }).default({ serviceChargeRate: 0 }),
+      // Whether the tender screen offers a tip line. Off by default: tipping is
+      // not customary in every market this ships to, and an always-present tip
+      // prompt reads as a demand rather than an option.
+      tipEnabled:        z.boolean().default(false),
+      // Blind close hides the expected-cash figure from the operator counting
+      // the drawer, so the count is a genuine count rather than a number typed
+      // to match. Managers still see the variance after the fact.
+      blindClose:        z.boolean().default(false),
+    }).default({ serviceChargeRate: 0, tipEnabled: false, blindClose: false }),
     // Reservations-only settings. Same always-present rationale as `pos` above.
     reservations: z.object({
       maxPartySize:    z.number().int().min(1).default(20),
@@ -120,6 +132,40 @@ export const TenantConfigSchema = z.object({
       // WhatsApp Business phone number ID from Meta Developer Console
       wabaPhoneNumberId: z.string().optional(),
       displayName:       z.string().optional(),
+    }).optional(),
+
+    // Inbound phone agent over a SIP trunk. `didNumber` is the dialled number in
+    // E.164 and is what maps a ringing call back to this tenant — the same role
+    // wabaPhoneNumberId plays for WhatsApp. It must be unique across tenants;
+    // that is enforced at save time, not here, because a schema refinement would
+    // need to see every other tenant's config on every parse.
+    phone: z.object({
+      enabled:          z.boolean().default(false),
+      didNumber:        z.string().optional(),
+      // Overrides the generated greeting. Left empty, the agent greets with the
+      // restaurant name and asks the delivery/pickup/takeaway/dine-in question.
+      greetingOverride: z.string().default(''),
+      // E.164 number to bridge the caller to when they ask for a human. Empty
+      // disables the transfer_to_human tool entirely rather than offering a
+      // transfer that then fails.
+      transferTo:       z.string().default(''),
+      // Hard cap so a stuck session cannot bill minutes indefinitely.
+      maxCallSeconds:   z.number().int().min(60).max(3600).default(600),
+    }).optional(),
+
+    // QR self-ordering at the table.
+    qr: z.object({
+      enabled:        z.boolean().default(false),
+      // Require the PIN printed on the table card in addition to scanning the
+      // QR. Turning this off makes a photographed QR sufficient to order to that
+      // table from anywhere — offered because some venues want zero friction,
+      // but it is not the default.
+      requirePin:     z.boolean().default(true),
+      // Guests may send orders straight to the kitchen, or have the cashier
+      // accept the first one. 'staff_accept' is the safer default for a new site.
+      orderMode:      z.enum(['direct', 'staff_accept']).default('direct'),
+      // Seconds a Call Waiter button stays disabled after a press.
+      waiterCooldown: z.number().int().min(0).max(600).default(60),
     }).optional(),
   }).optional(),
 

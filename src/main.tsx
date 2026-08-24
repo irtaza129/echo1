@@ -7,6 +7,7 @@ import SignupScreen from './SignupScreen.tsx';
 import AdminDashboard from './AdminDashboard.tsx';
 import SuperAdminDashboard from './SuperAdminDashboard.tsx';
 import TranscriptScreen from './TranscriptScreen.tsx';
+import PosTerminal from './pos/PosTerminal.tsx';
 import type { TranscriptTurn } from './lib/types';
 import './index.css';
 
@@ -44,6 +45,7 @@ type Screen =
   | 'transcripts'
   | 'admin'
   | 'super_admin'
+  | 'pos'
   | 'impersonate';
 
 // ── Root ──────────────────────────────────────────────────────────────────────
@@ -52,9 +54,6 @@ function Root() {
   const [screen,      setScreen]      = useState<Screen>('loading');
   const [jwtToken,    setJwtToken]    = useState<string>('');
   const [jwtClaims,   setJwtClaims]   = useState<JwtClaims | null>(null);
-  // Transient state set after signup before onboarding saves to Redis
-  const [pendingSlug, setPendingSlug] = useState('');
-  const [pendingName, setPendingName] = useState('');
   // Impersonation state — set when super admin manages a tenant in-app
   const [impJwt,      setImpJwt]      = useState('');
   const [impSlug,     setImpSlug]     = useState('');
@@ -128,8 +127,6 @@ function Root() {
     const claims = decodeJwt(jwt);
     setJwtToken(jwt);
     setJwtClaims(claims);
-    setPendingSlug(slug);
-    setPendingName(claims?.sub ?? slug);
     setScreen('admin');
   };
 
@@ -273,6 +270,10 @@ function Root() {
     );
   }
 
+  if (screen === 'pos') {
+    return <PosTerminal onExit={() => setScreen('kiosk')} />;
+  }
+
   if (screen === 'dashboard') {
     return (
       <OrdersDashboard
@@ -298,6 +299,7 @@ function Root() {
   return (
     <App
       tenantSlug={jwtClaims?.slug || undefined}
+      onNavigateToPos={() => setScreen('pos')}
       onNavigateToDashboard={() => setScreen('dashboard')}
       onNavigateToTranscripts={() => setScreen('transcripts')}
       onNavigateToAdmin={adminRole ? () => setScreen('admin') : undefined}

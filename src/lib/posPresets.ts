@@ -12,7 +12,7 @@
 // live here as the single source of truth.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type PresetAdapterType = 'managed' | 'custom_api' | 'webhook';
+export type PresetAdapterType = 'pos' | 'managed' | 'custom_api' | 'webhook';
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
@@ -115,16 +115,27 @@ export interface PosPreset {
 
 export const POS_PRESETS: PosPreset[] = [
   {
-    id:           'managed',
-    name:         'Savour Managed',
-    tagline:      "We host everything — nothing to set up. Best for most restaurants.",
-    icon:         '✨',
-    adapterType:  'managed',
+    id:           'pos',
+    name:         'Built-in POS',
+    tagline:      'The full till, kitchen display, QR tables and reports — included, nothing to connect.',
+    icon:         '🧾',
+    adapterType:  'pos',
     recommended:  true,
     needsBaseUrl:    false,
     needsApiKey:     false,
     needsWebhookUrl: false,
-    setupNote:    'You build your menu right here in the dashboard and the AI uses it instantly. No POS account or developer needed.',
+    setupNote:    'You build your menu right here in the dashboard. This also turns on the Till, so your team can start ringing up orders the moment setup finishes.',
+  },
+  {
+    id:           'managed',
+    name:         'Savour Managed',
+    tagline:      'We host your ordering only — no till, kitchen display or reports.',
+    icon:         '✨',
+    adapterType:  'managed',
+    needsBaseUrl:    false,
+    needsApiKey:     false,
+    needsWebhookUrl: false,
+    setupNote:    'You build your menu right here in the dashboard and the AI uses it instantly. Choose this only if you already have a separate POS for taking payments.',
   },
   {
     id:           'foodics',
@@ -179,6 +190,7 @@ export function getPreset(id: string): PosPreset | undefined {
 // Map a saved adapter type back to its most likely preset id, so the admin
 // dashboard can highlight the right card when an existing tenant loads.
 export function presetIdForAdapterType(type: string): string {
+  if (type === 'pos')     return 'pos';
   if (type === 'managed') return 'managed';
   if (type === 'webhook') return 'webhook';
   return 'custom_api';

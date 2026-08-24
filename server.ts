@@ -1,9 +1,10 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import axios from 'axios';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { issueJwt, extractJwt, type JwtPayload, type UserRole } from './src/lib/jwt.js';
@@ -13,8 +14,10 @@ import type { TenantConfig, AdapterCredentials } from './src/lib/tenantConfig.js
 import { getRedis, redisKey, TTL } from './src/lib/redis.js';
 import { attachAdapter } from './middleware/tenant.js';
 import { AdapterFactory } from './adapter/AdapterFactory.js';
+import { PosAdapter } from './adapter/PosAdapter.js';
+import { syncMenuToPostgres } from './src/lib/posMenuWrite.js';
+import { ordersRepo } from './src/lib/posRepo.js';
 import type { IRestaurantAdapter } from './adapter/IRestaurantAdapter.js';
-import type { WireOrder, WireCartItem } from './src/lib/types.js';
 import { checkSchema } from './src/lib/supabaseAdmin.js';
 import { PaymentProviderFactory } from './payments/PaymentProviderFactory.js';
 import type { IPaymentProvider, PaymentTransaction } from './payments/IPaymentProvider.js';
@@ -25,6 +28,13 @@ import {
   billingRouter,
   billingPublicRouter,
 } from './routes/billing.js';
+import { posRouter }          from './routes/pos.js';
+import { streamRouter }       from './routes/stream.js';
+import { reservationsRouter } from './routes/reservations.js';
+import { requireFeature }     from './middleware/requireFeature.js';
+import { guestRouter }        from './routes/guest.js';
+import { startTelephony, type TelephonyHandle } from './telephony/startTelephony.js';
+import { findOrProvision, clearPin as clearStaffPin } from './src/lib/staffRepo.js';
 import type { HttpMethod } from './src/lib/posPresets.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
 import {
@@ -70,86 +80,12 @@ interface MenuCategoryRow { id: string; name: string; sortOrder: number }
 interface MenuItemRow     { id: string; categoryId: string; name: string; description: string; price: number; available: boolean }
 interface MenuData        { categories: MenuCategoryRow[]; items: MenuItemRow[] }
 
-// ── Local order management (for admin-managed-menu tenants) ──────────────────
-// Used instead of the Render backend when the tenant manages their menu via the
-// admin panel (i.e. menuData exists in Redis). The Render backend stays for
-// Savour Foods which has no admin-managed menu in Redis.
-
-interface LocalCartItem {
-  cart_item_id: string;
-  name:         string;
-  category:     string;
-  summary:      string;
-  quantity:     number;
-  unit_price:   number;
-  modifiers:    string[];
-  notes:        string | null;
-}
-
-interface LocalOrder {
-  id:             string;
-  order_number:   number;
-  tenant_id:      string;
-  status:         string;
-  items:          LocalCartItem[];
-  subtotal:       number;
-  total:          number;
-  customer_name:  string;
-  customer_phone: string;
-  order_type:     string;
-  payment_method: string;
-  // Online-payment state (absent for cash orders). payment_ref is the gateway tracker.
-  payment_status?: string;
-  payment_ref?:    string;
-  notes:          string | null;
-  created_at:     string;
-  updated_at:     string;
-}
-
-// ── Local → wire normalisation ───────────────────────────────────────────────
-// LocalOrder/LocalCartItem are the *storage* shapes in Redis. They are NOT what
-// goes on the wire: the dashboard and the Render backend use `total_amount`,
-// `dish_name` and `item_total`. Render is external so it defines the contract;
-// we translate here on read.
-//
-// Do not "simplify" this by renaming the stored fields — 500 orders already sit
-// in Redis under the old names, and these mappers are what keeps them readable.
-// Returning the storage shape directly is the bug that rendered every order as
-// Rs 0 with blank item names.
-
-function toWireCartItem(i: LocalCartItem): WireCartItem {
-  return {
-    cart_item_id: i.cart_item_id,
-    dish_name:    i.name,
-    quantity:     i.quantity,
-    unit_price:   i.unit_price,
-    summary:      i.summary,
-    notes:        i.notes,
-  };
-}
-
-function toWireOrder(o: LocalOrder): WireOrder {
-  return {
-    id:             o.id,
-    order_number:   o.order_number,
-    customer_name:  o.customer_name,
-    customer_phone: o.customer_phone,
-    order_type:     o.order_type,
-    status:         o.status,
-    total_amount:   o.total,
-    subtotal:       o.subtotal,
-    notes:          o.notes,
-    created_at:     o.created_at,
-    items: o.items.map(i => ({
-      dish_name:  i.name,
-      quantity:   i.quantity,
-      unit_price: i.unit_price,
-      item_total: i.unit_price * i.quantity,
-      notes:      i.notes,
-      selected_options: (i.modifiers ?? []).map(m => ({ choice_name: m })),
-    })),
-  };
-}
+// The LocalCartItem / LocalOrder storage shapes and their toWireOrder /
+// toWireCartItem mappers used to live here. They are gone along with the inline
+// Redis order path: every channel now submits through req.adapter, so orders
+// live in Postgres and PosAdapter.toWireOrder does the one translation needed.
+// The remaining Local* types (still used by the WhatsApp dispatch path) are in
+// src/lib/localMenuUtils.ts.
 
 // Count menu items across the shapes a backend might return (flat array,
 // { items }, { data }, or { categories: [{ items }] }). Used by test-connection.
@@ -175,50 +111,61 @@ async function savePaymentTxn(redis: RedisClientT, txn: PaymentTransaction): Pro
   await redis.set(redisKey.orderPayment(txn.orderId), txn.providerRef, { ex: TTL.PAYMENT });
 }
 
-// Normalise a string for fuzzy matching: lowercase, strip punctuation, collapse spaces.
-function normStr(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-}
+// normStr / fuzzyMatchItem / getLocalMenu lived here to serve the inline Redis
+// order path. That path is gone: matching now happens inside the adapter that
+// owns the menu — adapter/posMatching.ts for the native POS, the upstream's own
+// matcher for managed and custom_api tenants. Keeping a second matcher here is
+// how a dish could resolve one way for the kiosk and another for the till.
 
-// Fuzzy-match a voice/text query against the available menu items.
-// Priority: exact → substring (either direction) → word-overlap ≥ 35 %.
-function fuzzyMatchItem(query: string, items: MenuItemRow[]): MenuItemRow | null {
-  const q     = normStr(query);
-  const avail = items.filter(i => i.available !== false && i.name.trim() !== '');
-
-  // 1. Exact
-  let m = avail.find(i => normStr(i.name) === q);
-  if (m) return m;
-
-  // 2. Substring either direction
-  m = avail.find(i => { const n = normStr(i.name); return n.includes(q) || q.includes(n); });
-  if (m) return m;
-
-  // 3. Word-overlap score
-  const qw = q.split(' ').filter(w => w.length > 1);
-  let best: MenuItemRow | null = null;
-  let top = 0;
-  for (const item of avail) {
-    const iw    = normStr(item.name).split(' ').filter(w => w.length > 1);
-    const hits  = qw.filter(w => iw.some(iw2 => iw2 === w || iw2.startsWith(w) || w.startsWith(iw2))).length;
-    const score = hits / Math.max(qw.length, iw.length, 1);
-    if (score > top) { top = score; best = item; }
-  }
-  return top >= 0.35 ? best : null;
-}
-
-// Returns the admin-managed menu for a tenant, or null if none exists.
-// null means "fall through to the Render backend adapter".
+// Boot-time audit: which tenants still carry a Redis `menu:data:<id>` but are
+// not on the native POS adapter?
 //
-// Tenants in SUPABASE_MENU_TENANTS never read from `menu:data:<id>` — their
-// menu lives in Supabase v_menu. This guarantees the admin panel can never
-// override their menu by writing the Redis key (whether by mistake or by a
-// hijacked session like the agent1101 legacy login was previously able to do).
-async function getLocalMenu(tenantId: string): Promise<MenuData | null> {
-  if (SUPABASE_MENU_TENANTS.has(tenantId)) return null;
+// Before the ledger was unified, that key WAS the tenant's menu — an inline
+// branch in six routes read it directly. Those branches are gone, so the key is
+// now inert and the tenant is served by their configured adapter instead. For a
+// tenant whose menu never synced upstream that is a silently empty kiosk, so it
+// gets reported loudly, once, at startup.
+//
+// Best-effort and never fatal: Redis may be unavailable, and a diagnostic must
+// not be able to stop the server booting.
+async function reportUnmigratedPosTenants(): Promise<void> {
   try {
-    const data = await getRedis().get<MenuData>(redisKey.menuData(tenantId));
-    return data ?? null;
+    const redis     = getRedis();
+    const tenantIds = (await redis.smembers(redisKey.tenantsIndex)) as string[];
+    const stranded: string[] = [];
+
+    for (const tenantId of tenantIds) {
+      if (SUPABASE_MENU_TENANTS.has(tenantId)) continue;   // menu lives in v_menu
+      const hasRedisMenu = await redis.get<unknown>(redisKey.menuData(tenantId)).catch(() => null);
+      if (!hasRedisMenu) continue;
+      if ((await getAdapterType(tenantId)) === 'pos') continue;
+      stranded.push(tenantId);
+    }
+
+    if (stranded.length === 0) return;
+
+    console.warn(
+      `[POS] ${stranded.length} tenant(s) have an admin-managed Redis menu but are NOT on the ` +
+      `native POS adapter. Their menu is no longer read from Redis. Migrate each with:\n` +
+      stranded.map(id => `  npx tsx scripts/backfill-pos.ts --tenant ${id} --write --activate`).join('\n'),
+    );
+  } catch (err) {
+    console.warn('[POS] Could not audit tenant migration state:', err instanceof Error ? err.message : err);
+  }
+}
+
+// Which adapter a tenant is configured for, without building one.
+//
+// The admin menu route needs this before it knows where to write, and it runs
+// behind requireAuth rather than attachAdapter (it is keyed off the JWT's
+// tenantId, not a resolved config), so req.tenantConfig is not available there.
+// Returns null when the config cannot be read — callers treat that as "not pos"
+// and keep the pre-existing Render behaviour rather than guessing.
+async function getAdapterType(tenantId: string): Promise<TenantConfig['adapter']['type'] | null> {
+  try {
+    const raw = await getRedis().get<unknown>(redisKey.tenantConfig(tenantId));
+    if (!raw) return null;
+    return parseTenantConfig(raw).adapter.type;
   } catch {
     return null;
   }
@@ -283,6 +230,10 @@ declare global {
       jwtPayload?:  JwtPayload;
       tenantConfig?: TenantConfig;
       adapter?:     IRestaurantAdapter;
+      // Decrypted adapter credentials. Attached by attachAdapter so routes can
+      // read non-gateway settings such as printer addresses without decrypting
+      // again. NEVER serialise this onto a response — it holds API secrets.
+      adapterCredentials?: AdapterCredentials;
       paymentProvider?: IPaymentProvider;
       rawBody?:     Buffer;
     }
@@ -290,9 +241,18 @@ declare global {
 }
 
 // ── Legacy auth (Savour Foods backward compat) ────────────────────────────────
-const AUTH_USERNAME      = 'agent1101';
-const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH
-  ?? 'a3046da0d15a27e89f2afe639b25748a7ad4d9290af3e7b1b6c1a5533c8f0a8c';
+const AUTH_USERNAME = 'agent1101';
+
+// No default, deliberately.
+//
+// This used to fall back to a hardcoded SHA-256 digest, which meant any
+// deployment that had not set AUTH_PASSWORD_HASH accepted a password that is
+// sitting in version control — as tenant_admin for Savour Foods. Unset now
+// means the legacy login is DISABLED rather than wide open.
+//
+// Everyone should be on the JWT path (/api/auth/login with an email); this
+// exists only for the original agent1101 kiosk and should eventually go.
+const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH ?? null;
 const SESSION_SECRET = process.env.SESSION_SECRET
   ?? crypto.randomBytes(32).toString('hex');
 
@@ -321,6 +281,16 @@ function verifyLegacyToken(token: string): boolean {
 // ── Auth middleware ───────────────────────────────────────────────────────────
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const jwtPayload = extractJwt(req.headers['authorization']);
+
+  // A guest token is a diner at a table. It is a valid, correctly signed token
+  // for this tenant, which is exactly why it has to be refused explicitly here:
+  // without this line every staff and admin route would accept one, because
+  // they only ever asked "is this token valid?".
+  if (jwtPayload?.role === 'guest') {
+    res.status(403).json({ error: 'This is a guest session and cannot access staff features' });
+    return;
+  }
+
   if (jwtPayload) { req.jwtPayload = jwtPayload; next(); return; }
 
   const legacyToken =
@@ -389,6 +359,7 @@ async function startServer() {
 
   if (!process.env.JWT_SECRET)              console.warn('[AUTH] JWT_SECRET not set — JWT auth will fail');
   if (!process.env.SESSION_SECRET)          console.warn('[AUTH] SESSION_SECRET not set — legacy sessions lost on restart');
+  if (!process.env.AUTH_PASSWORD_HASH)      console.warn('[AUTH] AUTH_PASSWORD_HASH not set — the legacy agent1101 login is DISABLED (this is the safe default)');
   if (!process.env.META_APP_SECRET)         console.warn('[WA] META_APP_SECRET not set — WhatsApp webhook verification disabled');
   if (!process.env.META_WHATSAPP_TOKEN)     console.warn('[WA] META_WHATSAPP_TOKEN not set — WhatsApp replies will fail');
   if (!process.env.META_WEBHOOK_VERIFY_TOKEN) console.warn('[WA] META_WEBHOOK_VERIFY_TOKEN not set — Meta webhook registration will fail');
@@ -412,11 +383,39 @@ async function startServer() {
   });
 
   // ── Rate limiters ───────────────────────────────────────────────────────────
-  const generalLimiter  = rateLimit({ windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
-  const agentLimiter    = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
+  //
+  // Bucketing purely by IP means every device behind one restaurant's WiFi —
+  // the till, the kitchen display, and every guest's phone at every table —
+  // shares a single allowance, and two unrelated tenants tested from the same
+  // office or dev machine compete for it too. That is exactly what happened
+  // testing crumble1 (admin + a guest tab) and crumble2 (staff till) side by
+  // side from one machine: their combined traffic shared one IP bucket, so
+  // once it emptied every tab, on both tenants, started getting 429s at once.
+  //
+  // Keying by tenant when one is resolvable — from X-Tenant-ID, or the JWT if
+  // present — gives each tenant its own allowance instead. Falls back to IP
+  // for requests where no tenant is known yet (an unauthenticated agent call
+  // with no header, a malformed request).
+  function tenantAwareKey(req: Request): string {
+    const header = req.headers['x-tenant-id'];
+    if (typeof header === 'string' && header) return `tenant:${header}`;
+
+    const claims = extractJwt(req.headers['authorization']);
+    if (claims?.tenantId) return `tenant:${claims.tenantId}`;
+
+    return ipKeyGenerator(req.ip ?? '');
+  }
+
+  const generalLimiter  = rateLimit({ windowMs: 15*60*1000, max: 600, standardHeaders: true, legacyHeaders: false, keyGenerator: tenantAwareKey, message: { error: 'Too many requests.' } });
+  const agentLimiter    = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeaders: true, legacyHeaders: false, keyGenerator: tenantAwareKey, message: { error: 'Too many requests.' } });
   const authLimiter     = rateLimit({ windowMs: 15*60*1000, max: 20,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts.' } });
   const tokenLimiter    = rateLimit({ windowMs: 60*1000,    max: 10,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many token requests.' } });
   const webhookLimiter  = rateLimit({ windowMs: 60*1000,    max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many webhook requests.' } });
+  // A table of four all scanning and ordering at once is normal, so this is not
+  // tight; 60/min per IP covers that while still capping a script grinding
+  // table PINs. The real defence against PIN guessing is that a wrong PIN and an
+  // unknown token return the identical message (see routes/guest.ts).
+  const guestLimiter    = rateLimit({ windowMs: 60*1000,    max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests — please wait a moment.' } });
 
   // Paddle webhook goes on BEFORE the general limiter. Paddle can deliver a
   // burst (transaction.completed + subscription.created + customer.created all
@@ -458,6 +457,18 @@ async function startServer() {
       );
     })
     .catch(err => console.warn('[SCHEMA] Could not verify schema:', err instanceof Error ? err.message : err));
+
+  // Report tenants stranded mid-migration onto the native POS.
+  //
+  // A tenant with an admin-managed menu in Redis (`menu:data:<id>`) used to be
+  // served by an inline branch that read that key directly. That branch is gone;
+  // such a tenant is now served by whichever adapter their config names. If they
+  // are still on `managed`, their kiosk asks Render for a menu that may never
+  // have synced — so this must be visible at boot, not discovered by a customer.
+  //
+  // The fix per tenant is:
+  //   npx tsx scripts/backfill-pos.ts --tenant <uuid> --write --activate
+  void reportUnmigratedPosTenants();
 
   // ── Gemini ephemeral token ──────────────────────────────────────────────────
   app.post('/api/gemini-token', tokenLimiter, async (_req, res: Response) => {
@@ -531,7 +542,8 @@ async function startServer() {
     }
 
     // Legacy hardcoded user (agent1101)
-    if (loginId === AUTH_USERNAME && hash === AUTH_PASSWORD_HASH) {
+    // AUTH_PASSWORD_HASH === null means the legacy account is switched off.
+    if (AUTH_PASSWORD_HASH && loginId === AUTH_USERNAME && hash === AUTH_PASSWORD_HASH) {
       const jwtToken = process.env.JWT_SECRET
         ? issueJwt({ sub: 'legacy-agent1101', tenantId: '00000000-0000-4000-8000-000000000001', role: 'tenant_admin', slug: 'savour-foods' })
         : undefined;
@@ -1188,6 +1200,25 @@ async function startServer() {
       void writeAuditLog(tenantId, 'menu_save', req.jwtPayload!.sub,
         `categories=${menuData.categories.length} items=${menuData.items.length}`);
 
+      // Native POS tenants own their menu in our own Postgres. Write it directly
+      // and skip the Render round trip entirely — a till must not depend on an
+      // external service to know what it sells. Failure is reported, not
+      // swallowed: an out-of-date menu on a POS is a wrong price at the counter.
+      const adapterType = await getAdapterType(tenantId);
+      if (adapterType === 'pos') {
+        try {
+          const sync = await syncMenuToPostgres(tenantId, menuData);
+          await PosAdapter.invalidateMenu(tenantId);
+          console.log(`[MENU] Postgres sync for tenant ${tenantId}:`, sync);
+          res.json({ ok: true, syncOk: true, postgres: sync });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[MENU] Postgres sync failed:', msg);
+          res.status(502).json({ ok: false, syncOk: false, syncError: msg });
+        }
+        return;
+      }
+
       // Forward to FastAPI backend so dishes land in Supabase for resolve-item fuzzy matching.
       // Shape matches admin_service.py DishIn: category, name, description, price, base_price, tag, available
       const flatDishes = menuData.items.map(item => {
@@ -1306,6 +1337,32 @@ async function startServer() {
   // the request body.
   app.use('/api/billing', requireAuth, billingRouter);
 
+  // ── Point of sale / Reservations ────────────────────────────────────────────
+  // Both routers were written against this exact chain (see the header comment
+  // in routes/pos.ts): requireAuth proves who is calling, attachAdapter resolves
+  // req.tenantConfig, and requireFeature refuses tenants who have not bought the
+  // module. Order matters — requireFeature fails closed if it runs first.
+  //
+  // Unlike /api/agent/*, there is no soft tenant fallback here: an unauthenticated
+  // caller gets 401 from requireAuth before attachAdapter can default to Savour.
+  // The event stream is mounted BEFORE posRouter so '/api/pos/stream' is not
+  // swallowed by posRouter's own routes, and so it can skip the general rate
+  // limiter's accounting for a connection that stays open by design.
+  // ── Guest (QR table ordering) ───────────────────────────────────────────
+  // Mounted WITHOUT requireAuth and WITHOUT attachAdapter. A diner is not a
+  // user of the platform: the router carries its own gate (requireGuest), and
+  // resolves the tenant from the table the QR token belongs to rather than from
+  // a header a phone could set.
+  //
+  // Its own limiter, and a tighter one: POST /session is the only unauthenticated
+  // write in the app that can be reached by anyone holding a printed code, and
+  // it is the obvious place to grind PINs.
+  app.use('/api/guest', guestLimiter, guestRouter);
+
+  app.use('/api/pos/stream',   requireAuth, attachAdapter, requireFeature('pos'),          streamRouter);
+  app.use('/api/pos',          requireAuth, attachAdapter, requireFeature('pos'),          posRouter);
+  app.use('/api/reservations', requireAuth, attachAdapter, requireFeature('reservations'), reservationsRouter);
+
   app.use('/api/agent/', attachAdapter);
 
   app.get('/api/agent/menu-context', async (req: Request, res: Response) => {
@@ -1336,20 +1393,16 @@ async function startServer() {
             res.type('text/plain').send(cached);
             return;
           }
-          // 2. Check raw menu data — build markdown from it (admin-managed menu)
-          const menuData = await redis.get<MenuData>(redisKey.menuData(tenantId));
-          if (menuData && req.tenantConfig) {
-            const md = buildMenuMarkdown(menuData, req.tenantConfig);
-            await redis.set(redisKey.menuContext(tenantId), md, { ex: TTL.MENU_CONTEXT }).catch(() => undefined);
-            res.type('text/plain').send(md);
-            return;
-          }
         } catch {
           // Redis unavailable — fall through to adapter
         }
       }
 
-      // 3. Fall through to backend adapter (managed / custom_api)
+      // 2. Ask the adapter. PosAdapter renders from our own Postgres menu;
+      //    ManagedBackendAdapter fetches Render's. The raw `menu:data:<id>`
+      //    branch that used to sit here is gone: it rendered a menu the order
+      //    path no longer used, so a tenant could be shown one menu and billed
+      //    against another.
       const text = await req.adapter!.getMenuContext();
 
       if (tenantId && !SUPABASE_MENU_TENANTS.has(tenantId)) {
@@ -1367,45 +1420,7 @@ async function startServer() {
 
   app.post('/api/agent/resolve-item', async (req: Request, res: Response) => {
     const b = req.body as { session_id: string; dish_query: string; modifiers?: string[]; quantity?: number; notes?: string | null };
-    const tenantId = req.tenantConfig?.tenantId;
 
-    // Local path: tenant has an admin-managed menu in Redis
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        const qty   = b.quantity || 1;
-        const mods  = (b.modifiers ?? []).filter(Boolean);
-        const match = fuzzyMatchItem(b.dish_query, menu.items);
-        if (!match) {
-          res.json({
-            status: 'not_found', cart_item_id: null, summary: null, unit_price: null,
-            ai_instruction: `I couldn't find '${b.dish_query}' on the menu. Could you clarify what you'd like?`,
-          });
-          return;
-        }
-        const cat     = menu.categories.find(c => c.id === match.categoryId);
-        const summary = mods.length > 0
-          ? `${match.name} × ${qty} (${mods.join(', ')})`
-          : `${match.name} × ${qty}`;
-        const cartItemId = crypto.randomUUID();
-        try {
-          const redis    = getRedis();
-          const cartKey  = redisKey.localCart(tenantId, b.session_id);
-          const existing = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
-          const newItem: LocalCartItem = {
-            cart_item_id: cartItemId, name: match.name,
-            category: cat?.name ?? '', summary, quantity: qty,
-            unit_price: match.price, modifiers: mods, notes: b.notes ?? null,
-          };
-          await redis.set(cartKey, [...existing, newItem], { ex: TTL.LOCAL_CART });
-        } catch { /* non-fatal — cart may not persist but the kiosk maintains its own state */ }
-        console.log(`[LOCAL] resolve-item: "${b.dish_query}" → "${match.name}" for tenant ${tenantId}`);
-        res.json({ status: 'ok', summary, unit_price: match.price, cart_item_id: cartItemId });
-        return;
-      }
-    }
-
-    // Render-backend path (Savour Foods and any tenant without a local menu)
     try {
       const result = await req.adapter!.resolveItem({
         sessionId: b.session_id, dishQuery: b.dish_query,
@@ -1416,34 +1431,13 @@ async function startServer() {
   });
 
   app.post('/api/agent/remove-item', async (req: Request, res: Response) => {
-    const b        = req.body as { session_id: string; cart_item_id: string };
-    const tenantId = req.tenantConfig?.tenantId;
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try {
-          const redis   = getRedis();
-          const cartKey = redisKey.localCart(tenantId, b.session_id);
-          const items   = (await redis.get<LocalCartItem[]>(cartKey)) ?? [];
-          await redis.set(cartKey, items.filter(i => i.cart_item_id !== b.cart_item_id), { ex: TTL.LOCAL_CART });
-        } catch { /* non-fatal */ }
-        res.json({ ok: true }); return;
-      }
-    }
+    const b = req.body as { session_id: string; cart_item_id: string };
     try { await req.adapter!.removeItem(b.session_id, b.cart_item_id); res.json({ ok: true }); }
     catch (err) { adapterError(res, err); }
   });
 
   app.post('/api/agent/clear-cart', async (req: Request, res: Response) => {
-    const b        = req.body as { session_id: string };
-    const tenantId = req.tenantConfig?.tenantId;
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try { await getRedis().del(redisKey.localCart(tenantId, b.session_id)); } catch { /* non-fatal */ }
-        res.json({ ok: true }); return;
-      }
-    }
+    const b = req.body as { session_id: string };
     try { await req.adapter!.clearCart(b.session_id); res.json({ ok: true }); }
     catch (err) { adapterError(res, err); }
   });
@@ -1452,22 +1446,9 @@ async function startServer() {
     if (!UUID_RE.test(req.params.sessionId)) {
       res.status(400).json({ error: 'Invalid session ID format' }); return;
     }
-    const tenantId = req.tenantConfig?.tenantId;
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try {
-          const items = (await getRedis().get<LocalCartItem[]>(redisKey.localCart(tenantId, req.params.sessionId))) ?? [];
-          res.json(items.map(toWireCartItem)); return;
-        } catch (err) {
-          // Previously `res.json([])` — a Redis outage was reported as "cart is
-          // empty" with a 200. An error must never be indistinguishable from an
-          // empty result; fail loudly so the caller can retry or surface it.
-          console.error('[LOCAL] get-cart failed:', err);
-          res.status(500).json({ error: 'Failed to load cart' }); return;
-        }
-      }
-    }
+    // Errors propagate as 5xx rather than an empty array: a Redis outage
+    // reported as "cart is empty" with a 200 is indistinguishable from a real
+    // empty cart, and that ambiguity once hid an outage completely.
     try { res.json(await req.adapter!.getCart(req.params.sessionId)); }
     catch (err) { adapterError(res, err); }
   });
@@ -1481,105 +1462,79 @@ async function startServer() {
       // persistence failures don't block order submission.
       cart_items?: Array<{ cart_item_id?: string; summary: string; quantity: number; unit_price: number; notes?: string | null }>;
     };
-    const tenantId = req.tenantConfig?.tenantId;
+    const cfg = req.tenantConfig;
 
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try {
-          const redis    = getRedis();
-          const cartKey  = redisKey.localCart(tenantId, b.session_id);
-
-          // Prefer Redis cart (has full detail); fall back to inline cart_items from body
-          const redisItems  = await redis.get<LocalCartItem[]>(cartKey).catch(() => null) ?? [];
-          const inlineItems: LocalCartItem[] = (b.cart_items ?? []).map(i => ({
-            cart_item_id: i.cart_item_id ?? crypto.randomUUID(),
-            name:         i.summary,
-            category:     '',
-            summary:      i.summary,
-            quantity:     i.quantity,
-            unit_price:   i.unit_price,
-            modifiers:    [],
-            notes:        i.notes ?? null,
-          }));
-          const items = redisItems.length > 0 ? redisItems : inlineItems;
-          if (items.length === 0) { res.status(400).json({ error: 'Cart is empty' }); return; }
-
-          const cfg       = req.tenantConfig!;
-          const subtotal  = items.reduce((s, i) => s + i.unit_price * i.quantity, 0);
-          const gst       = Math.round(subtotal * cfg.businessRules.gstRate);
-          const total     = subtotal + gst;
-          const orderNum  = await redis.incr(redisKey.localOrderCounter(tenantId));
-          const orderId   = crypto.randomUUID();
-          const now       = new Date().toISOString();
-
-          const order: LocalOrder = {
-            id: orderId, order_number: orderNum, tenant_id: tenantId, status: 'pending',
-            items, subtotal, total,
-            customer_name:  b.customer_name  ?? 'Guest',
-            customer_phone: b.customer_phone ?? '',
-            order_type:     b.order_type     ?? 'dine_in',
-            payment_method: b.payment_method ?? 'cash',
-            notes: b.notes ?? b.instructions ?? null,
-            created_at: now, updated_at: now,
-          };
-
-          // If this tenant collects payment online, create a checkout session
-          // up-front so the kiosk can redirect the customer. The order stays
-          // 'pending' until the signed webhook confirms capture (truth = webhook,
-          // not the client). Cash tenants skip this entirely — unchanged.
-          let payment: { providerRef: string; redirectUrl?: string; clientToken?: string; status: string } | undefined;
-          if (PaymentProviderFactory.isOnline(cfg) && req.paymentProvider) {
-            try {
-              const amountPaisa = rupeesToPaisa(total);
-              const checkout    = await req.paymentProvider.createCheckout({
-                orderId, amountPaisa, currency: cfg.businessRules.currency,
-                customerName: order.customer_name, customerPhone: order.customer_phone,
-              });
-              order.payment_method = req.paymentProvider.id;
-              order.payment_status = checkout.status;
-              order.payment_ref    = checkout.providerRef;
-              await savePaymentTxn(redis, {
-                providerRef: checkout.providerRef, provider: req.paymentProvider.id,
-                tenantId, orderId, amountPaisa, currency: cfg.businessRules.currency,
-                status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
-              });
-              payment = {
-                providerRef: checkout.providerRef, redirectUrl: checkout.redirectUrl,
-                clientToken: checkout.clientToken, status: checkout.status,
-              };
-            } catch (err) {
-              // Never lose the order over a gateway hiccup — record it unpaid so
-              // staff can collect manually, and surface the failure to the caller.
-              console.error('[PAYMENT] checkout creation failed:', err);
-              order.payment_status = 'failed';
-            }
-          }
-
-          await redis.set(redisKey.localOrder(orderId), order, { ex: TTL.LOCAL_ORDER });
-          await redis.lpush(redisKey.localOrders(tenantId), orderId);
-          await redis.ltrim(redisKey.localOrders(tenantId), 0, 499);
-          await redis.del(cartKey);
-
-          console.log(`[LOCAL] Order #${orderNum} created for tenant ${tenantId}`);
-          res.status(201).json({ id: orderId, order_id: orderId, order_number: orderNum, total, summary: `Order #${orderNum}`, payment });
-        } catch (err) {
-          console.error('[LOCAL] submit-order failed:', err);
-          res.status(500).json({ error: 'Failed to submit order' });
-        }
-        return;
-      }
-    }
-
-    // Render-backend path
     try {
+      // The adapter decides where the order lands: PosAdapter writes our own
+      // Postgres, ManagedBackendAdapter forwards to Render. Either way it is one
+      // ledger per tenant — the previous inline Redis branch made it two.
+      //
+      // cart_items is the browser's own copy of the cart, sent so an expired or
+      // unreachable Redis cart degrades the receipt's detail rather than losing
+      // the sale. The adapter prefers its stored cart and falls back to this.
       const result = await req.adapter!.submitOrder({
-        sessionId:      b.session_id,   customerName:  b.customer_name,
-        customerPhone:  b.customer_phone, orderType:   b.order_type,
-        paymentMethod:  b.payment_method, deliveryFee: b.delivery_fee,
-        discount:       b.discount,     instructions:  b.instructions,  notes: b.notes,
+        sessionId:      b.session_id,     customerName:  b.customer_name,
+        customerPhone:  b.customer_phone, orderType:     b.order_type,
+        paymentMethod:  b.payment_method, deliveryFee:   b.delivery_fee,
+        discount:       b.discount,       instructions:  b.instructions,
+        notes:          b.notes,          source:        'kiosk',
+        cartItems: (b.cart_items ?? []).map(i => ({
+          dishName:  i.summary,
+          quantity:  i.quantity,
+          unitPrice: i.unit_price,
+          notes:     i.notes ?? null,
+        })),
       });
-      res.status(201).json(result);
+
+      if (result.error) { res.status(400).json({ error: result.error }); return; }
+
+      // If this tenant collects payment online, create a checkout session so the
+      // kiosk can open the payment overlay. The order stays 'pending' until the
+      // signed webhook confirms capture — truth is the webhook, never the client.
+      // Cash tenants skip this entirely.
+      const orderId = result.order_id;
+      let payment: { providerRef: string; redirectUrl?: string; clientToken?: string; status: string } | undefined;
+
+      if (cfg && orderId && PaymentProviderFactory.isOnline(cfg) && req.paymentProvider) {
+        const now         = new Date().toISOString();
+        const amountPaisa = rupeesToPaisa(result.total ?? 0);
+        try {
+          const checkout = await req.paymentProvider.createCheckout({
+            orderId, amountPaisa, currency: cfg.businessRules.currency,
+            customerName: b.customer_name, customerPhone: b.customer_phone,
+          });
+
+          await savePaymentTxn(getRedis(), {
+            providerRef: checkout.providerRef, provider: req.paymentProvider.id,
+            tenantId: cfg.tenantId, orderId, amountPaisa,
+            currency: cfg.businessRules.currency,
+            status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
+          });
+
+          // Stamp the order so staff can see a card payment is in flight. Best
+          // effort: the authoritative update is the webhook, and failing here
+          // must not undo an order that already exists.
+          await ordersRepo.applyPayment(orderId, {
+            paymentStatus: checkout.status,
+            paymentRef:    checkout.providerRef,
+            paymentMethod: req.paymentProvider.id,
+          }).catch(err => console.warn('[PAYMENT] could not stamp order at checkout:', err));
+
+          payment = {
+            providerRef: checkout.providerRef, redirectUrl: checkout.redirectUrl,
+            clientToken: checkout.clientToken, status: checkout.status,
+          };
+        } catch (err) {
+          // Never lose the order over a gateway hiccup — it stays unpaid so
+          // staff can collect manually, and the failure is surfaced.
+          console.error('[PAYMENT] checkout creation failed:', err);
+          await ordersRepo.applyPayment(orderId, {
+            paymentStatus: 'failed', paymentRef: '', paymentMethod: req.paymentProvider.id,
+          }).catch(() => undefined);
+        }
+      }
+
+      res.status(201).json({ ...result, id: result.order_id, payment });
     } catch (err) { adapterError(res, err); }
   });
 
@@ -1603,23 +1558,26 @@ async function startServer() {
     if (!order_id) { res.status(400).json({ error: 'order_id is required' }); return; }
 
     try {
-      const redis = getRedis();
-      const order = await redis.get<LocalOrder>(redisKey.localOrder(order_id));
-      if (!order || order.tenant_id !== tenantId) { res.status(404).json({ error: 'Order not found' }); return; }
+      // Tenant-scoped read: an order id from another tenant must 404, not open a
+      // checkout that would take a diner's money into the wrong account.
+      const order = await ordersRepo.findById(tenantId, order_id);
+      if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
+      if (order.voided_at) { res.status(400).json({ error: 'Cannot take payment on a voided order' }); return; }
 
-      const amountPaisa = rupeesToPaisa(order.total);
+      const amountPaisa = rupeesToPaisa(Number(order.total_amount));
       const checkout    = await provider.createCheckout({
         orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
-        customerName: order.customer_name, customerPhone: order.customer_phone,
+        customerName: order.customer_name ?? 'Guest', customerPhone: order.customer_phone ?? '',
         redirectUrl: redirect_url, cancelUrl: cancel_url,
       });
 
       const now = new Date().toISOString();
-      order.payment_method = provider.id;
-      order.payment_status = checkout.status;
-      order.payment_ref    = checkout.providerRef;
-      await redis.set(redisKey.localOrder(order_id), order, { ex: TTL.LOCAL_ORDER });
-      await savePaymentTxn(redis, {
+      await ordersRepo.applyPayment(order_id, {
+        paymentStatus: checkout.status,
+        paymentRef:    checkout.providerRef,
+        paymentMethod: provider.id,
+      });
+      await savePaymentTxn(getRedis(), {
         providerRef: checkout.providerRef, provider: provider.id, tenantId,
         orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
         status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
@@ -1676,13 +1634,17 @@ async function startServer() {
         txn.updatedAt = now;
         await redis.set(redisKey.payment(refHint), txn, { ex: TTL.PAYMENT });
 
-        const order = await redis.get<LocalOrder>(redisKey.localOrder(txn.orderId));
-        if (order) {
-          order.payment_status = result.status;
-          order.updated_at     = now;
-          // On capture, advance a still-pending order so the kitchen sees a paid order.
-          if (result.status === 'captured' && order.status === 'pending') order.status = 'confirmed';
-          await redis.set(redisKey.localOrder(txn.orderId), order, { ex: TTL.LOCAL_ORDER });
+        // applyPayment advances a still-pending order to 'confirmed' on capture,
+        // so the kitchen sees a paid order. It returns null when the order is
+        // unknown — a transaction that was never ours, or one that predates the
+        // Postgres ledger. Neither is retryable, so the webhook still answers 2xx.
+        const updated = await ordersRepo.applyPayment(txn.orderId, {
+          paymentStatus: result.status,
+          paymentRef:    refHint,
+          paymentMethod: txn.provider,
+        });
+        if (!updated) {
+          console.warn(`[PAYMENT] webhook ${refHint} → order ${txn.orderId} not found in ledger`);
         }
       }
 
@@ -1723,7 +1685,19 @@ async function startServer() {
 
   // ── Menu + Orders routes — also through adapter ─────────────────────────────
   app.use('/api/menu',   attachAdapter);
-  app.use('/api/orders', attachAdapter);
+
+  // requireAuth BEFORE attachAdapter, deliberately.
+  //
+  // attachAdapter is a soft resolver — it never returns 401, it just works out
+  // which tenant a request belongs to. On its own that left GET /api/orders
+  // readable by anyone who knew a tenant uuid: every customer name, phone
+  // number and total for that restaurant. The kitchen dashboard already sends
+  // its JWT, so requiring one costs nothing and closes the hole.
+  //
+  // This also matters for the QR channel: a diner holds a valid token carrying
+  // their own tenantId, so "knows a tenant uuid" stopped being a hypothetical.
+  // requireAuth rejects role 'guest', so a diner cannot read the order book.
+  app.use('/api/orders', requireAuth, attachAdapter);
 
   app.get('/api/menu', async (req: Request, res: Response) => {
     const tenantId = req.tenantConfig?.tenantId;
@@ -1759,8 +1733,19 @@ async function startServer() {
         // fall through so kiosk still renders something during a Supabase outage
       }
 
-      // 1. Admin-managed menu in Redis (non-Supabase tenants only)
-      if (tenantId) {
+      // 1. Admin-managed menu in Redis (non-Supabase, non-POS tenants only)
+      //
+      // A tenant switched onto the native POS keeps its menu in our `dishes`
+      // table — that's what the Till, kitchen display and QR ordering all
+      // read, and what /api/pos/quote prices against. This cache predates
+      // the POS adapter and is written by the old single-tenant Menu editor;
+      // for a POS tenant it is leftover data with no dish_id on any item; it
+      // is not just stale, using it here for the shape the browser then
+      // renders as `MenuDish.dish_id` would put items on screen that have no
+      // usable id at all. It bit a real tenant: /api/menu kept serving this
+      // cache after they switched adapter.type to 'pos', so every Till tap
+      // resolved to the same "no id" signature and collided onto one line.
+      if (tenantId && req.tenantConfig?.adapter.type !== 'pos') {
         try {
           const redis    = getRedis();
           const menuData = await redis.get<MenuData>(redisKey.menuData(tenantId));
@@ -1789,25 +1774,7 @@ async function startServer() {
   });
 
   app.get('/api/orders', async (req: Request, res: Response) => {
-    const q        = req.query as Record<string, string>;
-    const tenantId = req.tenantConfig?.tenantId;
-
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try {
-          const redis    = getRedis();
-          const ids      = await redis.lrange(redisKey.localOrders(tenantId), 0, 99);
-          const orders   = (await Promise.all(ids.map(id => redis.get<LocalOrder>(redisKey.localOrder(id)).catch(() => null))))
-            .filter((o): o is LocalOrder => o !== null);
-          const filtered = q.status ? orders.filter(o => o.status === q.status) : orders;
-          res.json(filtered.map(toWireOrder)); return;
-        } catch (err) {
-          console.error('[LOCAL] get-orders failed:', err);
-          res.status(500).json({ error: 'Failed to load orders' }); return;
-        }
-      }
-    }
+    const q = req.query as Record<string, string>;
 
     try {
       const orders = await req.adapter!.getOrders({
@@ -1827,16 +1794,6 @@ async function startServer() {
       res.status(400).json({ error: 'status is required' }); return;
     }
 
-    // Check local orders first (UUID keys are the same format for both paths)
-    try {
-      const order = await getRedis().get<LocalOrder>(redisKey.localOrder(req.params.orderId));
-      if (order) {
-        const updated: LocalOrder = { ...order, status, updated_at: new Date().toISOString() };
-        await getRedis().set(redisKey.localOrder(req.params.orderId), updated, { ex: TTL.LOCAL_ORDER });
-        res.json(updated); return;
-      }
-    } catch { /* fall through to adapter */ }
-
     try {
       const result = await req.adapter!.updateOrderStatus(req.params.orderId, status);
       res.json(result);
@@ -1848,25 +1805,7 @@ async function startServer() {
   // kitchen dashboard can poll at 6-second intervals without 4× the requests.
   app.get('/api/orders/active', attachAdapter, async (req: Request, res: Response) => {
     res.set('Cache-Control', 'no-store, must-revalidate');
-    const tenantId    = req.tenantConfig?.tenantId;
-    const ACTIVE      = ['pending', 'confirmed', 'preparing', 'ready'] as const;
-
-    if (tenantId) {
-      const menu = await getLocalMenu(tenantId);
-      if (menu) {
-        try {
-          const redis  = getRedis();
-          const ids    = await redis.lrange(redisKey.localOrders(tenantId), 0, 199);
-          const orders = (await Promise.all(
-            ids.map(id => redis.get<LocalOrder>(redisKey.localOrder(id)).catch(() => null))
-          )).filter((o): o is LocalOrder => o !== null && (ACTIVE as readonly string[]).includes(o.status));
-          res.json(orders); return;
-        } catch (err) {
-          console.error('[LOCAL] get-orders/active failed:', err);
-          res.status(500).json({ error: 'Failed to load orders' }); return;
-        }
-      }
-    }
+    const ACTIVE = ['pending', 'confirmed', 'preparing', 'ready'] as const;
 
     try {
       const results = await Promise.all(
@@ -1923,6 +1862,17 @@ async function startServer() {
       const slug           = configRaw?.slug ?? tenantId;
       const passwordHash   = crypto.createHash('sha256').update(password).digest('hex');
 
+      // Postgres FIRST, then Redis. This invite used to write Redis only, which
+      // left every cashier and manager with a working login but no
+      // platform_users row — and therefore no way to be given a till PIN, since
+      // that lives on the Postgres row. Ordering it this way means a Postgres
+      // failure creates nothing at all and the admin can simply retry, rather
+      // than leaving a user who can log in but cannot be administered.
+      await usersRepo.upsert({
+        tenantId, email: email.toLowerCase(), passwordHash,
+        role: staffRole as 'manager' | 'staff',
+      });
+
       await redis.set(emailKey,
         { email: email.toLowerCase(), passwordHash, tenantId, slug, role: staffRole },
         { ex: ONE_YEAR }
@@ -1951,6 +1901,22 @@ async function startServer() {
       if (u.role === 'tenant_admin') { res.status(400).json({ error: 'Cannot remove a tenant admin account' }); return; }
       await redis.del(`user:email:${email}`);
       await redis.srem(`tenant:staff:${tenantId}`, email);
+
+      // Revoke the till PIN too, or a removed cashier could still ring in sales
+      // at the terminal: the PIN lives on the Postgres row, and deleting the
+      // Redis login only closes the browser login.
+      //
+      // The platform_users row itself is KEPT, with its PIN cleared. Historical
+      // orders carry staff_id, and deleting the row would turn every one of
+      // that person's past sales, voids and drawer counts into an unattributable
+      // uuid — the opposite of what an audit trail is for.
+      try {
+        const staff = await findOrProvision(tenantId, email);
+        if (staff) await clearStaffPin(tenantId, staff.id);
+      } catch (err) {
+        console.error('[STAFF] could not revoke till PIN for', email, err);
+      }
+
       void writeAuditLog(tenantId, 'staff_remove', req.jwtPayload!.sub, `removed=${email}`);
       res.json({ ok: true });
     } catch (err) {
@@ -1997,16 +1963,100 @@ async function startServer() {
   });
 
   // ── Static / SPA ────────────────────────────────────────────────────────────
+  //
+  // Two apps, two bundles. `/t/<slug>/<qr-token>` is a diner who scanned a table
+  // QR and gets guest.html; everything else is staff and gets index.html.
+  //
+  // The split is enforced here at the server, not by client-side routing,
+  // because the staff bundle contains the till — order entry, tender, drawer
+  // counts, manager approval. A diner's phone should never receive it.
+  const GUEST_PATH = /^\/t\/[^/]+\/[^/]+/;
+
   if (IS_DEV) {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'custom' });
     app.use(vite.middlewares);
+
+    // appType 'custom' means Vite does not invent an index for us, so each HTML
+    // entry is transformed explicitly. This is what makes /t/... load the guest
+    // entry in dev the same way the built site does in production.
+    app.use(async (req: Request, res: Response, next: NextFunction) => {
+      if (req.method !== 'GET' || req.originalUrl.startsWith('/api/')) { next(); return; }
+      const entry = GUEST_PATH.test(req.path) ? 'guest.html' : 'index.html';
+      try {
+        const raw  = await fs.promises.readFile(path.join(process.cwd(), entry), 'utf8');
+        const html = await vite.transformIndexHtml(req.originalUrl, raw);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+      } catch (err) {
+        vite.ssrFixStacktrace(err as Error);
+        next(err);
+      }
+    });
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res: Response) => res.sendFile(path.join(distPath, 'index.html')));
+    app.get('*', (req: Request, res: Response) => {
+      const entry = GUEST_PATH.test(req.path) ? 'guest.html' : 'index.html';
+      res.sendFile(path.join(distPath, entry));
+    });
   }
 
-  app.listen(PORT, '0.0.0.0', () => console.log(`Server running on http://localhost:${PORT}`));
+  const httpServer = app.listen(PORT, '0.0.0.0', () =>
+    console.log(`Server running on http://localhost:${PORT}`));
+
+  // ── Phone channel ─────────────────────────────────────────────────────────
+  // Off unless SIP_ENABLED=true. It needs infrastructure the app cannot provide
+  // for itself — an Asterisk instance registered to a SIP trunk — so the default
+  // is inert rather than a stream of connection errors on every dev machine.
+  let telephony: TelephonyHandle | null = null;
+
+  if (process.env.SIP_ENABLED === 'true') {
+    const missing = ['ARI_URL', 'ARI_USERNAME', 'ARI_PASSWORD', 'GEMINI_API_KEY']
+      .filter(k => !process.env[k]);
+
+    if (missing.length > 0) {
+      console.error(`[PHONE] SIP_ENABLED is set but ${missing.join(', ')} missing — phone channel NOT started`);
+    } else {
+      const audioPort = Number(process.env.AUDIOSOCKET_PORT ?? 8090);
+      try {
+        telephony = await startTelephony({
+          ari: {
+            baseUrl:  process.env.ARI_URL!,
+            username: process.env.ARI_USERNAME!,
+            password: process.env.ARI_PASSWORD!,
+            app:      process.env.ARI_APP ?? 'echo-agent',
+          },
+          audioSocketPort:    audioPort,
+          // Asterisk dials back to this. Defaults to loopback because the
+          // normal deployment has Asterisk on the same host; anything else
+          // means the media leg crosses a network and should be set explicitly.
+          audioSocketAddress: process.env.AUDIOSOCKET_ADDRESS ?? `127.0.0.1:${audioPort}`,
+          geminiApiKey:       process.env.GEMINI_API_KEY!,
+        });
+      } catch (err) {
+        // A phone channel that will not start must not stop the kiosk, the till
+        // and the table app from serving customers.
+        console.error('[PHONE] failed to start — every other channel is unaffected:', err);
+      }
+    }
+  }
+
+  // Drain in-flight calls before exiting. Cutting someone off mid-sentence
+  // during a deploy is a worse experience than a slightly slower restart.
+  const shutdown = (signal: string) => {
+    void (async () => {
+      console.log(`[SERVER] ${signal} — shutting down`);
+      if (telephony) {
+        console.log(`[PHONE] draining ${telephony.activeCalls} active call(s)`);
+        await telephony.stop().catch(err => console.error('[PHONE] shutdown error:', err));
+      }
+      httpServer.close(() => process.exit(0));
+      // Do not hang forever on a keep-alive connection that will not close.
+      setTimeout(() => process.exit(0), 10_000).unref();
+    })();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 }
 
 startServer();

@@ -6,6 +6,8 @@ import {
   type PosMenu, type OrderRow, type OrderItemRow, type NewOrderItem,
 } from '../src/lib/posRepo.js';
 import { fuzzyMatchItem, matchModifiers, buildMenuMarkdown } from './posMatching.js';
+import { withCartLock } from '../src/lib/cartLock.js';
+import { publish } from '../src/lib/posEvents.js';
 import type {
   IRestaurantAdapter,
   ResolveItemParams,
@@ -183,7 +185,12 @@ export class PosAdapter implements IRestaurantAdapter {
       notes:        params.notes ?? null,
     };
 
-    await this.writeCart(params.sessionId, [...await this.readCart(params.sessionId), item]);
+    // Read-modify-write under the lock. A model that emits two add_item calls in
+    // one turn would otherwise have both read the same pre-state, and the second
+    // write would drop the first item.
+    await withCartLock(this.cartKey(params.sessionId), async () => {
+      await this.writeCart(params.sessionId, [...await this.readCart(params.sessionId), item]);
+    });
 
     return {
       status:           'ok',
@@ -198,8 +205,10 @@ export class PosAdapter implements IRestaurantAdapter {
   }
 
   async removeItem(sessionId: string, cartItemId: string): Promise<void> {
-    const cart = await this.readCart(sessionId);
-    await this.writeCart(sessionId, cart.filter(i => i.cart_item_id !== cartItemId));
+    await withCartLock(this.cartKey(sessionId), async () => {
+      const cart = await this.readCart(sessionId);
+      await this.writeCart(sessionId, cart.filter(i => i.cart_item_id !== cartItemId));
+    });
   }
 
   async clearCart(sessionId: string): Promise<void> {
@@ -225,7 +234,11 @@ export class PosAdapter implements IRestaurantAdapter {
     // Prefer the Redis cart (full detail: dish_id, modifiers, category). Fall
     // back to an inline cart from the request body so a Redis outage degrades
     // the receipt's detail rather than losing the sale outright.
-    const stored = await this.readCart(params.sessionId);
+    //
+    // Snapshot under the lock: an add_item still in flight must land before we
+    // read, or the customer is charged for an order missing its last item.
+    const stored = await withCartLock(this.cartKey(params.sessionId),
+      () => this.readCart(params.sessionId));
     const items: NewOrderItem[] = stored.length > 0
       ? stored.map(i => ({
           dishId:          i.dish_id,
@@ -254,10 +267,25 @@ export class PosAdapter implements IRestaurantAdapter {
       paymentMethod:     params.paymentMethod,
       instructions:      params.instructions,
       notes:             params.notes,
-      source:            'kiosk',
+      tableId:           params.tableId,
+      // Defaults to 'kiosk' because that is the caller that predates the field;
+      // every other channel passes its own.
+      source:            params.source ?? 'kiosk',
     });
 
     await this.clearCart(params.sessionId);
+
+    // Kiosk, phone, WhatsApp and QR orders all arrive through this method, so
+    // this is the one place that makes them appear on the POS floor and the
+    // kitchen board without each channel having to remember to announce itself.
+    publish(this.tenantId, 'order.created', {
+      orderId:     order.id,
+      orderNumber: order.order_number,
+      tableId:     order.table_id,
+      orderType:   order.order_type,
+      total:       totals.total,
+      source:      params.source ?? 'kiosk',
+    });
 
     return {
       order_id:     order.id,
@@ -286,6 +314,9 @@ export class PosAdapter implements IRestaurantAdapter {
   async updateOrderStatus(orderId: string, status: string): Promise<unknown> {
     const updated = await ordersRepo.setStatus(this.tenantId, orderId, status);
     if (!updated) throw new Error(`[POS] order ${orderId} not found`);
+    publish(this.tenantId, 'order.status', {
+      orderId, orderNumber: updated.order_number, status,
+    });
     return updated;
   }
 }
