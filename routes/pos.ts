@@ -4,8 +4,8 @@ import {
   ordersRepo, paymentsRepo, shiftsRepo, tablesRepo, customersRepo,
   computeTotals, type NewOrderItem,
 } from '../src/lib/posRepo.js';
-import { auditRepo, tenantConfigsRepo, dualWrite } from '../src/lib/repo.js';
-import { getRedis, redisKey, TTL } from '../src/lib/redis.js';
+import { auditRepo } from '../src/lib/repo.js';
+import { writeTenantConfig } from '../src/lib/platformState.js';
 import { parseTenantConfig, type TenantConfig } from '../src/lib/tenantConfig.js';
 import { toWireOrder, PosAdapter } from '../adapter/PosAdapter.js';
 import { publish } from '../src/lib/posEvents.js';
@@ -1194,10 +1194,13 @@ posRouter.get('/reports/summary.csv', async (req: Request, res: Response) => {
  * Turn on QR table ordering, in place, the moment a table's code is issued.
  *
  * Same read-patch-write shape as EnablePosGate/PinGate use over HTTP, done
- * directly here since the route already holds the parsed config. Redis is
- * primary — middleware/tenant.ts reads it first — so it is written before the
- * Postgres mirror; the mirror is best-effort and must never block a QR code
- * a manager is standing there waiting to print.
+ * directly here since the route already holds the parsed config.
+ *
+ * writeTenantConfig persists to Postgres and only then refreshes the cache, and
+ * it throws if Postgres refuses. That is deliberate even though a manager is
+ * standing at the printer: a QR card whose channel flag reached only the cache
+ * stops working the moment that key expires, and it fails as an unreadable code
+ * on a printed card rather than as an error anyone can see.
  */
 async function enableQrChannel(tenantId: string, config: TenantConfig): Promise<void> {
   const next = parseTenantConfig({
@@ -1213,8 +1216,7 @@ async function enableQrChannel(tenantId: string, config: TenantConfig): Promise<
     },
   });
 
-  await getRedis().set(redisKey.tenantConfig(tenantId), next, { ex: TTL.TENANT_CONFIG });
-  void dualWrite('tenant_configs.upsert', tenantConfigsRepo.upsert(tenantId, next));
+  await writeTenantConfig(tenantId, next);
 }
 
 // The guest URL has to be absolute so a printed QR works from a phone on the

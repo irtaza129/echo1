@@ -72,40 +72,54 @@ disagreement.
    `orders.source` (`pos|kiosk|phone|whatsapp|qr|web`) is a closed set with a DB
    check constraint, because it drives channel attribution.
 
-2. **Totals are computed server-side, once.** `computeTotals()` in
+2. **Postgres is the source of truth; Redis is a cache.** That holds for tenant
+   configs, adapter credentials, logins and payment records as well as orders.
+   Reads go cache → Postgres (`src/lib/platformState.ts`, `src/lib/paymentStore.ts`);
+   writes go Postgres → cache, never the reverse. A value that exists only in
+   Redis is a bug. Every TTL is a cache lifetime, so shortening one may cost a
+   query but can never lose data — if a TTL is load-bearing, the direction has
+   been inverted somewhere.
+
+3. **A write that IS the record uses `mustWrite` and is allowed to throw.**
+   `bestEffort` is only for true side-effects (today: the audit trail), and it
+   logs unconditionally. Reporting success for a write that reached only the
+   cache is silent data loss. The fire-and-forget `dualWrite` this replaced is
+   why `audit_log` recorded nothing for the entire life of the feature.
+
+4. **Totals are computed server-side, once.** `computeTotals()` in
    `src/lib/posRepo.ts` is the only version that counts. The till prices a basket
    through `POST /api/pos/quote`, which runs that same function. Never do money
    arithmetic in a component.
 
-3. **Never patch totals incrementally.** Re-derive from live lines
+5. **Never patch totals incrementally.** Re-derive from live lines
    (`ordersRepo.recomputeTotals`). Incremental addition makes the result depend on
    the order edits happened in.
 
-4. **Never discount or void below what has been paid.** Both paths preview the
+6. **Never discount or void below what has been paid.** Both paths preview the
    result and refuse *before* writing, so a rejected action changes nothing.
 
-5. **Manager approval is a server check.** `approve()` in `routes/pos.ts`
+7. **Manager approval is a server check.** `approve()` in `routes/pos.ts`
    re-identifies the PIN and reads that operator's stored permissions, including
    `max_discount_pct`. `ManagerApproval.tsx` is a convenience, not the control.
 
-6. **Guest and staff tokens are mutually exclusive.** `requireAuth` rejects
+8. **Guest and staff tokens are mutually exclusive.** `requireAuth` rejects
    `role: 'guest'`; `requireGuest` accepts nothing else. A guest token is validly
    signed for a real tenant, so "is this token valid?" is never sufficient.
    Both directions are asserted in `testing/test-guest-isolation.ts`.
 
-7. **Guests are identified by their token, never by the request.** `tableId` and
+9. **Guests are identified by their token, never by the request.** `tableId` and
    `dineSessionId` come from the JWT. Nothing in `routes/guest.ts` reads a table
    from a body or query.
 
-8. **The real Gemini key never reaches a browser.** Kiosk and guest both get a
+10. **The real Gemini key never reaches a browser.** Kiosk and guest both get a
    60-second ephemeral token. The server-side phone bridge uses the real key
    because it *is* the server.
 
-9. **Tool calls run sequentially, never `Promise.all`.** Two `add_item` calls in
+11. **Tool calls run sequentially, never `Promise.all`.** Two `add_item` calls in
    one turn race on the same cart. `session_id` is stripped from tools on every
    channel except the kiosk — the session is the call/table/number.
 
-10. **A failed side-effect never fails a committed sale.** Audit writes, prints,
+12. **A failed side-effect never fails a committed sale.** Audit writes, prints,
     and event publishes are best-effort *after* the money moved. Returning non-2xx
     invites the client to retry the sale.
 
@@ -131,6 +145,9 @@ disagreement.
 | `src/pos/` | The till: order entry, tender, KDS, shift, bookings, reports |
 | `src/guest/` | The diner's phone app (separate Vite entry) |
 | `src/lib/posRepo.ts` | Orders, payments, shifts, tables — **money lives here** |
+| `src/lib/repo.ts` | Platform tables + `mustWrite`/`bestEffort`. Read the header |
+| `src/lib/platformState.ts` | Read-through cache over Postgres for config, credentials, slugs, logins |
+| `src/lib/paymentStore.ts` | Diner card payments: `payment_transactions` + its Redis hot copy |
 | `src/lib/posEvents.ts` | In-process event bus behind the SSE stream |
 | `src/lib/escpos.ts` | Receipt and kitchen-ticket bytes |
 | `src/lib/PromptBuilder.ts` | System prompt per channel (`kiosk｜whatsapp｜qr｜phone`) |
@@ -156,6 +173,17 @@ npx tsx --env-file=.env scripts/table-qr.ts --slug <slug> --issue-all --base htt
 
 # Move a tenant's Redis menu/orders into Postgres, then switch them to the native POS
 npx tsx --env-file=.env scripts/backfill-pos.ts --tenant <uuid> --write --activate
+
+# Copy platform state (tenants, configs, credentials, logins) out of Redis into
+# Postgres. MUST have been run before the reads cutover reaches an environment:
+# reads now fall through to Postgres, so a tenant that was never persisted there
+# disappears when their cache entry expires. Dry run by default.
+# Apply migrations 017 and 018 FIRST — the script refuses to run otherwise.
+npx tsx --env-file=.env scripts/backfill-platform-state.ts                 # report only
+npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --verify
+# Logins whose tenant config expired are reported by name, not resurrected,
+# until you opt in — most are test signups.
+npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --recover-orphans
 ```
 
 ---
@@ -173,6 +201,11 @@ npm run test:guest   -- --slug <slug>     # QR: scan → PIN → call waiter →
 npm run test:kds     -- --tenant <uuid>   # bump → order ready → recall
 npm run test:reports -- --tenant <uuid>
 ```
+
+`testing/test-platform-state.ts` (in `npm test`) pins the Redis → Postgres
+cutover. Some of its checks read the source rather than execute it, because the
+regression it guards against — a read path quietly reverted to Redis-only — has
+no runtime symptom until a cache key expires.
 
 Tests are bare `tsx` + `node:assert`. No runner. Add new suites to `scripts.test`.
 
@@ -203,10 +236,26 @@ Honest list. None of these is secretly finished.
 - **Safepay is implemented but unwired.** `payments/SafepayProvider.ts` is complete
   and unreachable; Paddle rejects PKR, so PKR tenants are cash-only until it is wired.
 - **No inventory, no multi-branch.** `orders.branch_id` exists and is inert.
+- **`public.payment_ledger` is still unwritten.** Migration 002 provisioned it as
+  the double-entry journal for settlement reconciliation;
+  `payment_transactions` is now populated but the ledger is not. Nothing reads it
+  either, so it is dormant rather than wrong.
+- **`public.tenant_configs` was empty until migration 018.** `updated_by` was
+  declared `uuid` in migration 001 while every caller passes an email, so every
+  write to that table failed and `dualWrite` swallowed it — the same shape as the
+  `audit_log` bug. `checkSchema()` now compares column types, not just presence.
+- **Two tenants can share a slug in Redis; `tenants.slug` is unique.** The
+  backfill reports the collision rather than picking a winner.
+- **Legacy Redis keys are still written but no longer read.** `user:email:<addr>`
+  and `tenant:slug:<x>` are kept in step by the write paths purely as a rollback
+  route for the cutover. Delete them, and their writers, once it has held.
 - **14 pre-existing tables have RLS enabled with no policies** (`orders`, `dishes`,
   `billing_*`, `users`…). Latent only because the app uses the service-role key.
 - **`platform_users.password_hash` is sha256.** Till PINs correctly use scrypt;
-  account passwords still do not.
+  account passwords still do not. This got more urgent with the reads cutover:
+  that column is now what login actually verifies against, rather than a mirror
+  of a Redis record. Unsalted sha256 of a user-chosen password is trivially
+  reversible from a rainbow table.
 - **Legacy `agent1101` login** exists for the original kiosk. It is now disabled
   unless `AUTH_PASSWORD_HASH` is explicitly set (it used to default to a hash in
   version control).
@@ -225,6 +274,9 @@ Honest list. None of these is secretly finished.
 | Orders appear late | SSE not connected | Till header badge; `routes/stream.ts` |
 | QR scan says code invalid | `channels.qr.enabled` false, or token rotated | `scripts/table-qr.ts` |
 | Guest gets 403 everywhere | Staff token being used as a guest one | `middleware/guest.ts` |
+| Tenant 404s after working fine | Never backfilled; cache expired | `scripts/backfill-platform-state.ts` |
+| Admin can't save config / creds | Postgres write refused — now surfaced, not swallowed | server log `[DB] write FAILED` |
+| Every config save 500s | Migration 018 not applied (`updated_by` still uuid) | boot log `[SCHEMA] MISMATCH` |
 | Phone call is silent | Trunk negotiated G.729 | `telephony/sip/README-asterisk.md` |
 | First PTT press silent | WebSocket not open before audio | dual-flag connect in `App.tsx` |
 | Kitchen ticket shows money | Wrong builder | `buildKitchenTicket`, not `buildReceipt` |

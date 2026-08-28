@@ -11,7 +11,7 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "smoke": "tsx --env-file=.env scripts/smoke.mts",
-    "test": "tsx testing/test-payments.ts && tsx testing/test-discovery.ts && tsx testing/test-billing.ts && tsx testing/test-pos-phase1.ts && tsx testing/test-pos-stream.ts && tsx testing/test-pos-phase2.ts && tsx testing/test-guest-voice.ts && tsx testing/test-phone-agent.ts && tsx testing/test-telephony-audio.ts && tsx testing/test-telephony-transport.ts && tsx testing/test-escpos.ts && tsx testing/test-reports.ts && tsx --env-file=.env testing/test-guest-isolation.ts",
+    "test": "tsx testing/test-payments.ts && tsx testing/test-discovery.ts && tsx testing/test-billing.ts && tsx testing/test-pos-phase1.ts && tsx testing/test-pos-stream.ts && tsx testing/test-pos-phase2.ts && tsx testing/test-guest-voice.ts && tsx testing/test-phone-agent.ts && tsx testing/test-telephony-audio.ts && tsx testing/test-telephony-transport.ts && tsx testing/test-escpos.ts && tsx testing/test-reports.ts && tsx testing/test-platform-state.ts && tsx --env-file=.env testing/test-guest-isolation.ts",
     "test:live": "tsx --env-file=.env testing/test-pos-routes.ts",
     "test:guest": "tsx --env-file=.env testing/test-guest-flow.ts",
     "test:kds": "tsx --env-file=.env testing/test-kds.ts",

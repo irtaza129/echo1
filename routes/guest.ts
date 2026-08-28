@@ -5,8 +5,8 @@ import { requireGuest } from '../middleware/guest.js';
 import { publish } from '../src/lib/posEvents.js';
 import { ordersRepo, computeTotals } from '../src/lib/posRepo.js';
 import { AdapterFactory } from '../adapter/AdapterFactory.js';
-import { parseTenantConfig, type TenantConfig } from '../src/lib/tenantConfig.js';
-import { getRedis, redisKey } from '../src/lib/redis.js';
+import type { TenantConfig } from '../src/lib/tenantConfig.js';
+import { readTenantConfig } from '../src/lib/platformState.js';
 import { tableQrRepo, dineSessionsRepo, serviceRequestsRepo } from '../src/lib/dineRepo.js';
 import { PromptBuilder } from '../src/lib/PromptBuilder.js';
 import { GoogleGenAI } from '@google/genai';
@@ -27,10 +27,13 @@ export const guestRouter = Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Cache, then Postgres. A cache-only read meant a diner who scanned a QR code
+// got a 500 whenever the tenant's config key had expired — the restaurant's
+// tables simply stopped working, with nothing to point at.
 async function loadConfig(tenantId: string): Promise<TenantConfig> {
-  const cached = await getRedis().get<unknown>(redisKey.tenantConfig(tenantId));
-  if (!cached) throw new Error(`[GUEST] no config for tenant ${tenantId}`);
-  return parseTenantConfig(cached);
+  const config = await readTenantConfig(tenantId);
+  if (!config) throw new Error(`[GUEST] no config for tenant ${tenantId}`);
+  return config;
 }
 
 function fail(res: Response, err: unknown, fallback: string): void {

@@ -1,14 +1,16 @@
 import type { Request, Response, NextFunction } from 'express';
-import { getRedis, redisKey, TTL } from '../src/lib/redis.js';
 import { parseTenantConfig, type TenantConfig, type AdapterCredentials } from '../src/lib/tenantConfig.js';
-import { decryptCredentials, type EncryptedBlob } from '../src/lib/crypto.js';
+import { readTenantConfig, readCredentials } from '../src/lib/platformState.js';
 import { AdapterFactory } from '../adapter/AdapterFactory.js';
 import type { IRestaurantAdapter } from '../adapter/IRestaurantAdapter.js';
 import { PaymentProviderFactory } from '../payments/PaymentProviderFactory.js';
 import { extractJwt } from '../src/lib/jwt.js';
 
-// Savour Foods hard-coded fallback — used when no JWT is present or Redis is
-// unavailable. Remove once Supabase DB lookup is wired in (Phase 3).
+// Savour Foods hard-coded fallback — the original single-tenant kiosk, which
+// predates the tenants table and may have no row in it. Kept as a last resort
+// only: readTenantConfig() now consults Postgres, so this fires solely when
+// Savour has genuinely never been persisted. Delete it once that tenant has
+// been through scripts/backfill-platform-state.ts.
 const SAVOUR_FOODS_TENANT_ID = '00000000-0000-4000-8000-000000000001';
 
 const SAVOUR_FOODS_CONFIG_FALLBACK: TenantConfig = parseTenantConfig({
@@ -41,31 +43,20 @@ const SAVOUR_FOODS_CONFIG_FALLBACK: TenantConfig = parseTenantConfig({
   features:      { deliveryOrders: false, tableNumbers: true, transcriptScreen: true, loyaltyPoints: false },
 });
 
+// Resolution order is Redis cache → Postgres → Savour fallback, all of it
+// inside readTenantConfig() except the last step. A cache miss is now a slower
+// request rather than a 404, which is the whole point of the cutover: a config
+// only disappears if it was never written, not if a key expired.
 async function loadConfig(tenantId: string): Promise<TenantConfig> {
-  // 1. Try Redis cache
-  try {
-    const redis  = getRedis();
-    const cached = await redis.get<unknown>(redisKey.tenantConfig(tenantId));
-    if (cached) return parseTenantConfig(cached);
-  } catch {
-    // Redis unavailable — continue to fallback
+  const config = await readTenantConfig(tenantId);
+  if (config) return config;
+
+  if (tenantId === SAVOUR_FOODS_TENANT_ID) {
+    console.warn('[TENANT] Savour Foods has no tenant_configs row — serving hardcoded fallback');
+    return SAVOUR_FOODS_CONFIG_FALLBACK;
   }
 
-  // 2. Hard-coded fallback for Savour Foods while DB is being wired up
-  if (tenantId === SAVOUR_FOODS_TENANT_ID) return SAVOUR_FOODS_CONFIG_FALLBACK;
-
-  // Phase 3: add Supabase DB lookup here
   throw new Error(`[TENANT] Config not found for tenant ${tenantId}`);
-}
-
-// Warm a loaded config back into Redis so subsequent requests hit cache
-async function warmCache(config: TenantConfig): Promise<void> {
-  try {
-    const redis = getRedis();
-    await redis.set(redisKey.tenantConfig(config.tenantId), config, { ex: TTL.TENANT_CONFIG });
-  } catch {
-    // Non-fatal
-  }
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -136,15 +127,10 @@ export async function attachAdapter(
     return;
   }
 
-  // Load encrypted credentials from Redis and decrypt (Phase 5)
-  let credentials: AdapterCredentials = {};
-  try {
-    const redis = getRedis();
-    const blob  = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
-    if (blob) credentials = decryptCredentials(blob);
-  } catch {
-    // Credentials unavailable — adapter will work for managed; custom_api will throw on use
-  }
+  // Cache, then adapter_credentials in Postgres. Returns {} when the tenant has
+  // none or decryption fails — managed tenants need none, and custom_api
+  // surfaces the problem when the adapter actually tries to use one.
+  const credentials: AdapterCredentials = await readCredentials(tenantId);
 
   const adapter: IRestaurantAdapter = AdapterFactory.create(config, credentials);
   req.tenantConfig = config;
@@ -164,9 +150,6 @@ export async function attachAdapter(
   // (and should) cross-check this against the tenantId they expected — catches
   // accidental cross-tenant calls before they show wrong data to a user.
   res.setHeader('X-Resolved-Tenant', config.tenantId);
-
-  // Keep cache warm asynchronously — don't block the request
-  warmCache(config).catch(() => undefined);
 
   next();
 }

@@ -7,8 +7,8 @@ import axios from 'axios';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
-import { issueJwt, extractJwt, type JwtPayload, type UserRole } from './src/lib/jwt.js';
-import { encryptCredentials, decryptCredentials, type EncryptedBlob } from './src/lib/crypto.js';
+import { issueJwt, extractJwt, type JwtPayload } from './src/lib/jwt.js';
+import { encryptCredentials, decryptCredentials } from './src/lib/crypto.js';
 import { parseTenantConfig, validatePaymentConfig } from './src/lib/tenantConfig.js';
 import type { TenantConfig, AdapterCredentials } from './src/lib/tenantConfig.js';
 import { getRedis, redisKey, TTL } from './src/lib/redis.js';
@@ -20,7 +20,7 @@ import { ordersRepo } from './src/lib/posRepo.js';
 import type { IRestaurantAdapter } from './adapter/IRestaurantAdapter.js';
 import { checkSchema } from './src/lib/supabaseAdmin.js';
 import { PaymentProviderFactory } from './payments/PaymentProviderFactory.js';
-import type { IPaymentProvider, PaymentTransaction } from './payments/IPaymentProvider.js';
+import type { IPaymentProvider } from './payments/IPaymentProvider.js';
 import { rupeesToPaisa, paisaToRupees } from './payments/money.js';
 import { probeEndpoint } from './adapter/probeEndpoint.js';
 import {
@@ -39,12 +39,23 @@ import type { HttpMethod } from './src/lib/posPresets.js';
 import { fetchMenuFromSupabase } from './src/lib/supabaseMenu.js';
 import {
   tenantsRepo,
-  tenantConfigsRepo,
-  credentialsRepo,
   usersRepo,
   auditRepo,
-  dualWrite,
+  mustWrite,
+  bestEffort,
+  REVOKED_PASSWORD_HASH,
 } from './src/lib/repo.js';
+import {
+  readTenantConfig,
+  writeTenantConfig,
+  warmTenantConfig,
+  readCredentialBlob,
+  writeCredentials,
+  resolveSlug,
+  findUserByEmail,
+  createUser,
+} from './src/lib/platformState.js';
+import { savePaymentTxn, loadPaymentTxn, updatePaymentStatus } from './src/lib/paymentStore.js';
 import { verifyWebhookSignature, handleWebhook } from './telephony/WhatsAppHandler.js';
 
 dotenv.config();
@@ -103,13 +114,9 @@ function countMenuItems(menu: unknown): number {
   return 0;
 }
 
-// Persist a payment transaction + an orderId → providerRef pointer so webhooks
-// (which only know the gateway ref) and status polls can both find the record.
-type RedisClientT = ReturnType<typeof getRedis>;
-async function savePaymentTxn(redis: RedisClientT, txn: PaymentTransaction): Promise<void> {
-  await redis.set(redisKey.payment(txn.providerRef), txn, { ex: TTL.PAYMENT });
-  await redis.set(redisKey.orderPayment(txn.orderId), txn.providerRef, { ex: TTL.PAYMENT });
-}
+// Payment attempts are persisted to public.payment_transactions and cached in
+// Redis by src/lib/paymentStore.ts. This helper used to live here and wrote only
+// Redis, under a 30-day TTL — see that module for why that had to change.
 
 // normStr / fuzzyMatchItem / getLocalMenu lived here to serve the inline Redis
 // order path. That path is gone: matching now happens inside the adapter that
@@ -163,9 +170,7 @@ async function reportUnmigratedPosTenants(): Promise<void> {
 // and keep the pre-existing Render behaviour rather than guessing.
 async function getAdapterType(tenantId: string): Promise<TenantConfig['adapter']['type'] | null> {
   try {
-    const raw = await getRedis().get<unknown>(redisKey.tenantConfig(tenantId));
-    if (!raw) return null;
-    return parseTenantConfig(raw).adapter.type;
+    return (await readTenantConfig(tenantId))?.adapter.type ?? null;
   } catch {
     return null;
   }
@@ -328,8 +333,12 @@ async function writeAuditLog(tenantId: string, action: string, sub: string, deta
     await redis.lpush(key, entry);
     await redis.ltrim(key, 0, 499);
   } catch { /* non-fatal */ }
-  // Dual-write to Postgres — append-only, isolated from Redis success/failure.
-  void dualWrite('audit_log', auditRepo.append({ tenantId, actor: sub, action, details }));
+  // Postgres is the durable audit trail; the Redis list above is a fast tail for
+  // the admin panel. Best-effort and awaited: the audit trail must never turn a
+  // committed action into a 5xx, but a failure is logged unconditionally. It
+  // used to be logged only in development, which is how a column mismatch let
+  // this table record nothing at all for the whole life of the feature.
+  await bestEffort('audit_log', auditRepo.append({ tenantId, actor: sub, action, details }));
 }
 
 // Ensure a tenant row exists in the relational source of truth (Supabase
@@ -442,17 +451,29 @@ async function startServer() {
   );
 
   // Verify the deployed Postgres schema matches what repo.ts writes. Non-fatal
-  // (Redis is the primary store), but loud — a mismatch here means dual-writes
-  // are failing silently, which is exactly how the audit_log drift went
-  // unnoticed. Run once at boot; a schema change requires a redeploy anyway.
+  // so a diagnostic cannot stop the server booting, but loud — Postgres is now
+  // the source of truth, so drift here does not degrade the app, it breaks it.
+  //
+  // Checks column types as well as presence. audit_log drifted on a missing
+  // column; tenant_configs.updated_by drifted on the TYPE of a column that was
+  // present, which the earlier presence-only check reported as healthy while
+  // every write to the table failed.
   checkSchema()
     .then(problems => {
       if (!problems.length) { console.log('[SCHEMA] Postgres schema OK'); return; }
       for (const p of problems) {
-        console.error(`[SCHEMA] MISMATCH ${p.table}: missing column(s) ${p.missing.join(', ')}`);
+        if (p.missing.length) {
+          console.error(`[SCHEMA] MISMATCH ${p.table}: missing column(s) ${p.missing.join(', ')}`);
+        }
+        for (const m of p.mistyped ?? []) {
+          console.error(
+            `[SCHEMA] MISMATCH ${p.table}.${m.column}: expected ${m.expected}, found ${m.actual} — ` +
+            `every write to this table will be rejected`,
+          );
+        }
       }
       console.error(
-        `[SCHEMA] ${problems.length} table(s) drifted — dual-writes to these WILL fail silently. ` +
+        `[SCHEMA] ${problems.length} table(s) drifted — writes to these WILL fail. ` +
         `Apply the pending migration in migrations/.`,
       );
     })
@@ -550,12 +571,21 @@ async function startServer() {
       res.json({ token: issueLegacyToken(loginId), jwtToken, role: 'tenant_admin', slug: 'savour-foods' }); return;
     }
 
-    // Email-based users registered via /api/auth/register
+    // Email-based users registered via /api/auth/register.
+    //
+    // Reads platform_users in Postgres, falling back to the legacy
+    // `user:email:<addr>` Redis record for accounts created before that table
+    // was authoritative — a hit there is healed forward, so no existing tenant
+    // is locked out by the cutover. See src/lib/platformState.ts.
     try {
-      const redis = getRedis();
-      const user  = await redis.get<{ email: string; passwordHash: string; tenantId: string; slug: string; role: UserRole }>(
-        `user:email:${loginId.toLowerCase()}`
-      );
+      const user = await findUserByEmail(loginId);
+      // Explicit, even though a sentinel can never equal a sha256 digest: this
+      // is the check that keeps a removed staff member out, and it should not
+      // depend on a property of the hash format to work.
+      if (user && user.passwordHash === REVOKED_PASSWORD_HASH) {
+        console.warn(`[AUTH] Refusing login for revoked account ${user.email}`);
+        res.status(401).json({ error: 'Invalid credentials' }); return;
+      }
       if (user && user.passwordHash === hash) {
         // Self-heal: a user account that holds a reserved slug should never have
         // been created. Refuse the login so the rogue account is effectively
@@ -570,7 +600,7 @@ async function startServer() {
         res.json({ token: issueLegacyToken(loginId), jwtToken, role: user.role, slug: user.slug }); return;
       }
     } catch (err) {
-      console.error('[AUTH] Redis user lookup failed:', err);
+      console.error('[AUTH] user lookup failed:', err);
     }
 
     res.status(401).json({ error: 'Invalid credentials' });
@@ -595,13 +625,14 @@ async function startServer() {
     }
 
     try {
-      const redis        = getRedis();
-      const emailKey     = `user:email:${email.toLowerCase()}`;
-      const slugKey      = `tenant:slug:${slug}`;
-
+      // Uniqueness is checked against Postgres (with the legacy Redis records as
+      // a fallback), not against Redis alone. Checking only the cache meant an
+      // expired key read as "available": a second signup could then claim an
+      // email or slug that already existed, and the platform_users upsert —
+      // keyed on email — would overwrite the original owner's account.
       const [existingEmail, existingSlug] = await Promise.all([
-        redis.get(emailKey),
-        redis.get(slugKey),
+        findUserByEmail(email),
+        resolveSlug(slug),
       ]);
       if (existingEmail) { res.status(409).json({ error: 'Email already registered' }); return; }
       if (existingSlug)  { res.status(409).json({ error: 'That restaurant identifier is already taken' }); return; }
@@ -642,21 +673,24 @@ async function startServer() {
         },
       });
 
-      await Promise.all([
-        redis.set(emailKey, { email: email.toLowerCase(), passwordHash, tenantId, slug, role: 'tenant_admin' }, { ex: ONE_YEAR }),
-        redis.set(slugKey,  tenantId, { ex: ONE_YEAR }),
-        redis.set(redisKey.tenantConfig(tenantId), config, { ex: TTL.TENANT_CONFIG }),
-        redis.sadd(redisKey.tenantsIndex, tenantId),
-      ]);
+      // Registration is persisted to Postgres BEFORE anything is reported as
+      // successful, and a failure aborts the request. These three writes were
+      // previously fire-and-forget behind Redis; when one failed the signup
+      // still returned 201 and the tenant existed only in cache, so their
+      // account quietly ceased to exist when the key expired.
+      //
+      // Ordered tenant → config → user because the latter two carry foreign
+      // keys into tenants. Each throws on failure and is caught below as a 500,
+      // which the signup screen surfaces as a retryable error.
+      await mustWrite('tenants.upsert', tenantsRepo.upsert({
+        id: tenantId, slug, name: restaurantName, plan: plan ?? 'starter',
+      }));
+      await writeTenantConfig(tenantId, config, email.toLowerCase());
+      await createUser({
+        email: email.toLowerCase(), passwordHash, tenantId, slug, role: 'tenant_admin',
+      });
 
-      void writeAuditLog(tenantId, 'register', email.toLowerCase(), `slug=${slug} plan=${plan ?? 'starter'}`);
-
-      // Dual-write registration into the relational source of truth so the
-      // tenant row, its config, and the admin user all exist in Postgres.
-      // Each is independent — a failure on one doesn't block the others.
-      void dualWrite('tenants.upsert',         tenantsRepo.upsert({ id: tenantId, slug, name: restaurantName, plan: plan ?? 'starter' }));
-      void dualWrite('tenant_configs.upsert',  tenantConfigsRepo.upsert(tenantId, config, email.toLowerCase()));
-      void dualWrite('platform_users.upsert',  usersRepo.upsert({ tenantId, email: email.toLowerCase(), passwordHash, role: 'tenant_admin' }));
+      await writeAuditLog(tenantId, 'register', email.toLowerCase(), `slug=${slug} plan=${plan ?? 'starter'}`);
 
       if (!process.env.JWT_SECRET) {
         res.status(500).json({ error: 'Server not configured for JWT auth' }); return;
@@ -686,8 +720,6 @@ async function startServer() {
     // path, and a stale 304 here would feed the wrong tenantId into App.tsx.
     res.set('Cache-Control', 'no-store, must-revalidate');
     try {
-      const redis = getRedis();
-
       // Reserved-slug guard: if the slug has a hardcoded owner, use it regardless of
       // what Redis says. If the slug is reserved but has no hardcoded owner (e.g.
       // "admin", "api"), 404 immediately — never consult Redis for those.
@@ -697,14 +729,14 @@ async function startServer() {
       } else if (RESERVED_SLUGS.has(slug)) {
         res.status(404).json({ error: 'Tenant not found' }); return;
       } else {
-        tenantId = await redis.get<string>(`tenant:slug:${slug}`);
+        tenantId = await resolveSlug(slug);
       }
       if (!tenantId) { res.status(404).json({ error: 'Tenant not found' }); return; }
 
-      const cached = await redis.get<unknown>(redisKey.tenantConfig(tenantId));
+      const stored = await readTenantConfig(tenantId);
       let config;
-      if (cached) {
-        config = parseTenantConfig(cached);
+      if (stored) {
+        config = stored;
       } else if (tenantId === SAVOUR_FOODS_TENANT_ID) {
         config = parseTenantConfig({
           tenantId, slug: 'savour-foods', restaurantName: 'Savour Foods', plan: 'growth',
@@ -743,16 +775,29 @@ async function startServer() {
     }
   });
 
-  // ── Admin: push config into Redis cache ────────────────────────────────────
+  // ── Admin: warm the config cache ───────────────────────────────────────────
+  //
+  // Cache-only, deliberately. It does NOT persist: /api/admin/save-config is the
+  // write path, and this endpoint accepts a whole config body, so persisting
+  // here would give any tenant_admin a way to write durable state for a tenant
+  // they picked themselves.
+  //
+  // For the same reason the tenantId is forced from the JWT rather than read
+  // from the body. It used to come from the body, which let any tenant_admin
+  // overwrite ANY tenant's cached config — a poisoned entry that middleware
+  // would then serve until it expired.
   app.post('/api/admin/cache-config', requireAuth, async (req: Request, res: Response) => {
     const role = req.jwtPayload?.role;
     if (role !== 'super_admin' && role !== 'tenant_admin') {
       res.status(403).json({ error: 'Forbidden' }); return;
     }
     try {
-      const config = parseTenantConfig(req.body);
-      const redis  = getRedis();
-      await redis.set(redisKey.tenantConfig(config.tenantId), config, { ex: TTL.TENANT_CONFIG });
+      const body     = req.body as Record<string, unknown>;
+      const tenantId = role === 'super_admin'
+        ? String(body.tenantId ?? req.jwtPayload!.tenantId)
+        : req.jwtPayload!.tenantId;
+      const config = parseTenantConfig({ ...body, tenantId });
+      await warmTenantConfig(config);
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -763,11 +808,14 @@ async function startServer() {
   app.get('/api/admin/my-config', requireAuth, async (req: Request, res: Response) => {
     const { tenantId, slug } = req.jwtPayload!;
     try {
-      const redis  = getRedis();
-      const cached = await redis.get<unknown>(redisKey.tenantConfig(tenantId));
-      if (cached) { res.json(cached); return; }
-    } catch {
-      // Redis unavailable — fall through to fallbacks
+      const stored = await readTenantConfig(tenantId);
+      if (stored) { res.json(stored); return; }
+    } catch (err) {
+      // A lookup failure is not the same as a missing tenant. Say so instead of
+      // falling through to the synthesised default below, which would show the
+      // admin an empty config and invite them to save over their real one.
+      console.error(`[ADMIN] config lookup failed for tenant ${tenantId}:`, err);
+      res.status(500).json({ error: 'Failed to load configuration' }); return;
     }
     // Hardcoded fallback for Savour Foods
     if (tenantId === '00000000-0000-4000-8000-000000000001') {
@@ -781,9 +829,15 @@ async function startServer() {
       });
       return;
     }
-    // Redis key expired — rebuild a minimal config from JWT claims so the admin panel
-    // still loads. The admin can re-save from the Config tab to persist properly.
-    console.warn(`[ADMIN] Config missing from Redis for tenant ${tenantId} — returning default`);
+    // No tenant_configs row at all — a tenant that never completed signup, or
+    // one whose registration predates the relational tables and has not been
+    // through scripts/backfill-platform-state.ts. Synthesise a minimal config
+    // from the JWT claims so the admin panel still loads and they can save a
+    // real one.
+    //
+    // This is now genuinely rare. It used to fire whenever the Redis key
+    // expired, which made a routine eviction look like a factory reset.
+    console.warn(`[ADMIN] No stored config for tenant ${tenantId} — returning synthesised default`);
     const restored = parseTenantConfig({
       tenantId, slug,
       restaurantName: slug,
@@ -794,11 +848,10 @@ async function startServer() {
       businessRules: { gstRate: 0, currencySymbol: '$', orderStatusMachine: ['pending','confirmed','preparing','ready','delivered'] },
       features: { deliveryOrders: false, tableNumbers: false, transcriptScreen: false, loyaltyPoints: false },
     });
-    // Write it back so subsequent requests don't have to rebuild
-    try {
-      const redis = getRedis();
-      await redis.set(redisKey.tenantConfig(tenantId), restored, { ex: TTL.TENANT_CONFIG });
-    } catch { /* non-fatal */ }
+    // Cache it so the panel is responsive, but do NOT persist: a synthesised
+    // config must never become the stored record of a tenant that simply has
+    // not been backfilled yet. Only an explicit save writes to Postgres.
+    await warmTenantConfig(restored);
     res.json(restored);
   });
 
@@ -825,20 +878,15 @@ async function startServer() {
         if (incompatible) { res.status(400).json({ error: incompatible }); return; }
       }
 
-      const redis  = getRedis();
-      await redis.set(redisKey.tenantConfig(tenantId), config, { ex: TTL.TENANT_CONFIG });
-      // Ensure this tenant is discoverable by scans (e.g. WhatsApp phoneNumberId
-      // routing), even for legacy tenants like Savour Foods that predate the
-      // signup flow and were never added to the index there. Idempotent — a
-      // no-op if already a member.
-      await redis.sadd(redisKey.tenantsIndex, tenantId).catch(() => undefined);
+      // Postgres first, then the cache — and a failure here reaches the admin as
+      // an error rather than a false "saved". writeTenantConfig also keeps the
+      // tenants row in step (slug, name and plan are edited on this same screen)
+      // and re-adds the tenant to the scan index used by WhatsApp routing.
+      await writeTenantConfig(tenantId, config, req.jwtPayload!.sub);
+
       // Invalidate stale menu cache so next request re-fetches from backend
-      await redis.del(redisKey.menuContext(tenantId)).catch(() => undefined);
-      void writeAuditLog(tenantId, 'config_save', req.jwtPayload!.sub);
-      // Dual-write the config (and keep tenants.slug/name in sync — admins
-      // editing the restaurant name in the wizard should propagate to Postgres).
-      void dualWrite('tenant_configs.upsert', tenantConfigsRepo.upsert(tenantId, config, req.jwtPayload!.sub));
-      void dualWrite('tenants.upsert',        tenantsRepo.upsert({ id: tenantId, slug: config.slug, name: config.restaurantName, plan: config.plan }));
+      await getRedis().del(redisKey.menuContext(tenantId)).catch(() => undefined);
+      await writeAuditLog(tenantId, 'config_save', req.jwtPayload!.sub);
       console.log(`[ADMIN] Config saved for tenant ${tenantId}`);
       res.json({ ok: true, kioskUrl: `/kiosk/${config.slug}` });
     } catch (err) {
@@ -863,7 +911,7 @@ async function startServer() {
     let secret = apiSecret;
     if (!key) {
       try {
-        const blob = await getRedis().get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        const blob = await readCredentialBlob(tenantId);
         if (blob) { const c = decryptCredentials(blob); key = c.apiKey; secret = secret ?? c.apiSecret; }
       } catch { /* no saved creds */ }
     }
@@ -939,7 +987,7 @@ async function startServer() {
     let secret: string | undefined;
     if (!key) {
       try {
-        const blob = await getRedis().get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        const blob = await readCredentialBlob(tenantId);
         if (blob) { const c = decryptCredentials(blob); key = c.apiKey; secret = c.apiSecret; }
       } catch { /* no saved creds — probe unauthenticated */ }
     }
@@ -973,13 +1021,12 @@ async function startServer() {
     }
 
     try {
-      const redis = getRedis();
       // Merge with existing credentials so saving POS keys doesn't wipe payment
       // keys (and vice-versa). Only fields actually sent are overwritten; an
       // empty-string field is treated as "clear", undefined as "leave as-is".
       let existing: AdapterCredentials = {};
       try {
-        const prevBlob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId));
+        const prevBlob = await readCredentialBlob(tenantId);
         if (prevBlob) existing = decryptCredentials(prevBlob);
       } catch { /* no prior creds — start fresh */ }
 
@@ -988,10 +1035,13 @@ async function startServer() {
         if (v !== undefined) merged[k] = v === '' ? undefined : v;
       }
 
+      // Postgres first, then the cache. Credentials that reached only the cache
+      // are the worst version of this bug: the tenant's integration works until
+      // the key expires, then their adapter starts failing with no visible cause
+      // and no record of what was saved.
       const blob = encryptCredentials(merged);
-      await redis.set(redisKey.credentialsKey(tenantId), blob);
-      void writeAuditLog(tenantId, 'credentials_save', req.jwtPayload!.sub);
-      void dualWrite('adapter_credentials.upsert', credentialsRepo.upsert(tenantId, blob));
+      await writeCredentials(tenantId, blob);
+      await writeAuditLog(tenantId, 'credentials_save', req.jwtPayload!.sub);
       res.json({ ok: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1006,11 +1056,10 @@ async function startServer() {
   app.get('/api/admin/credentials-status', requireAuth, async (req: Request, res: Response) => {
     const { tenantId } = req.jwtPayload!;
     try {
-      const redis = getRedis();
-      const blob  = await redis.get(redisKey.credentialsKey(tenantId));
+      const blob = await readCredentialBlob(tenantId);
       if (!blob) { res.json({ hasCredentials: false }); return; }
       // Decrypt just to get the non-secret URLs — never return the key/secret
-      const creds = decryptCredentials(blob as Parameters<typeof decryptCredentials>[0]);
+      const creds = decryptCredentials(blob);
       res.json({ hasCredentials: true, baseUrl: creds.baseUrl ?? '', webhookUrl: creds.webhookUrl ?? '' });
     } catch {
       res.json({ hasCredentials: false });
@@ -1085,14 +1134,26 @@ async function startServer() {
   // ── Super admin: list all tenants ─────────────────────────────────────────
   app.get('/api/super/tenants', requireSuperAdmin, async (_req: Request, res: Response) => {
     try {
-      const redis     = getRedis();
-      const tenantIds = (await redis.smembers(redisKey.tenantsIndex)) as string[];
-      const configs   = await Promise.all(
-        tenantIds.map(id => redis.get<unknown>(redisKey.tenantConfig(id)).catch(() => null))
-      );
-      const tenants = configs
-        .map((cfg, i) => (cfg ? { tenantId: tenantIds[i], ...(cfg as Record<string, unknown>) } : null))
-        .filter(Boolean);
+      // Enumerated from the tenants table rather than the `tenants:index` Redis
+      // set. The set only ever contained tenants some code path had remembered
+      // to add, and its members' configs dropped off the list as their cache
+      // keys expired — so the platform owner's view of who exists was a
+      // function of cache age. A row in Postgres is the definition of a tenant.
+      const rows = await tenantsRepo.list();
+      const tenants = await Promise.all(rows.map(async row => {
+        const config = await readTenantConfig(row.id).catch(() => null);
+        return {
+          tenantId: row.id,
+          ...(config as unknown as Record<string, unknown> ?? {}),
+          // Fallbacks so a tenant with no config row still renders as a row in
+          // the console instead of vanishing from it.
+          slug:           config?.slug           ?? row.slug,
+          restaurantName: config?.restaurantName ?? row.name,
+          plan:           config?.plan           ?? row.plan,
+          status:         row.status,
+          createdAt:      row.created_at,
+        };
+      }));
       res.json(tenants);
     } catch (err) {
       console.error('[SUPER] tenants list failed:', err);
@@ -1105,8 +1166,7 @@ async function startServer() {
     const { tenantId } = req.params;
     if (!UUID_RE.test(tenantId)) { res.status(400).json({ error: 'Invalid tenant ID' }); return; }
     try {
-      const redis  = getRedis();
-      const config = await redis.get<{ slug?: string }>(redisKey.tenantConfig(tenantId));
+      const config = await readTenantConfig(tenantId);
       if (!config) { res.status(404).json({ error: 'Tenant not found' }); return; }
       const impJwt = issueJwt({ sub: req.jwtPayload!.sub, tenantId, role: 'tenant_admin', slug: config.slug ?? tenantId });
       void writeAuditLog(tenantId, 'impersonate', req.jwtPayload!.sub, 'impersonated by super_admin');
@@ -1189,11 +1249,10 @@ async function startServer() {
       const redis = getRedis();
       await redis.set(redisKey.menuData(tenantId), menuData);
       // Rebuild Gemini menu context markdown and overwrite the cache
-      const configRaw = await redis.get<unknown>(redisKey.tenantConfig(tenantId)).catch(() => null);
-      if (configRaw) {
+      const config = await readTenantConfig(tenantId).catch(() => null);
+      if (config) {
         try {
-          const config = parseTenantConfig(configRaw);
-          const md     = buildMenuMarkdown(menuData, config);
+          const md = buildMenuMarkdown(menuData, config);
           await redis.set(redisKey.menuContext(tenantId), md, { ex: TTL.MENU_CONTEXT });
         } catch { /* non-fatal — cache regenerated on next request */ }
       }
@@ -1292,13 +1351,13 @@ async function startServer() {
       // Non-fatal: if the tenant already exists the upsert is a no-op; if the
       // backend is cold-starting we still attempt the menu sync below (it will
       // surface a clearer FK error if the row is truly missing).
-      const configRaw = await redis.get<{ restaurantName?: string; slug?: string; plan?: string }>(redisKey.tenantConfig(tenantId)).catch(() => null);
+      const syncConfig = await readTenantConfig(tenantId).catch(() => null);
       try {
         await ensureTenantInBackend(
           tenantId,
-          configRaw?.slug  ?? tenantId,
-          configRaw?.restaurantName ?? tenantId,
-          configRaw?.plan  ?? 'starter',
+          syncConfig?.slug           ?? tenantId,
+          syncConfig?.restaurantName ?? tenantId,
+          syncConfig?.plan           ?? 'starter',
         );
       } catch (ensureErr) {
         // Surface the real error instead of masking it behind the downstream
@@ -1504,7 +1563,11 @@ async function startServer() {
             customerName: b.customer_name, customerPhone: b.customer_phone,
           });
 
-          await savePaymentTxn(getRedis(), {
+          // Throwing here is caught below, which marks the payment failed and
+          // KEEPS the order — a committed sale must never be lost because its
+          // payment record could not be written. The customer is simply not
+          // handed a checkout URL, so no money moves against a missing record.
+          await savePaymentTxn({
             providerRef: checkout.providerRef, provider: req.paymentProvider.id,
             tenantId: cfg.tenantId, orderId, amountPaisa,
             currency: cfg.businessRules.currency,
@@ -1571,16 +1634,20 @@ async function startServer() {
         redirectUrl: redirect_url, cancelUrl: cancel_url,
       });
 
+      // Record the attempt BEFORE stamping the order. If the payment record
+      // cannot be persisted this throws and the customer never receives the
+      // checkout URL, so no money moves. Doing it the other way round left the
+      // order marked as having a payment in flight that nothing had a record of.
       const now = new Date().toISOString();
+      await savePaymentTxn({
+        providerRef: checkout.providerRef, provider: provider.id, tenantId,
+        orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
+        status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
+      });
       await ordersRepo.applyPayment(order_id, {
         paymentStatus: checkout.status,
         paymentRef:    checkout.providerRef,
         paymentMethod: provider.id,
-      });
-      await savePaymentTxn(getRedis(), {
-        providerRef: checkout.providerRef, provider: provider.id, tenantId,
-        orderId: order_id, amountPaisa, currency: req.tenantConfig!.businessRules.currency,
-        status: checkout.status, method: 'card', createdAt: now, updatedAt: now,
       });
 
       res.json({
@@ -1609,14 +1676,16 @@ async function startServer() {
     if (!refHint) { res.status(400).json({ error: 'Missing payment reference' }); return; }
 
     try {
-      const redis = getRedis();
-      const txn   = await redis.get<PaymentTransaction>(redisKey.payment(refHint));
+      // Cache, then Postgres. An expired cache entry used to make this answer
+      // "Unknown payment reference" for a payment we had genuinely taken,
+      // leaving it permanently unreconcilable against its order.
+      const txn = await loadPaymentTxn(refHint);
       if (!txn) { res.status(404).json({ error: 'Unknown payment reference' }); return; }
 
       // Rebuild this tenant's provider so verifyWebhook uses the right secret.
       let credentials: AdapterCredentials = {};
       try {
-        const blob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(txn.tenantId));
+        const blob = await readCredentialBlob(txn.tenantId);
         if (blob) credentials = decryptCredentials(blob);
       } catch { /* no creds → verification will fail safely below */ }
       const provider = PaymentProviderFactory.createById(txn.provider, credentials);
@@ -1628,11 +1697,11 @@ async function startServer() {
       }
 
       // Idempotent: re-deliveries of an already-final state are no-ops.
-      const now = new Date().toISOString();
       if (txn.status !== result.status) {
-        txn.status    = result.status;
-        txn.updatedAt = now;
-        await redis.set(redisKey.payment(refHint), txn, { ex: TTL.PAYMENT });
+        // Postgres first, and allowed to throw: a failure here answers non-2xx
+        // so the gateway redelivers, which is what we want when a status change
+        // was not recorded. The write is absolute, so redelivery converges.
+        await updatePaymentStatus(txn, result.status, result.amountPaisa);
 
         // applyPayment advances a still-pending order to 'confirmed' on capture,
         // so the kitchen sees a paid order. It returns null when the order is
@@ -1661,8 +1730,7 @@ async function startServer() {
     const providerRef = req.params.providerRef;
     if (!tenantId) { res.status(400).json({ error: 'Tenant unavailable' }); return; }
     try {
-      const redis = getRedis();
-      const txn   = await redis.get<PaymentTransaction>(redisKey.payment(providerRef));
+      let txn = await loadPaymentTxn(providerRef);
       if (!txn || txn.tenantId !== tenantId) { res.status(404).json({ error: 'Payment not found' }); return; }
 
       // If still open, ask the gateway directly and reconcile.
@@ -1670,8 +1738,7 @@ async function startServer() {
         try {
           const live = await req.paymentProvider.getStatus(providerRef);
           if (live.status !== txn.status) {
-            txn.status = live.status; txn.updatedAt = new Date().toISOString();
-            await redis.set(redisKey.payment(providerRef), txn, { ex: TTL.PAYMENT });
+            txn = await updatePaymentStatus(txn, live.status, live.amountPaisa);
           }
         } catch { /* gateway unreachable — return last-known status */ }
       }
@@ -1824,14 +1891,14 @@ async function startServer() {
       res.status(403).json({ error: 'Forbidden' }); return;
     }
     try {
-      const redis    = getRedis();
-      const emails   = (await redis.smembers(`tenant:staff:${tenantId}`)) as string[];
-      const members  = (await Promise.all(
-        emails.map(async email => {
-          const u = await redis.get<{ email: string; role: string }>(`user:email:${email}`).catch(() => null);
-          return u ? { email: u.email, role: u.role } : null;
-        })
-      )).filter(Boolean);
+      // Listed from platform_users rather than the `tenant:staff:<id>` Redis set.
+      // The set and the login records expired independently, so a manager could
+      // open this screen and find staff they had invited simply missing.
+      // Revoked accounts are filtered out — the row is kept for order
+      // attribution (see usersRepo.revokeLogin) but the person is gone.
+      const members = (await usersRepo.listByTenant(tenantId))
+        .filter(u => u.role !== 'tenant_admin' && u.password_hash !== REVOKED_PASSWORD_HASH)
+        .map(u => ({ email: u.email, role: u.role }));
       res.json(members);
     } catch (err) {
       console.error('[STAFF] list failed:', err);
@@ -1854,12 +1921,15 @@ async function startServer() {
     try {
       const redis        = getRedis();
       const emailKey     = `user:email:${email.toLowerCase()}`;
-      const existing     = await redis.get<{ tenantId: string }>(emailKey).catch(() => null);
+      // Checked against platform_users, not the cache: a stale-empty cache made
+      // this read as "not taken" and let one tenant's invite overwrite another
+      // tenant's user, since the upsert is keyed on email.
+      const existing     = await findUserByEmail(email).catch(() => null);
       if (existing && existing.tenantId !== tenantId) {
         res.status(409).json({ error: 'That email is already registered to a different account' }); return;
       }
-      const configRaw      = await redis.get<{ slug?: string }>(redisKey.tenantConfig(tenantId)).catch(() => null);
-      const slug           = configRaw?.slug ?? tenantId;
+      const inviteConfig   = await readTenantConfig(tenantId).catch(() => null);
+      const slug           = inviteConfig?.slug ?? tenantId;
       const passwordHash   = crypto.createHash('sha256').update(password).digest('hex');
 
       // Postgres FIRST, then Redis. This invite used to write Redis only, which
@@ -1895,10 +1965,14 @@ async function startServer() {
     const email = decodeURIComponent(req.params.email).toLowerCase();
     try {
       const redis = getRedis();
-      const u     = await redis.get<{ tenantId: string; role: string }>(`user:email:${email}`).catch(() => null);
+      const u     = await findUserByEmail(email).catch(() => null);
       if (!u) { res.status(404).json({ error: 'Staff member not found' }); return; }
       if (u.tenantId !== tenantId) { res.status(403).json({ error: 'Cannot remove users from another tenant' }); return; }
       if (u.role === 'tenant_admin') { res.status(400).json({ error: 'Cannot remove a tenant admin account' }); return; }
+      // Revoke in Postgres FIRST — that is what login reads. Clearing only the
+      // Redis record would leave the account fully working, because
+      // findUserByEmail falls through to platform_users.
+      await mustWrite('platform_users.revoke', usersRepo.revokeLogin(email));
       await redis.del(`user:email:${email}`);
       await redis.srem(`tenant:staff:${tenantId}`, email);
 

@@ -1,8 +1,7 @@
-import { getRedis, redisKey, TTL } from './redis.js';
+import { loadPaymentTxn, updatePaymentStatus } from './paymentStore.js';
 import { ordersRepo } from './posRepo.js';
 import { mapStatus } from '../../payments/PaddleProvider.js';
 import { fromPaddleAmount } from '../../payments/paddleCurrency.js';
-import type { PaymentTransaction } from '../../payments/IPaymentProvider.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Diner order payments made through Paddle.
@@ -16,10 +15,10 @@ import type { PaymentTransaction } from '../../payments/IPaymentProvider.js';
 //   otherwise                 → a tenant paying US for a plan     (paddleWebhook.ts)
 //
 // The order itself lives in Postgres `orders` (the single ledger every channel
-// writes to); the payment attempt stays in Redis under `payment:<ref>` as a hot
-// record. Neither goes into the Supabase billing mirror, deliberately: that
-// table feeds SaaS revenue reporting, and mixing per-order food revenue into it
-// would make MRR meaningless.
+// writes to) and the payment attempt in Postgres `payment_transactions`, cached
+// in Redis under `payment:<ref>`. Neither goes into the Supabase billing mirror,
+// deliberately: that table feeds SaaS revenue reporting, and mixing per-order
+// food revenue into it would make MRR meaningless.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface OrderPaymentResult {
@@ -71,22 +70,20 @@ export async function applyOrderPayment(
   }
 
   const status = mapStatus(String(data.status ?? ''), eventType);
-  const redis  = getRedis();
-  const now    = new Date().toISOString();
 
   // The payment record is keyed on the Paddle transaction id, which is exactly
-  // what providerRef was set to at checkout.
-  const txnKey = redisKey.payment(data.id);
-  const txn    = await redis.get<PaymentTransaction>(txnKey);
+  // what providerRef was set to at checkout. Resolved from the cache, falling
+  // back to payment_transactions — Paddle retries for up to three days, well
+  // past the point where a cache entry may have expired.
+  const txn = await loadPaymentTxn(data.id);
 
   if (txn) {
-    txn.status    = status;
-    txn.updatedAt = now;
+    let amountPaisa: number | undefined;
     if (data.details?.totals) {
       const raw = data.details.totals.grand_total ?? data.details.totals.total;
-      if (raw !== undefined) txn.amountPaisa = fromPaddleAmount(raw, data.currency_code ?? 'USD');
+      if (raw !== undefined) amountPaisa = fromPaddleAmount(raw, data.currency_code ?? 'USD');
     }
-    await redis.set(txnKey, txn, { ex: TTL.PAYMENT });
+    await updatePaymentStatus(txn, status, amountPaisa);
   } else {
     console.warn(`[BILLING] order payment ${data.id} has no stored payment txn — ` +
                  `updating order ${orderId} anyway`);

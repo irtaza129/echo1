@@ -131,13 +131,20 @@ export function getRedis(): Redis {
 
 // TTLs
 export const TTL = {
-  TENANT_CONFIG:  365 * 24 * 60 * 60, // 1 year — configs are explicitly saved; short TTL causes data loss
+  // 1 h. Postgres `tenant_configs` is the source of truth and every miss falls
+  // through to it (src/lib/platformState.ts), so this is a plain cache lifetime.
+  // It was 365 days, with a comment saying a shorter TTL "causes data loss" —
+  // true only while Redis WAS the store, and the reason a config could vanish
+  // when a key was evicted.
+  TENANT_CONFIG:  60 * 60,
   MENU_CONTEXT:   6 * 60 * 60,        // 6 h
   SESSION:        12 * 60 * 60,       // 12 h
   USAGE_HASH:     90 * 24 * 60 * 60,  // 90 days
   LOCAL_CART:     12 * 60 * 60,       // 12 h — same as session
   LOCAL_ORDER:    30 * 24 * 60 * 60,  // 30 days
-  PAYMENT:        30 * 24 * 60 * 60,  // 30 days — match order retention
+  // 30 days. Now a cache in front of public.payment_transactions rather than the
+  // only copy — expiry costs a Postgres read, not the payment record itself.
+  PAYMENT:        30 * 24 * 60 * 60,
 } as const;
 
 // Key builders — single place so key format never drifts
