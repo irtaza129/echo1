@@ -79,6 +79,37 @@ function log(...parts: unknown[]): void {
 }
 
 /**
+ * Retry an idempotent write past a transient link stall.
+ *
+ * This run copies ~50 tenants through three or four sequential Postgres calls
+ * each. The Supabase link on this project stalls intermittently — observed from
+ * two languages and two client libraries, on unrelated tables — and a stall
+ * takes 15s to surface as a timeout. Without this, a stall anywhere in ~180
+ * calls failed that tenant permanently and the run reported "do not deploy" for
+ * a reason that had nothing to do with the data. It did exactly that: five
+ * tenants failed, and four of them succeeded on a plain re-run.
+ *
+ * Only safe because every call here is an upsert. Do NOT lift this into
+ * supabaseAdmin's client: retrying a plain insert after a timeout can write the
+ * row twice, since a timeout says the answer was lost, not that the write was.
+ */
+async function withRetry<T>(label: string, op: () => Promise<T>): Promise<T> {
+  const ATTEMPTS = 3;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === ATTEMPTS) break;
+      console.warn(`    ⟳ ${label} attempt ${attempt} failed (${(err as Error).message}) — retrying`);
+      await new Promise(r => setTimeout(r, 500 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Every tenant id Redis knows about.
  *
  * The `tenants:index` set alone is not enough — membership was only ever added
@@ -146,22 +177,21 @@ async function backfillTenant(tenantId: string): Promise<void> {
   log(`  · ${tenantId}  ${config.slug}  (${config.restaurantName})`);
   attempted.add(tenantId);
 
-  if (!WRITE) {
-    stats.tenants++; stats.configs++;
-    const blob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId)).catch(() => null);
-    if (blob) stats.credentials++;
-    return;
-  }
-
   try {
-    // tenants first — tenant_configs and adapter_credentials both carry a
-    // foreign key into it.
+    // The slug check runs in BOTH modes, and that is the point of doing it here
+    // rather than inside the write block where it used to live.
     //
     // tenants.slug is UNIQUE, and Redis had no such constraint, so two tenants
     // can both hold the same slug there. Whichever the legacy `tenant:slug:<x>`
     // key points at is the one the kiosk URL actually served, so that one wins;
     // the other is reported and left for a human, because renaming somebody's
     // restaurant is not a decision a backfill gets to make.
+    //
+    // It is a pure read, so skipping it on a dry run bought nothing and cost
+    // the operator the one thing a dry run is for: a collision was reported as
+    // a clean 0 and only surfaced during the real write, halfway through a
+    // production run. A dry run that cannot see a blocking condition is worse
+    // than no dry run, because it is believed.
     const owner = await resolveSlugOwner(config.slug);
     if (owner && owner !== tenantId) {
       console.error(
@@ -173,25 +203,36 @@ async function backfillTenant(tenantId: string): Promise<void> {
     }
     slugOwner.set(config.slug, tenantId);
 
-    await tenantsRepo.upsert({
+    const blob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId)).catch(() => null);
+
+    if (!WRITE) {
+      stats.tenants++; stats.configs++;
+      if (blob) stats.credentials++;
+      return;
+    }
+
+    // tenants first — tenant_configs and adapter_credentials both carry a
+    // foreign key into it.
+    await withRetry(`tenants.upsert ${tenantId}`, () => tenantsRepo.upsert({
       id:   tenantId,
       slug: config.slug,
       name: config.restaurantName,
       plan: config.plan,
-    });
+    }));
     stats.tenants++;
 
     // 'backfill' is an opaque actor string, the same way audit_log.actor holds
     // "super" or "legacy-agent1101". Requires migration 018 — before it this
     // column was a uuid and rejected every value the app has ever passed.
-    await tenantConfigsRepo.upsert(tenantId, config, 'backfill');
+    await withRetry(`tenant_configs.upsert ${tenantId}`,
+      () => tenantConfigsRepo.upsert(tenantId, config, 'backfill'));
     stats.configs++;
 
-    const blob = await redis.get<EncryptedBlob>(redisKey.credentialsKey(tenantId)).catch(() => null);
     if (blob) {
       // Copied as ciphertext — the backfill never decrypts, so it does not need
       // CREDENTIAL_ENCRYPTION_KEY and cannot leak a plaintext credential.
-      await credentialsRepo.upsert(tenantId, blob);
+      await withRetry(`adapter_credentials.upsert ${tenantId}`,
+        () => credentialsRepo.upsert(tenantId, blob));
       stats.credentials++;
     }
   } catch (err) {
@@ -233,9 +274,16 @@ async function backfillUsers(): Promise<void> {
     // config expired, leaving a login pointing at a tenant that no longer has a
     // record anywhere. Today they can still log in; after the cutover they
     // cannot, because there is nothing for the read path to fall through to.
-    const tenantExists = WRITE
-      ? await tenantsRepo.findById(rec.tenantId).then(Boolean).catch(() => false)
-      : true;
+    //
+    // `attempted` is consulted first, and that is what makes this correct on a
+    // DRY RUN. This used to read `WRITE ? <query> : true`, which meant a dry run
+    // could not report a single orphan — it reported 0 while the real run found
+    // 9. The gate was not gratuitous: on a dry run the tenant rows have not been
+    // written, so querying alone would call every login an orphan. Checking what
+    // this run WOULD have created first answers the question in both modes,
+    // because backfillTenant has already run over every tenant by now.
+    const tenantExists = attempted.has(rec.tenantId)
+      || await tenantsRepo.findById(rec.tenantId).then(Boolean).catch(() => false);
 
     if (!tenantExists) {
       if (!RECOVER) {

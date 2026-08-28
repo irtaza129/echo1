@@ -1,12 +1,16 @@
 import crypto from 'crypto';
 import type { TenantConfig } from '../src/lib/tenantConfig.js';
-import { getRedis, redisKey, TTL } from '../src/lib/redis.js';
+import { getRedis, redisKey } from '../src/lib/redis.js';
 import {
   fetchPosMenu, ordersRepo,
   type PosMenu, type OrderRow, type OrderItemRow, type NewOrderItem,
 } from '../src/lib/posRepo.js';
 import { fuzzyMatchItem, matchModifiers, buildMenuMarkdown } from './posMatching.js';
-import { withCartLock } from '../src/lib/cartLock.js';
+import {
+  sessionCartKey, readCart, appendCartItem, removeCartItem,
+  clearCart as clearSessionCart, snapshotCart, toWireCartItems,
+  type SessionCartItem,
+} from '../src/lib/sessionCart.js';
 import { publish } from '../src/lib/posEvents.js';
 import type {
   IRestaurantAdapter,
@@ -34,17 +38,10 @@ import type {
 //     "pay", and a TTL is the correct way to clean up an abandoned kiosk
 //     session. Nothing is lost if it evaporates.
 
-export interface PosCartItem {
-  cart_item_id: string;
-  dish_id:      number;
-  name:         string;
-  category:     string;
-  summary:      string;
-  quantity:     number;
-  unit_price:   number;
-  modifiers:    { option_name: string; choice_name: string }[];
-  notes:        string | null;
-}
+// The cart itself now lives in src/lib/sessionCart.ts, because
+// ManagedBackendAdapter needs the same one. Kept as an alias so the name this
+// file has always used still resolves.
+export type PosCartItem = SessionCartItem;
 
 // Menu reads happen on every kiosk connect and every POS boot; four Postgres
 // queries each time would be wasteful and slow. Cached under a key distinct
@@ -118,24 +115,7 @@ export class PosAdapter implements IRestaurantAdapter {
   // ── Cart ───────────────────────────────────────────────────────────────────
 
   private cartKey(sessionId: string): string {
-    return redisKey.localCart(this.tenantId, sessionId);
-  }
-
-  private async readCart(sessionId: string): Promise<PosCartItem[]> {
-    try {
-      return (await getRedis().get<PosCartItem[]>(this.cartKey(sessionId))) ?? [];
-    } catch {
-      return [];
-    }
-  }
-
-  private async writeCart(sessionId: string, items: PosCartItem[]): Promise<void> {
-    try {
-      await getRedis().set(this.cartKey(sessionId), items, { ex: TTL.LOCAL_CART });
-    } catch {
-      // Non-fatal: the kiosk keeps its own copy in React state and submitOrder
-      // accepts an inline cart, so a Redis blip cannot block a sale.
-    }
+    return sessionCartKey(this.tenantId, sessionId);
   }
 
   async resolveItem(params: ResolveItemParams): Promise<ResolveItemResult> {
@@ -185,12 +165,7 @@ export class PosAdapter implements IRestaurantAdapter {
       notes:        params.notes ?? null,
     };
 
-    // Read-modify-write under the lock. A model that emits two add_item calls in
-    // one turn would otherwise have both read the same pre-state, and the second
-    // write would drop the first item.
-    await withCartLock(this.cartKey(params.sessionId), async () => {
-      await this.writeCart(params.sessionId, [...await this.readCart(params.sessionId), item]);
-    });
+    await appendCartItem(this.cartKey(params.sessionId), item);
 
     return {
       status:           'ok',
@@ -205,27 +180,15 @@ export class PosAdapter implements IRestaurantAdapter {
   }
 
   async removeItem(sessionId: string, cartItemId: string): Promise<void> {
-    await withCartLock(this.cartKey(sessionId), async () => {
-      const cart = await this.readCart(sessionId);
-      await this.writeCart(sessionId, cart.filter(i => i.cart_item_id !== cartItemId));
-    });
+    await removeCartItem(this.cartKey(sessionId), cartItemId);
   }
 
   async clearCart(sessionId: string): Promise<void> {
-    try {
-      await getRedis().del(this.cartKey(sessionId));
-    } catch { /* non-fatal */ }
+    await clearSessionCart(this.cartKey(sessionId));
   }
 
   async getCart(sessionId: string): Promise<WireCartItem[]> {
-    return (await this.readCart(sessionId)).map(i => ({
-      cart_item_id: i.cart_item_id,
-      dish_name:    i.name,
-      quantity:     i.quantity,
-      unit_price:   i.unit_price,
-      summary:      i.summary,
-      notes:        i.notes,
-    }));
+    return toWireCartItems(await readCart(this.cartKey(sessionId)));
   }
 
   // ── Orders ─────────────────────────────────────────────────────────────────
@@ -237,8 +200,7 @@ export class PosAdapter implements IRestaurantAdapter {
     //
     // Snapshot under the lock: an add_item still in flight must land before we
     // read, or the customer is charged for an order missing its last item.
-    const stored = await withCartLock(this.cartKey(params.sessionId),
-      () => this.readCart(params.sessionId));
+    const stored = await snapshotCart(this.cartKey(params.sessionId));
     const items: NewOrderItem[] = stored.length > 0
       ? stored.map(i => ({
           dishId:          i.dish_id,

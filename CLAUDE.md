@@ -50,24 +50,42 @@ Gemini Live API       ← the voice agent, on every channel
 
 `config.adapter.type` decides where a tenant's menu and orders live:
 
-| Type | Menu | Orders |
-|---|---|---|
-| `pos` | **Our own Postgres.** The native POS. | ours |
-| `managed` | The external Render/FastAPI backend. | **ours** — see below |
-| `custom_api` | The tenant's own REST API, via `endpointMappings`. |
-| `webhook` | Fire-and-forget POST to the tenant's URL. |
+| Type | Menu | Cart | Orders |
+|---|---|---|---|
+| `pos` | **Our own Postgres.** The native POS. | ours (Redis) | ours |
+| `managed` | The external Render/FastAPI backend. | **ours** (Redis) — matched upstream | **ours** — see below |
+| `custom_api` | The tenant's own REST API, via `endpointMappings`. | theirs | theirs |
+| `webhook` | Fire-and-forget POST to the tenant's URL. | theirs | theirs |
 
 Routes call `req.adapter.*` and never branch on tenant. If you find yourself
 writing `if (tenant is X)` in a route, the logic belongs in an adapter.
 
-`managed` is menu-and-cart only. Its orders are written to our own ledger by
-`ordersRepo`, not POSTed to the upstream — that upstream points at the SAME
+`managed` is **menu-and-matching only**. Its orders are written to our own ledger
+by `ordersRepo`, not POSTed to the upstream — that upstream points at the SAME
 Postgres, so the old split meant two services writing `orders` with separately
 maintained column lists. They drifted to 36 columns against the 29 either side
 believed in, the upstream never wrote `source` (so every voice order reported as
 `kiosk`) and never called the `order_number` allocator. `custom_api` and
 `webhook` still send orders outward, correctly: those tenants own their data in
 their own system and we are a client of it.
+
+Its **cart** moved here for the same reason, one step later. Resolving "a large
+pulao with two sides" is the upstream's job — its matcher sits on the menu
+hierarchy it owns — but the basket that matching fills was a module-level dict in
+that service, so a restart or a second instance returned an *empty* cart rather
+than an error, mid-call. Every adapter that keeps a basket now uses
+`src/lib/sessionCart.ts`: one store, one lock, one TTL.
+
+The upstream's `remove-item`, `clear-cart` and `GET cart` are now **404**, and
+nothing here calls them. `resolve-item` returns the whole line — `dish_id`,
+`dish_name`, `quantity`, `unit_price`, `selected_options` with option *names*,
+`notes` — which is what makes holding the basket here possible at all.
+
+`dish_name` is the gate, and it is never defaulted: a guessed dish name reaches a
+receipt and a kitchen ticket. An `ok` response without one drops the line and
+logs at **error**, because the model has already told the customer the item was
+added — the choice is a wrong receipt or a short cart, and only the short cart is
+correctable.
 
 ---
 
@@ -157,6 +175,8 @@ disagreement.
 | `src/lib/repo.ts` | Platform tables + `mustWrite`/`bestEffort`. Read the header |
 | `src/lib/platformState.ts` | Read-through cache over Postgres for config, credentials, slugs, logins |
 | `src/lib/paymentStore.ts` | Diner card payments: `payment_transactions` + its Redis hot copy |
+| `src/lib/sessionCart.ts` | The session cart — Redis, locked. Shared by `pos` and `managed` |
+| `src/lib/backendAuth.ts` | Outbound bearer tokens to the FastAPI upstream. Its own secret |
 | `src/lib/posEvents.ts` | In-process event bus behind the SSE stream |
 | `src/lib/escpos.ts` | Receipt and kitchen-ticket bytes |
 | `src/lib/PromptBuilder.ts` | System prompt per channel (`kiosk｜whatsapp｜qr｜phone`) |
@@ -193,6 +213,13 @@ npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --verify
 # Logins whose tenant config expired are reported by name, not resurrected,
 # until you opt in — most are test signups.
 npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --recover-orphans
+
+# Remove legacy Redis records pointing at tenants that no longer exist — the
+# orphan logins and duplicate configs the backfill reports but will not act on.
+# Proves each target empty in Postgres (orders/dishes/payments/logins) before
+# deleting, skips any that is not, and refuses to write without a backup file.
+npx tsx --env-file=.env scripts/prune-stale-logins.ts                       # report only
+npx tsx --env-file=.env scripts/prune-stale-logins.ts --write --backup /tmp/pruned.json
 ```
 
 ---
@@ -266,6 +293,25 @@ Honest list. None of these is secretly finished.
   route for the cutover. Delete them, and their writers, once it has held.
 - **14 pre-existing tables have RLS enabled with no policies** (`orders`, `dishes`,
   `billing_*`, `users`…). Latent only because the app uses the service-role key.
+- **`anon` still holds SELECT on 16 tables until migration 020 is applied.**
+  The upstream repo's `.env` reached a public GitHub repo; the leaked value is
+  this project's **anon** key, valid to 2036. It reads zero rows today because
+  RLS denies it — but RLS is the *only* layer on those sixteen, which include
+  `adapter_credentials` and `platform_users`. 020 revokes the role outright and
+  sets default privileges so the next `create table` cannot reopen it — but only
+  for objects created by `postgres`. **021** covers `supabase_admin`, which
+  `pg_default_acl` showed still granting `anon` `arwdDxtm` on future tables, and
+  may be refused depending on role membership. Rotate the anon key regardless:
+  hygiene, not an incident.
+- **`authenticated` has full default privileges on every future table**, from
+  both `postgres` and `supabase_admin`. Safe only while Supabase Auth signups are
+  disabled — unverified. If they are on, that role is a worse hole than `anon`
+  ever was, held off only by the 14 RLS-enabled-no-policy tables. See the foot of
+  migration 021.
+- **Migration numbers collide across repos.** The upstream numbers its
+  migrations from 001 against this same database — its `005_lock_down_business_tables`
+  and this repo's `005_pos_core` are unrelated files, and this repo has two `002`s.
+  There is no shared ledger of what has been applied. Check both trees.
 - **`platform_users.password_hash` is sha256.** Till PINs correctly use scrypt;
   account passwords still do not. This got more urgent with the reads cutover:
   that column is now what login actually verifies against, rather than a mirror
@@ -292,6 +338,8 @@ Honest list. None of these is secretly finished.
 | Tenant 404s after working fine | Never backfilled; cache expired | `scripts/backfill-platform-state.ts` |
 | Admin can't save config / creds | Postgres write refused — now surfaced, not swallowed | server log `[DB] write FAILED` |
 | Every config save 500s | Migration 018 not applied (`updated_by` still uuid) | boot log `[SCHEMA] MISMATCH` |
+| `[SCHEMA]` reports a type that looks right | PostgREST spells the format differently (`int64` for `bigint`) | `normaliseFormat` in `supabaseAdmin.ts` — add the alias, don't change the expectation |
+| Upstream menu/agent calls 401 | `BACKEND_JWT_SECRET` differs from the upstream's `JWT_SECRET` | boot log `[AUTH] BACKEND_JWT_SECRET not set` |
 | New menu items silently don't appear | Migration 019 not applied — no id default | `posMenuWrite.ts` header |
 | Phone call is silent | Trunk negotiated G.729 | `telephony/sip/README-asterisk.md` |
 | First PTT press silent | WebSocket not open before audio | dual-flag connect in `App.tsx` |

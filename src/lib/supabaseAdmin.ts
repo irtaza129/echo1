@@ -204,6 +204,30 @@ const EXPECTED_TYPES: Record<string, Record<string, string>> = {
   payment_transactions: { provider_ref: 'text', amount_paisa: 'bigint' },
 };
 
+// PostgREST does not spell every type the way Postgres does: depending on
+// version it reports a bigint as the Postgres name or as OpenAPI's `int64`.
+// Comparing the raw strings made this check report `expected bigint, found
+// int64` — a mismatch that does not exist, on a column that was correct, which
+// blocked the platform-state backfill outright.
+//
+// A schema check that cries wolf is worse than none: the next real mismatch
+// gets read as another spelling quirk. Normalise both sides to the Postgres
+// name and compare that.
+const TYPE_ALIASES: Record<string, string> = {
+  int64: 'bigint',   int8: 'bigint',
+  int32: 'int',      int4: 'int',      integer: 'int',
+  int16: 'smallint', int2: 'smallint',
+  string: 'text',    character_varying: 'text', varchar: 'text',
+  double: 'double precision', float8: 'double precision',
+  bool: 'boolean',
+};
+
+/** The Postgres spelling of a PostgREST OpenAPI `format`. */
+export function normaliseFormat(format: string): string {
+  const f = format.trim().toLowerCase();
+  return TYPE_ALIASES[f] ?? f;
+}
+
 export interface SchemaProblem {
   table:    string;
   missing:  string[];
@@ -232,7 +256,9 @@ export async function checkSchema(): Promise<SchemaProblem[]> {
       const prop = live[column] as { format?: string } | undefined;
       const got  = prop?.format;
       // An absent column is already reported as missing; don't report it twice.
-      if (got && got !== want) mistyped.push({ column, expected: want, actual: got });
+      if (got && normaliseFormat(got) !== normaliseFormat(want)) {
+        mistyped.push({ column, expected: want, actual: got });
+      }
     }
 
     if (missing.length || mistyped.length) {

@@ -8,6 +8,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { issueJwt, extractJwt, type JwtPayload } from './src/lib/jwt.js';
+import { backendHeaders } from './src/lib/backendAuth.js';
 import { encryptCredentials, decryptCredentials } from './src/lib/crypto.js';
 import { parseTenantConfig, validatePaymentConfig } from './src/lib/tenantConfig.js';
 import type { TenantConfig, AdapterCredentials } from './src/lib/tenantConfig.js';
@@ -350,6 +351,47 @@ async function ensureTenantInBackend(tenantId: string, slug: string, name: strin
   await tenantsRepo.upsert({ id: tenantId, slug, name, plan, status: 'active' });
 }
 
+// Push a menu to the upstream, retrying a stalled or failed attempt.
+//
+// The upstream's menu upsert is five sequential statements, so a timeout part
+// way through leaves categories and sub-categories written with their dishes
+// missing. That is not corrupting — the upsert is idempotent, so a retry heals
+// it — but a bare failure leaves the menu visibly half-synced, and the upstream
+// now abandons at 10s rather than 120s, which makes a transient link stall much
+// likelier to be what we hit.
+//
+// Retries only on a timeout or a 5xx. A 4xx is the upstream telling us the
+// request is wrong — most importantly 401 or 403 once auth is enforced — and
+// repeating it just delays a failure that will not change.
+async function syncMenuUpstream(
+  tenantId:   string,
+  flatDishes: unknown[],
+  timeoutMs:  number,
+): Promise<void> {
+  const ATTEMPTS = 3;
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      await axios.post(
+        `${BACKEND_URL}/api/v1/admin/menu`,
+        { dishes: flatDishes },
+        { headers: backendHeaders(tenantId, 'tenant_admin'), timeout: timeoutMs },
+      );
+      if (attempt > 1) console.log(`[MENU] upstream sync succeeded on attempt ${attempt}`);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const status    = axios.isAxiosError(err) ? err.response?.status : undefined;
+      const retryable = status === undefined || status >= 500;
+      if (!retryable || attempt === ATTEMPTS) break;
+      console.warn(`[MENU] upstream sync attempt ${attempt} failed (${status ?? 'no response'}) — retrying`);
+      await new Promise(r => setTimeout(r, 500 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
 // Helper: propagate adapter errors with the correct HTTP status
 function adapterError(res: Response, err: unknown): void {
   if (axios.isAxiosError(err)) {
@@ -367,6 +409,7 @@ async function startServer() {
   const PORT = 3000;
 
   if (!process.env.JWT_SECRET)              console.warn('[AUTH] JWT_SECRET not set — JWT auth will fail');
+  if (!process.env.BACKEND_JWT_SECRET)      console.warn('[AUTH] BACKEND_JWT_SECRET not set — upstream menu/agent calls go out unauthenticated');
   if (!process.env.SESSION_SECRET)          console.warn('[AUTH] SESSION_SECRET not set — legacy sessions lost on restart');
   if (!process.env.AUTH_PASSWORD_HASH)      console.warn('[AUTH] AUTH_PASSWORD_HASH not set — the legacy agent1101 login is DISABLED (this is the safe default)');
   if (!process.env.META_APP_SECRET)         console.warn('[WA] META_APP_SECRET not set — WhatsApp webhook verification disabled');
@@ -441,13 +484,21 @@ async function startServer() {
   app.use('/api/agent/', agentLimiter);
   app.use('/api/auth/', authLimiter);
 
-  // Warm up Render backend on startup
+  // Warm up the Render backend on startup.
+  //
+  // /api/v1/health, and only that, on the upstream's own advice. It takes no
+  // tenant dependency, so it neither needs a token nor 401s once that service
+  // enforces auth — but the reason it is the right target is what it does: it
+  // builds the Supabase client and runs a real query. Building that client is
+  // the expensive part of a Render cold start, so the previous warmup was
+  // half-useless and about to become fully so. Hitting /menu woke the container
+  // and left the client cold, and after the flip it would have woken the
+  // container with a 401 and left the client cold. Their static /health is no
+  // better. One call that warms the slow path beats two that only warm the
+  // process.
   const warmupClient = axios.create({ timeout: 15_000 });
-  warmupClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
+  warmupClient.get(`${BACKEND_URL}/api/v1/health`).catch(() =>
     console.warn('[WARMUP] Render backend cold-starting')
-  );
-  warmupClient.get(`${BACKEND_URL}/api/v1/agent/menu-context`).catch(() =>
-    console.warn('[WARMUP] menu-context cold-starting')
   );
 
   // Verify the deployed Postgres schema matches what repo.ts writes. Non-fatal
@@ -1296,11 +1347,7 @@ async function startServer() {
       let syncOk = false;
       let syncError: string | undefined;
       try {
-        await axios.post(
-          `${BACKEND_URL}/api/v1/admin/menu`,
-          { dishes: flatDishes },
-          { headers: { 'X-Tenant-ID': tenantId }, timeout: 10_000 },
-        );
+        await syncMenuUpstream(tenantId, flatDishes, 10_000);
         syncOk = true;
         console.log(`[MENU] FastAPI sync succeeded for tenant ${tenantId} (${flatDishes.length} dishes)`);
       } catch (err) {
@@ -1371,11 +1418,7 @@ async function startServer() {
         return;
       }
 
-      await axios.post(
-        `${BACKEND_URL}/api/v1/admin/menu`,
-        { dishes: flatDishes },
-        { headers: { 'X-Tenant-ID': tenantId }, timeout: 30_000 },
-      );
+      await syncMenuUpstream(tenantId, flatDishes, 30_000);
       void writeAuditLog(tenantId, 'menu_sync', req.jwtPayload!.sub, `items=${menuData.items.length}`);
       console.log(`[MENU] Manual sync succeeded for tenant ${tenantId} (${flatDishes.length} dishes)`);
       res.json({ ok: true });
