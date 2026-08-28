@@ -406,7 +406,10 @@ function adapterError(res: Response, err: unknown): void {
 // ── Server bootstrap ──────────────────────────────────────────────────────────
 async function startServer() {
   const app  = express();
-  const PORT = 3000;
+  // Render, Fly and most PaaS hosts assign a port and expect the process to
+  // bind the one in $PORT. Hardcoding 3000 works locally and relies on the
+  // host's port detection in production — which is a fallback, not a contract.
+  const PORT = Number(process.env.PORT) || 3000;
 
   if (!process.env.JWT_SECRET)              console.warn('[AUTH] JWT_SECRET not set — JWT auth will fail');
   if (!process.env.BACKEND_JWT_SECRET)      console.warn('[AUTH] BACKEND_JWT_SECRET not set — upstream menu/agent calls go out unauthenticated');
