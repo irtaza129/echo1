@@ -50,15 +50,24 @@ Gemini Live API       ← the voice agent, on every channel
 
 `config.adapter.type` decides where a tenant's menu and orders live:
 
-| Type | Menu + orders |
-|---|---|
-| `pos` | **Our own Postgres.** The native POS. |
-| `managed` | The external Render/FastAPI backend. |
+| Type | Menu | Orders |
+|---|---|---|
+| `pos` | **Our own Postgres.** The native POS. | ours |
+| `managed` | The external Render/FastAPI backend. | **ours** — see below |
 | `custom_api` | The tenant's own REST API, via `endpointMappings`. |
 | `webhook` | Fire-and-forget POST to the tenant's URL. |
 
 Routes call `req.adapter.*` and never branch on tenant. If you find yourself
 writing `if (tenant is X)` in a route, the logic belongs in an adapter.
+
+`managed` is menu-and-cart only. Its orders are written to our own ledger by
+`ordersRepo`, not POSTed to the upstream — that upstream points at the SAME
+Postgres, so the old split meant two services writing `orders` with separately
+maintained column lists. They drifted to 36 columns against the 29 either side
+believed in, the upstream never wrote `source` (so every voice order reported as
+`kiosk`) and never called the `order_number` allocator. `custom_api` and
+`webhook` still send orders outward, correctly: those tenants own their data in
+their own system and we are a client of it.
 
 ---
 

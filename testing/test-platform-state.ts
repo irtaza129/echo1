@@ -36,6 +36,13 @@ async function check(name: string, fn: () => void | Promise<void>) {
 
 const src = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
 
+// Comments in this codebase describe what the code USED to do, at length. A
+// source check that greps the raw file matches its own explanation of the bug it
+// is guarding against, so strip comments before asserting on behaviour.
+const code = (p: string) => src(p)
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
+
 // Capture console output so the logging contract can be asserted without the
 // suite's own output being polluted by the failures it deliberately provokes.
 function captureErrors<T>(fn: () => Promise<T>): Promise<{ result: T; logs: string[] }> {
@@ -246,6 +253,40 @@ await check('the sequences migration exists and covers all five tables', async (
     assert.ok(sql.includes(`'${t}'`), `migration 019 must cover ${t}`);
   }
   assert.ok(sql.includes('setval'), 'each sequence must be set past the existing max(id)');
+});
+
+// ── 6. One order ledger ──────────────────────────────────────────────────────
+
+section('every adapter writes orders to our own ledger');
+
+await check('the managed adapter does not submit orders upstream', async () => {
+  // ManagedBackendAdapter used to POST /api/v1/agent/submit-order, which made
+  // `managed` tenants' orders the one channel that bypassed the ledger. That is
+  // how orders.source reported every voice order as 'kiosk' and order_number
+  // stayed null on most rows.
+  //
+  // Scoped to this adapter deliberately. CustomApiAdapter and WebhookAdapter
+  // also send orders outward, and must keep doing so: a `custom_api` tenant owns
+  // their menu and orders in their own system and we are a client of it. The
+  // ledger rule is about OUR data — `managed` pointed at the same Postgres this
+  // app owns, which is what made it a split rather than an integration.
+  assert.ok(!/submit-order/.test(code('adapter/ManagedBackendAdapter.ts')),
+    'ManagedBackendAdapter still submits orders upstream — non-negotiable #1');
+});
+
+await check('the managed adapter writes and reads orders in the same place', async () => {
+  const body = code('adapter/ManagedBackendAdapter.ts');
+  assert.ok(body.includes('ordersRepo.create'), 'orders must be written to our ledger');
+  assert.ok(body.includes('ordersRepo.list'),
+    'reading orders upstream while writing them here shows the till an empty order book');
+});
+
+await check('the upstream cart is cleared only after the sale is committed', async () => {
+  const body   = code('adapter/ManagedBackendAdapter.ts');
+  const create = body.indexOf('ordersRepo.create');
+  const clear  = body.indexOf('this.clearCart(params.sessionId)');
+  assert.ok(create > -1 && clear > create,
+    'clearing the cart before the write loses the basket when the write fails');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
