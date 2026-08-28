@@ -10,7 +10,13 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "smoke": "tsx --env-file=.env scripts/smoke.mts"
+    "smoke": "tsx --env-file=.env scripts/smoke.mts",
+    "test": "tsx testing/test-payments.ts && tsx testing/test-discovery.ts && tsx testing/test-billing.ts && tsx testing/test-pos-phase1.ts && tsx testing/test-pos-stream.ts && tsx testing/test-pos-phase2.ts && tsx testing/test-guest-voice.ts && tsx testing/test-phone-agent.ts && tsx testing/test-telephony-audio.ts && tsx testing/test-telephony-transport.ts && tsx testing/test-escpos.ts && tsx testing/test-reports.ts && tsx --env-file=.env testing/test-guest-isolation.ts",
+    "test:live": "tsx --env-file=.env testing/test-pos-routes.ts",
+    "test:guest": "tsx --env-file=.env testing/test-guest-flow.ts",
+    "test:kds": "tsx --env-file=.env testing/test-kds.ts",
+    "test:reports": "tsx --env-file=.env testing/test-reports.ts --live",
+    "test:setup": "tsx --env-file=.env testing/test-setup-ui.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -18,6 +24,7 @@
     "@paddle/paddle-node-sdk": "^3.10.0",
     "@tailwindcss/vite": "^4.1.14",
     "@types/jsonwebtoken": "^9.0.10",
+    "@types/qrcode": "^1.5.6",
     "@upstash/redis": "^1.38.0",
     "@vitejs/plugin-react": "^5.0.4",
     "axios": "^1.15.2",
@@ -27,6 +34,7 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tsx": "^4.21.0",

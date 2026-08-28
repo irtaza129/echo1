@@ -37,7 +37,17 @@ export interface SubmitOrderParams {
   instructions?:  string | null;
   notes?:         string | null;
   cartItems?:     SubmitOrderCartItem[];
+  // Which channel rang this order in. Recorded on the order so reporting can
+  // answer whether the AI channels earn their keep — the whole point of
+  // orders.source existing. Upstream adapters ignore it; PosAdapter stores it.
+  source?:        OrderSource;
+  // Dine-in table, when the channel knows it (POS floor, QR at the table).
+  tableId?:       string | null;
 }
+
+// Closed set rather than string: `source` drives reporting breakdowns, and one
+// typo'd 'kiosc' would quietly split a column in two.
+export type OrderSource = 'pos' | 'kiosk' | 'phone' | 'whatsapp' | 'qr' | 'web';
 
 export interface OrderFilter {
   status?:  string;

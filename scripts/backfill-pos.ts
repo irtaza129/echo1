@@ -208,7 +208,8 @@ async function backfillOrders(tenantId: string): Promise<number> {
       dish_name:        i.name,
       quantity:         i.quantity,
       unit_price:       i.unit_price,
-      item_total:       Math.round(i.unit_price * i.quantity * 100) / 100,
+      // item_total omitted on purpose — it is a GENERATED ALWAYS column and
+      // Postgres rejects any insert that supplies a value for it.
       selected_options: (i.modifiers ?? []).map(m => ({ choice_name: m })),
       notes:            i.notes,
     })));

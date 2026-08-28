@@ -468,7 +468,13 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
         // Sent on every save, including partial ones, so the agent's
         // cash-or-card behaviour matches the wizard the moment it is toggled.
         payments: cfg.payments,
-        features: cfg.features,
+        // The Built-in POS preset means the Till, kitchen display and reports
+        // all run — that IS features.pos. Forcing it true only when this adapter
+        // is chosen (never forcing it false for the others) keeps the two in
+        // lock-step: a tenant can never end up with the till writing to our
+        // Postgres while voice orders are sent to a different backend, which is
+        // exactly the split-ledger bug the POS conversion exists to prevent.
+        features: cfg.adapter.type === 'pos' ? { ...cfg.features, pos: true } : cfg.features,
         setupComplete: true,
         setupStep: STEPS.length - 1,
       };
@@ -539,7 +545,13 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
         // Sent on every save, including partial ones, so the agent's
         // cash-or-card behaviour matches the wizard the moment it is toggled.
         payments: cfg.payments,
-        features: cfg.features,
+        // The Built-in POS preset means the Till, kitchen display and reports
+        // all run — that IS features.pos. Forcing it true only when this adapter
+        // is chosen (never forcing it false for the others) keeps the two in
+        // lock-step: a tenant can never end up with the till writing to our
+        // Postgres while voice orders are sent to a different backend, which is
+        // exactly the split-ledger bug the POS conversion exists to prevent.
+        features: cfg.adapter.type === 'pos' ? { ...cfg.features, pos: true } : cfg.features,
         setupComplete: false,
         setupStep: step,
       };

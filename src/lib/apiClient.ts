@@ -29,6 +29,18 @@ function decodeJwt(token: string): JwtClaims | null {
 // Exposed so callers can decide whether to skip a request when no tenant is
 // known — e.g. the kitchen dashboard shouldn't poll Savour's orders just
 // because the caller forgot to log in.
+/**
+ * The signed-in role, for deciding what to RENDER.
+ *
+ * Never a permission check: the token is decoded here without verification, so
+ * anything that actually grants access must re-derive the role server-side from
+ * the verified token. Hiding a button is a courtesy; the server is the control.
+ */
+export function getCurrentRole(): string | null {
+  const jwt = sessionStorage.getItem(JWT_KEY);
+  return jwt ? decodeJwt(jwt)?.role ?? null : null;
+}
+
 export function getCurrentTenant(): { jwt: string | null; tenantId: string | null } {
   const jwt = sessionStorage.getItem(JWT_KEY);
   if (!jwt) return { jwt: null, tenantId: null };

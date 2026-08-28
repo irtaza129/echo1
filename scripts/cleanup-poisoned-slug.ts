@@ -36,9 +36,11 @@ async function scanAll(pattern: string): Promise<string[]> {
   let cursor: string | number = 0;
   const out: string[] = [];
   do {
-    const [next, batch] = await redis.scan(cursor, { match: pattern, count: 200 });
+    // Annotated rather than inferred: `cursor` is both an argument to scan and
+    // assigned from its result, and TS cannot break that circularity on its own.
+    const [next, batch] = await redis.scan(cursor, { match: pattern, count: 200 }) as [string | number, string[]];
     cursor = next;
-    out.push(...(batch as string[]));
+    out.push(...batch);
   } while (String(cursor) !== '0');
   return out;
 }

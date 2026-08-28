@@ -148,6 +148,7 @@ export async function attachAdapter(
 
   const adapter: IRestaurantAdapter = AdapterFactory.create(config, credentials);
   req.tenantConfig = config;
+  req.adapterCredentials = credentials;
   req.adapter      = adapter;
 
   // Build the payment provider too (cash by default). Guarded: a misconfigured
