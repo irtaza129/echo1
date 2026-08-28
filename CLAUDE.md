@@ -220,6 +220,12 @@ npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --recover-orp
 # deleting, skips any that is not, and refuses to write without a backup file.
 npx tsx --env-file=.env scripts/prune-stale-logins.ts                       # report only
 npx tsx --env-file=.env scripts/prune-stale-logins.ts --write --backup /tmp/pruned.json
+
+# Why can this account not log in? /api/auth/login answers 401 for five distinct
+# causes — correct for a public endpoint, useless for an operator. This runs the
+# same checks with the answers visible. Never prints a hash or a password.
+npx tsx --env-file=.env scripts/check-login.ts --all
+npx tsx --env-file=.env scripts/check-login.ts --email someone@example.com
 ```
 
 ---
@@ -335,6 +341,8 @@ Honest list. None of these is secretly finished.
 | Orders appear late | SSE not connected | Till header badge; `routes/stream.ts` |
 | QR scan says code invalid | `channels.qr.enabled` false, or token rotated | `scripts/table-qr.ts` |
 | Guest gets 403 everywhere | Staff token being used as a guest one | `middleware/guest.ts` |
+| A valid user gets 401 on login | Five causes share that status by design | `scripts/check-login.ts --email <addr>` |
+| `agent1101` can't log in | It is a hardcoded username, not a row; off unless `AUTH_PASSWORD_HASH` is set | `server.ts:250` |
 | Tenant 404s after working fine | Never backfilled; cache expired | `scripts/backfill-platform-state.ts` |
 | Admin can't save config / creds | Postgres write refused — now surfaced, not swallowed | server log `[DB] write FAILED` |
 | Every config save 500s | Migration 018 not applied (`updated_by` still uuid) | boot log `[SCHEMA] MISMATCH` |
