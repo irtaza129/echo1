@@ -56,6 +56,13 @@ interface FullConfig {
 
 interface Props {
   jwtToken:            string;
+  /**
+   * Set only for the session that just registered. Sends the tenant straight
+   * into setup — where the plan is chosen and paid for — and marks that run as
+   * first-time so the wizard's paywall applies. An existing tenant opening the
+   * wizard to edit its settings must never hit that gate.
+   */
+  justSignedUp?:       boolean;
   onLogout:            () => void;
   onNavigateToKiosk:   () => void;
   onNavigateToDashboard: () => void;
@@ -112,12 +119,14 @@ const LANGUAGE_OPTIONS = [
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, onNavigateToDashboard }: Props) {
+export default function AdminDashboard({ jwtToken, justSignedUp = false, onLogout, onNavigateToKiosk, onNavigateToDashboard }: Props) {
   const [tab,         setTab]         = useState<Tab>('overview');
   const [config,      setConfig]      = useState<FullConfig | null>(null);
   const [draft,       setDraft]       = useState<FullConfig | null>(null);
   const [loading,     setLoading]     = useState(true);
-  const [showSetupWizard, setShowSetupWizard] = useState(false);
+  // Opens immediately for a brand-new tenant so signup flows straight into
+  // plan + payment. Everyone else reaches it from the "Continue Setup" banner.
+  const [showSetupWizard, setShowSetupWizard] = useState(justSignedUp);
   const [saving,      setSaving]      = useState(false);
   const [saveMsg,     setSaveMsg]     = useState('');
   const [testUrl,     setTestUrl]     = useState('');
@@ -551,6 +560,7 @@ export default function AdminDashboard({ jwtToken, onLogout, onNavigateToKiosk, 
         initialName={config.restaurantName}
         initialConfig={config}
         initialStep={config.setupStep ?? 0}
+        firstTimeSetup={justSignedUp}
         onComplete={handleSetupComplete}
         onExit={() => setShowSetupWizard(false)}
         onLogout={onLogout}

@@ -9,19 +9,12 @@ function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
-const PLANS = [
-  { id: 'starter',    label: 'Starter',    desc: 'Up to 50 orders/day' },
-  { id: 'growth',     label: 'Growth',     desc: 'Unlimited orders, analytics' },
-  { id: 'enterprise', label: 'Enterprise', desc: 'Multi-branch, SLA, white-label' },
-] as const;
-
 export default function SignupScreen({ onSignedUp, onBackToLogin }: Props) {
   const [email,          setEmail]          = useState('');
   const [password,       setPassword]       = useState('');
   const [restaurantName, setRestaurantName] = useState('');
   const [slug,           setSlug]           = useState('');
   const [slugTouched,    setSlugTouched]    = useState(false);
-  const [plan,           setPlan]           = useState<'starter' | 'growth' | 'enterprise'>('starter');
   const [error,          setError]          = useState('');
   const [loading,        setLoading]        = useState(false);
 
@@ -43,7 +36,10 @@ export default function SignupScreen({ onSignedUp, onBackToLogin }: Props) {
       const r = await fetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, restaurantName, slug, plan }),
+        // No plan is sent: the tier is whatever the tenant actually pays for in
+        // the wizard, written by save-config after checkout. The server defaults
+        // this to 'starter' as a placeholder, which grants no paid features.
+        body: JSON.stringify({ email, password, restaurantName, slug }),
       });
       const body = await r.json() as { jwtToken?: string; slug?: string; error?: string };
       if (!r.ok) { setError(body.error || 'Registration failed'); return; }
@@ -117,28 +113,15 @@ export default function SignupScreen({ onSignedUp, onBackToLogin }: Props) {
             </Field>
           </div>
 
-          {/* Plan */}
-          <div className="border-t border-[#5A5A40]/10 pt-1">
-            <p className="text-[10px] uppercase tracking-widest opacity-40 font-semibold mb-3">
-              Plan
+          {/* Plan selection deliberately does NOT live here.
+              It used to, with its own tier list and no checkout — so a visitor
+              picked a plan, was charged nothing, and then met a second, different
+              plan list in the setup wizard. Choosing and paying now happen once,
+              in the wizard, against the real Paddle catalogue. */}
+          <div className="border-t border-[#5A5A40]/10 pt-3">
+            <p className="text-[11px] opacity-50 leading-relaxed">
+              You'll choose your plan and set up payment next.
             </p>
-            <div className="grid grid-cols-3 gap-2">
-              {PLANS.map(p => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => setPlan(p.id)}
-                  className={`rounded-xl border px-3 py-3 text-left transition-all cursor-pointer ${
-                    plan === p.id
-                      ? 'border-[#5A5A40] bg-[#5A5A40]/8'
-                      : 'border-[#5A5A40]/15 hover:border-[#5A5A40]/30'
-                  }`}
-                >
-                  <p className="text-xs font-bold text-[#5A5A40]">{p.label}</p>
-                  <p className="text-[10px] opacity-50 mt-0.5 leading-tight">{p.desc}</p>
-                </button>
-              ))}
-            </div>
           </div>
 
           {error && (
