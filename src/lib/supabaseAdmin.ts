@@ -152,6 +152,13 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_transactions:  ['transaction_id', 'customer_id', 'subscription_id', 'tenant_id',
                           'status', 'currency_code', 'total', 'billed_at'],
   billing_webhook_events: ['event_id', 'event_type', 'occurred_at', 'processed_at'],
+  // Diner card payments (migrations/002_payments.sql + 017). Provisioned long
+  // before anything wrote to it — payments lived only in Redis on a 30-day TTL.
+  // Now that it is the durable record, drift here loses the evidence that a
+  // customer paid, so it is checked at boot like the rest.
+  payment_transactions: ['id', 'tenant_id', 'order_id', 'provider', 'provider_ref',
+                         'amount_paisa', 'currency', 'status', 'method',
+                         'created_at', 'updated_at'],
   // POS ledger (migrations 004/005/007/009). Every channel now writes orders
   // here, so drift on these tables loses sales rather than log lines — the
   // loudest possible reason to check them at boot.
@@ -180,9 +187,51 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
                  'variance', 'note', 'status'],
 };
 
+// Columns whose declared TYPE matters, not just their presence.
+//
+// Added because tenant_configs.updated_by was `uuid` while every caller passed
+// an email: the column existed, so the check above passed, and every single
+// write to that table failed for the life of the feature. Presence is not
+// enough — a column of the wrong type is a column that rejects everything.
+//
+// Types are PostgREST's OpenAPI `format` strings. Only the columns where a
+// mismatch is silent and fatal are listed; this is not a full schema mirror.
+const EXPECTED_TYPES: Record<string, Record<string, string>> = {
+  tenant_configs: { updated_by: 'text' },
+  audit_log:      { actor: 'text', details: 'text' },
+  // provider_ref is what webhooks reconcile on, and amount_paisa must be an
+  // integer type — a numeric/float here would reintroduce float money.
+  payment_transactions: { provider_ref: 'text', amount_paisa: 'bigint' },
+};
+
+// PostgREST does not spell every type the way Postgres does: depending on
+// version it reports a bigint as the Postgres name or as OpenAPI's `int64`.
+// Comparing the raw strings made this check report `expected bigint, found
+// int64` — a mismatch that does not exist, on a column that was correct, which
+// blocked the platform-state backfill outright.
+//
+// A schema check that cries wolf is worse than none: the next real mismatch
+// gets read as another spelling quirk. Normalise both sides to the Postgres
+// name and compare that.
+const TYPE_ALIASES: Record<string, string> = {
+  int64: 'bigint',   int8: 'bigint',
+  int32: 'int',      int4: 'int',      integer: 'int',
+  int16: 'smallint', int2: 'smallint',
+  string: 'text',    character_varying: 'text', varchar: 'text',
+  double: 'double precision', float8: 'double precision',
+  bool: 'boolean',
+};
+
+/** The Postgres spelling of a PostgREST OpenAPI `format`. */
+export function normaliseFormat(format: string): string {
+  const f = format.trim().toLowerCase();
+  return TYPE_ALIASES[f] ?? f;
+}
+
 export interface SchemaProblem {
-  table:   string;
-  missing: string[];
+  table:    string;
+  missing:  string[];
+  mistyped?: { column: string; expected: string; actual: string }[];
 }
 
 // Reads PostgREST's OpenAPI document (one request, no writes) and compares the
@@ -199,8 +248,22 @@ export async function checkSchema(): Promise<SchemaProblem[]> {
   for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
     const live = defs[table]?.properties;
     if (!live) { problems.push({ table, missing: ['<table not found>'] }); continue; }
+
     const missing = expected.filter(c => !(c in live));
-    if (missing.length) problems.push({ table, missing });
+
+    const mistyped: { column: string; expected: string; actual: string }[] = [];
+    for (const [column, want] of Object.entries(EXPECTED_TYPES[table] ?? {})) {
+      const prop = live[column] as { format?: string } | undefined;
+      const got  = prop?.format;
+      // An absent column is already reported as missing; don't report it twice.
+      if (got && normaliseFormat(got) !== normaliseFormat(want)) {
+        mistyped.push({ column, expected: want, actual: got });
+      }
+    }
+
+    if (missing.length || mistyped.length) {
+      problems.push({ table, missing, ...(mistyped.length ? { mistyped } : {}) });
+    }
   }
 
   return problems;

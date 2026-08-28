@@ -14,11 +14,19 @@
 // Idempotent: menu rows are matched on (tenant_id, name) and skipped if already
 // present, and orders are matched on their existing uuid.
 //
-// KNOWN LIMITATION — read before running:
-// `categories`, `sub_categories` and `dishes` have integer primary keys with NO
-// database default (FastAPI assigns them). This script therefore allocates ids
-// as max(id)+1 across the whole table, which is safe only while nothing else is
-// inserting concurrently. Run it during a quiet window, one tenant at a time.
+// REQUIRES migrations/019_menu_id_sequences.sql.
+//
+// This script used to allocate menu ids itself as max(id)+1, because
+// `categories`, `sub_categories` and `dishes` genuinely had integer primary keys
+// with no database default — which made it, accidentally, the only working id
+// allocator in either service. That is no longer true: migration 019 gives those
+// columns sequences, and this script now inserts without an id like every other
+// caller.
+//
+// It has to. Once a default exists, supplying an explicit id does NOT advance
+// the sequence, so a hand-allocated id walks the sequence toward a collision
+// with a row that already exists — and the collision would surface later, in the
+// FastAPI service, as a random insert failure with nothing pointing back here.
 
 import 'dotenv/config';
 import { getRedis, redisKey } from '../src/lib/redis.js';
@@ -27,6 +35,10 @@ import { tenantConfigsRepo } from '../src/lib/repo.js';
 import { parseTenantConfig } from '../src/lib/tenantConfig.js';
 
 const DRY_RUN  = !process.argv.includes('--write');
+
+// Placeholder id used only while dry-running, where no row is actually inserted
+// and so no real id exists to thread through the category → dish chain.
+const DRY_RUN_ID = -1;
 const ACTIVATE = process.argv.includes('--activate');
 const TENANT   = (() => {
   const i = process.argv.indexOf('--tenant');
@@ -49,11 +61,6 @@ interface LocalOrder {
   payment_method: string; notes: string | null; created_at: string; updated_at: string;
 }
 
-async function nextId(table: string): Promise<number> {
-  const rows = await db.selectMany<{ id: number }>(table, { select: 'id', order: 'id.desc', limit: '1' });
-  return (rows[0]?.id ?? 0) + 1;
-}
-
 async function backfillMenu(tenantId: string): Promise<{ categories: number; dishes: number }> {
   const menu = await getRedis().get<MenuData>(redisKey.menuData(tenantId)).catch(() => null);
   if (!menu) {
@@ -65,10 +72,6 @@ async function backfillMenu(tenantId: string): Promise<{ categories: number; dis
     tenant_id: `eq.${tenantId}`, select: 'id,name',
   });
   const catByName = new Map(existingCats.map(c => [c.name.toLowerCase(), c.id]));
-
-  let catId = await nextId('categories');
-  let subId = await nextId('sub_categories');
-  let dishId = await nextId('dishes');
 
   // Redis category id (e.g. "cat:pulao") → Postgres integer id
   const catIdMap = new Map<string, number>();
@@ -87,27 +90,32 @@ async function backfillMenu(tenantId: string): Promise<{ categories: number; dis
       if (subs[0]) { subIdMap.set(cat.id, subs[0].id); continue; }
     }
 
-    const newCatId = existing ?? catId++;
-    const newSubId = subId++;
-    catIdMap.set(cat.id, newCatId);
-    subIdMap.set(cat.id, newSubId);
-
     if (DRY_RUN) {
-      console.log(`[POS-BACKFILL]   would add category "${cat.name}" (id ${newCatId})`);
-    } else {
-      if (existing === undefined) {
-        await db.insert('categories', {
-          id: newCatId, tenant_id: tenantId, name: cat.name,
-          status: 1,
-          // Redis sortOrder is ascending; `priority` is descending. Invert so
-          // the menu keeps the order the tenant arranged.
-          priority: 1_000_000 - cat.sortOrder,
-        });
-      }
-      await db.insert('sub_categories', {
-        id: newSubId, tenant_id: tenantId, category_id: newCatId, name: cat.name, status: 1,
-      });
+      // No real ids exist yet. Map to a sentinel so the dish loop below still
+      // runs and reports, rather than skipping every dish as "unknown category".
+      catIdMap.set(cat.id, existing ?? DRY_RUN_ID);
+      subIdMap.set(cat.id, DRY_RUN_ID);
+      console.log(`[POS-BACKFILL]   would add category "${cat.name}"`);
+      categoriesWritten++;
+      continue;
     }
+
+    // insertReturning, not insert: the sequence assigns the id and the
+    // sub-category needs it for its category_id.
+    const newCatId = existing ?? (await db.insertReturning<{ id: number }>('categories', {
+      tenant_id: tenantId, name: cat.name,
+      status: 1,
+      // Redis sortOrder is ascending; `priority` is descending. Invert so
+      // the menu keeps the order the tenant arranged.
+      priority: 1_000_000 - cat.sortOrder,
+    })).id;
+
+    const newSub = await db.insertReturning<{ id: number }>('sub_categories', {
+      tenant_id: tenantId, category_id: newCatId, name: cat.name, status: 1,
+    });
+
+    catIdMap.set(cat.id, newCatId);
+    subIdMap.set(cat.id, newSub.id);
     categoriesWritten++;
   }
 
@@ -131,7 +139,6 @@ async function backfillMenu(tenantId: string): Promise<{ categories: number; dis
       console.log(`[POS-BACKFILL]   would add dish "${item.name}" @ ${item.price}`);
     } else {
       await db.insert('dishes', {
-        id:              dishId++,
         tenant_id:       tenantId,
         category_id:     cid,
         sub_category_id: sid,

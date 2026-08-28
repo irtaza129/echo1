@@ -50,15 +50,42 @@ Gemini Live API       ← the voice agent, on every channel
 
 `config.adapter.type` decides where a tenant's menu and orders live:
 
-| Type | Menu + orders |
-|---|---|
-| `pos` | **Our own Postgres.** The native POS. |
-| `managed` | The external Render/FastAPI backend. |
-| `custom_api` | The tenant's own REST API, via `endpointMappings`. |
-| `webhook` | Fire-and-forget POST to the tenant's URL. |
+| Type | Menu | Cart | Orders |
+|---|---|---|---|
+| `pos` | **Our own Postgres.** The native POS. | ours (Redis) | ours |
+| `managed` | The external Render/FastAPI backend. | **ours** (Redis) — matched upstream | **ours** — see below |
+| `custom_api` | The tenant's own REST API, via `endpointMappings`. | theirs | theirs |
+| `webhook` | Fire-and-forget POST to the tenant's URL. | theirs | theirs |
 
 Routes call `req.adapter.*` and never branch on tenant. If you find yourself
 writing `if (tenant is X)` in a route, the logic belongs in an adapter.
+
+`managed` is **menu-and-matching only**. Its orders are written to our own ledger
+by `ordersRepo`, not POSTed to the upstream — that upstream points at the SAME
+Postgres, so the old split meant two services writing `orders` with separately
+maintained column lists. They drifted to 36 columns against the 29 either side
+believed in, the upstream never wrote `source` (so every voice order reported as
+`kiosk`) and never called the `order_number` allocator. `custom_api` and
+`webhook` still send orders outward, correctly: those tenants own their data in
+their own system and we are a client of it.
+
+Its **cart** moved here for the same reason, one step later. Resolving "a large
+pulao with two sides" is the upstream's job — its matcher sits on the menu
+hierarchy it owns — but the basket that matching fills was a module-level dict in
+that service, so a restart or a second instance returned an *empty* cart rather
+than an error, mid-call. Every adapter that keeps a basket now uses
+`src/lib/sessionCart.ts`: one store, one lock, one TTL.
+
+The upstream's `remove-item`, `clear-cart` and `GET cart` are now **404**, and
+nothing here calls them. `resolve-item` returns the whole line — `dish_id`,
+`dish_name`, `quantity`, `unit_price`, `selected_options` with option *names*,
+`notes` — which is what makes holding the basket here possible at all.
+
+`dish_name` is the gate, and it is never defaulted: a guessed dish name reaches a
+receipt and a kitchen ticket. An `ok` response without one drops the line and
+logs at **error**, because the model has already told the customer the item was
+added — the choice is a wrong receipt or a short cart, and only the short cart is
+correctable.
 
 ---
 
@@ -72,40 +99,54 @@ disagreement.
    `orders.source` (`pos|kiosk|phone|whatsapp|qr|web`) is a closed set with a DB
    check constraint, because it drives channel attribution.
 
-2. **Totals are computed server-side, once.** `computeTotals()` in
+2. **Postgres is the source of truth; Redis is a cache.** That holds for tenant
+   configs, adapter credentials, logins and payment records as well as orders.
+   Reads go cache → Postgres (`src/lib/platformState.ts`, `src/lib/paymentStore.ts`);
+   writes go Postgres → cache, never the reverse. A value that exists only in
+   Redis is a bug. Every TTL is a cache lifetime, so shortening one may cost a
+   query but can never lose data — if a TTL is load-bearing, the direction has
+   been inverted somewhere.
+
+3. **A write that IS the record uses `mustWrite` and is allowed to throw.**
+   `bestEffort` is only for true side-effects (today: the audit trail), and it
+   logs unconditionally. Reporting success for a write that reached only the
+   cache is silent data loss. The fire-and-forget `dualWrite` this replaced is
+   why `audit_log` recorded nothing for the entire life of the feature.
+
+4. **Totals are computed server-side, once.** `computeTotals()` in
    `src/lib/posRepo.ts` is the only version that counts. The till prices a basket
    through `POST /api/pos/quote`, which runs that same function. Never do money
    arithmetic in a component.
 
-3. **Never patch totals incrementally.** Re-derive from live lines
+5. **Never patch totals incrementally.** Re-derive from live lines
    (`ordersRepo.recomputeTotals`). Incremental addition makes the result depend on
    the order edits happened in.
 
-4. **Never discount or void below what has been paid.** Both paths preview the
+6. **Never discount or void below what has been paid.** Both paths preview the
    result and refuse *before* writing, so a rejected action changes nothing.
 
-5. **Manager approval is a server check.** `approve()` in `routes/pos.ts`
+7. **Manager approval is a server check.** `approve()` in `routes/pos.ts`
    re-identifies the PIN and reads that operator's stored permissions, including
    `max_discount_pct`. `ManagerApproval.tsx` is a convenience, not the control.
 
-6. **Guest and staff tokens are mutually exclusive.** `requireAuth` rejects
+8. **Guest and staff tokens are mutually exclusive.** `requireAuth` rejects
    `role: 'guest'`; `requireGuest` accepts nothing else. A guest token is validly
    signed for a real tenant, so "is this token valid?" is never sufficient.
    Both directions are asserted in `testing/test-guest-isolation.ts`.
 
-7. **Guests are identified by their token, never by the request.** `tableId` and
+9. **Guests are identified by their token, never by the request.** `tableId` and
    `dineSessionId` come from the JWT. Nothing in `routes/guest.ts` reads a table
    from a body or query.
 
-8. **The real Gemini key never reaches a browser.** Kiosk and guest both get a
+10. **The real Gemini key never reaches a browser.** Kiosk and guest both get a
    60-second ephemeral token. The server-side phone bridge uses the real key
    because it *is* the server.
 
-9. **Tool calls run sequentially, never `Promise.all`.** Two `add_item` calls in
+11. **Tool calls run sequentially, never `Promise.all`.** Two `add_item` calls in
    one turn race on the same cart. `session_id` is stripped from tools on every
    channel except the kiosk — the session is the call/table/number.
 
-10. **A failed side-effect never fails a committed sale.** Audit writes, prints,
+12. **A failed side-effect never fails a committed sale.** Audit writes, prints,
     and event publishes are best-effort *after* the money moved. Returning non-2xx
     invites the client to retry the sale.
 
@@ -131,6 +172,11 @@ disagreement.
 | `src/pos/` | The till: order entry, tender, KDS, shift, bookings, reports |
 | `src/guest/` | The diner's phone app (separate Vite entry) |
 | `src/lib/posRepo.ts` | Orders, payments, shifts, tables — **money lives here** |
+| `src/lib/repo.ts` | Platform tables + `mustWrite`/`bestEffort`. Read the header |
+| `src/lib/platformState.ts` | Read-through cache over Postgres for config, credentials, slugs, logins |
+| `src/lib/paymentStore.ts` | Diner card payments: `payment_transactions` + its Redis hot copy |
+| `src/lib/sessionCart.ts` | The session cart — Redis, locked. Shared by `pos` and `managed` |
+| `src/lib/backendAuth.ts` | Outbound bearer tokens to the FastAPI upstream. Its own secret |
 | `src/lib/posEvents.ts` | In-process event bus behind the SSE stream |
 | `src/lib/escpos.ts` | Receipt and kitchen-ticket bytes |
 | `src/lib/PromptBuilder.ts` | System prompt per channel (`kiosk｜whatsapp｜qr｜phone`) |
@@ -156,6 +202,24 @@ npx tsx --env-file=.env scripts/table-qr.ts --slug <slug> --issue-all --base htt
 
 # Move a tenant's Redis menu/orders into Postgres, then switch them to the native POS
 npx tsx --env-file=.env scripts/backfill-pos.ts --tenant <uuid> --write --activate
+
+# Copy platform state (tenants, configs, credentials, logins) out of Redis into
+# Postgres. MUST have been run before the reads cutover reaches an environment:
+# reads now fall through to Postgres, so a tenant that was never persisted there
+# disappears when their cache entry expires. Dry run by default.
+# Apply migrations 017 and 018 FIRST — the script refuses to run otherwise.
+npx tsx --env-file=.env scripts/backfill-platform-state.ts                 # report only
+npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --verify
+# Logins whose tenant config expired are reported by name, not resurrected,
+# until you opt in — most are test signups.
+npx tsx --env-file=.env scripts/backfill-platform-state.ts --write --recover-orphans
+
+# Remove legacy Redis records pointing at tenants that no longer exist — the
+# orphan logins and duplicate configs the backfill reports but will not act on.
+# Proves each target empty in Postgres (orders/dishes/payments/logins) before
+# deleting, skips any that is not, and refuses to write without a backup file.
+npx tsx --env-file=.env scripts/prune-stale-logins.ts                       # report only
+npx tsx --env-file=.env scripts/prune-stale-logins.ts --write --backup /tmp/pruned.json
 ```
 
 ---
@@ -173,6 +237,11 @@ npm run test:guest   -- --slug <slug>     # QR: scan → PIN → call waiter →
 npm run test:kds     -- --tenant <uuid>   # bump → order ready → recall
 npm run test:reports -- --tenant <uuid>
 ```
+
+`testing/test-platform-state.ts` (in `npm test`) pins the Redis → Postgres
+cutover. Some of its checks read the source rather than execute it, because the
+regression it guards against — a read path quietly reverted to Redis-only — has
+no runtime symptom until a cache key expires.
 
 Tests are bare `tsx` + `node:assert`. No runner. Add new suites to `scripts.test`.
 
@@ -203,10 +272,51 @@ Honest list. None of these is secretly finished.
 - **Safepay is implemented but unwired.** `payments/SafepayProvider.ts` is complete
   and unreachable; Paddle rejects PKR, so PKR tenants are cash-only until it is wired.
 - **No inventory, no multi-branch.** `orders.branch_id` exists and is inert.
+- **Adding a menu item never worked for a native POS tenant** until migration 019.
+  `categories`, `sub_categories` and `dishes` are `int NOT NULL` with no default
+  — their ids are scraped values from the original import — so every INSERT in
+  `posMenuWrite.ts` failed. Renaming, repricing and retiring go through UPDATE
+  and were unaffected, which is why it looked like it worked. The same bug exists
+  in the FastAPI service's `POST /api/v1/admin/menu`; 019 fixes both.
+- **`public.payment_ledger` is still unwritten.** Migration 002 provisioned it as
+  the double-entry journal for settlement reconciliation;
+  `payment_transactions` is now populated but the ledger is not. Nothing reads it
+  either, so it is dormant rather than wrong.
+- **`public.tenant_configs` was empty until migration 018.** `updated_by` was
+  declared `uuid` in migration 001 while every caller passes an email, so every
+  write to that table failed and `dualWrite` swallowed it — the same shape as the
+  `audit_log` bug. `checkSchema()` now compares column types, not just presence.
+- **Two tenants can share a slug in Redis; `tenants.slug` is unique.** The
+  backfill reports the collision rather than picking a winner.
+- **Legacy Redis keys are still written but no longer read.** `user:email:<addr>`
+  and `tenant:slug:<x>` are kept in step by the write paths purely as a rollback
+  route for the cutover. Delete them, and their writers, once it has held.
 - **14 pre-existing tables have RLS enabled with no policies** (`orders`, `dishes`,
   `billing_*`, `users`…). Latent only because the app uses the service-role key.
+- **`anon` still holds SELECT on 16 tables until migration 020 is applied.**
+  The upstream repo's `.env` reached a public GitHub repo; the leaked value is
+  this project's **anon** key, valid to 2036. It reads zero rows today because
+  RLS denies it — but RLS is the *only* layer on those sixteen, which include
+  `adapter_credentials` and `platform_users`. 020 revokes the role outright and
+  sets default privileges so the next `create table` cannot reopen it — but only
+  for objects created by `postgres`. **021** covers `supabase_admin`, which
+  `pg_default_acl` showed still granting `anon` `arwdDxtm` on future tables, and
+  may be refused depending on role membership. Rotate the anon key regardless:
+  hygiene, not an incident.
+- **`authenticated` has full default privileges on every future table**, from
+  both `postgres` and `supabase_admin`. Safe only while Supabase Auth signups are
+  disabled — unverified. If they are on, that role is a worse hole than `anon`
+  ever was, held off only by the 14 RLS-enabled-no-policy tables. See the foot of
+  migration 021.
+- **Migration numbers collide across repos.** The upstream numbers its
+  migrations from 001 against this same database — its `005_lock_down_business_tables`
+  and this repo's `005_pos_core` are unrelated files, and this repo has two `002`s.
+  There is no shared ledger of what has been applied. Check both trees.
 - **`platform_users.password_hash` is sha256.** Till PINs correctly use scrypt;
-  account passwords still do not.
+  account passwords still do not. This got more urgent with the reads cutover:
+  that column is now what login actually verifies against, rather than a mirror
+  of a Redis record. Unsalted sha256 of a user-chosen password is trivially
+  reversible from a rainbow table.
 - **Legacy `agent1101` login** exists for the original kiosk. It is now disabled
   unless `AUTH_PASSWORD_HASH` is explicitly set (it used to default to a hash in
   version control).
@@ -225,6 +335,12 @@ Honest list. None of these is secretly finished.
 | Orders appear late | SSE not connected | Till header badge; `routes/stream.ts` |
 | QR scan says code invalid | `channels.qr.enabled` false, or token rotated | `scripts/table-qr.ts` |
 | Guest gets 403 everywhere | Staff token being used as a guest one | `middleware/guest.ts` |
+| Tenant 404s after working fine | Never backfilled; cache expired | `scripts/backfill-platform-state.ts` |
+| Admin can't save config / creds | Postgres write refused — now surfaced, not swallowed | server log `[DB] write FAILED` |
+| Every config save 500s | Migration 018 not applied (`updated_by` still uuid) | boot log `[SCHEMA] MISMATCH` |
+| `[SCHEMA]` reports a type that looks right | PostgREST spells the format differently (`int64` for `bigint`) | `normaliseFormat` in `supabaseAdmin.ts` — add the alias, don't change the expectation |
+| Upstream menu/agent calls 401 | `BACKEND_JWT_SECRET` differs from the upstream's `JWT_SECRET` | boot log `[AUTH] BACKEND_JWT_SECRET not set` |
+| New menu items silently don't appear | Migration 019 not applied — no id default | `posMenuWrite.ts` header |
 | Phone call is silent | Trunk negotiated G.729 | `telephony/sip/README-asterisk.md` |
 | First PTT press silent | WebSocket not open before audio | dual-flag connect in `App.tsx` |
 | Kitchen ticket shows money | Wrong builder | `buildKitchenTicket`, not `buildReceipt` |

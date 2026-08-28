@@ -66,7 +66,30 @@ export interface ResolveItemResult {
   unit_price?:       number;
   cart_item_id?:     string;
   dish_id?:          number;
-  selected_options?: { option_id: number; sub_option_id: number }[];
+  /** The quantity the upstream actually priced, which need not be the one asked for. */
+  quantity?:         number;
+  /**
+   * The resolved dish name. Present when the upstream that matched the line
+   * says what it matched, which is what lets this app hold the cart itself
+   * rather than reading it back from that upstream.
+   *
+   * PosAdapter matches locally and always knows. ManagedBackendAdapter treats
+   * its absence as "the upstream still owns this cart" — see the cart section
+   * there. It is not defaulted, because inventing a name would put a guess on
+   * a receipt.
+   */
+  dish_name?:        string;
+  /**
+   * Ids identify the choice; names are what a receipt and a kitchen ticket
+   * print. An upstream that returns only ids costs the order line its
+   * modifiers, so both are optional and both are used when given.
+   */
+  selected_options?: {
+    option_id?:     number;
+    sub_option_id?: number;
+    option_name?:   string;
+    choice_name?:   string;
+  }[];
   ai_instruction?:   string;
 }
 

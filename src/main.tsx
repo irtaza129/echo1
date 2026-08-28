@@ -54,6 +54,13 @@ function Root() {
   const [screen,      setScreen]      = useState<Screen>('loading');
   const [jwtToken,    setJwtToken]    = useState<string>('');
   const [jwtClaims,   setJwtClaims]   = useState<JwtClaims | null>(null);
+  // True only for the session that just completed signup. It is what sends a
+  // brand-new tenant straight into setup (plan + payment) instead of dropping
+  // them on the dashboard behind a banner, and it is deliberately NOT derived
+  // from `setupComplete`: every tenant onboarded before billing existed also has
+  // an incomplete setup, and they must not be pushed through a paywall to reach
+  // their own settings.
+  const [justSignedUp, setJustSignedUp] = useState(false);
   // Impersonation state — set when super admin manages a tenant in-app
   const [impJwt,      setImpJwt]      = useState('');
   const [impSlug,     setImpSlug]     = useState('');
@@ -122,11 +129,12 @@ function Root() {
     setScreen(effectiveRole === 'super_admin' ? 'super_admin' : 'kiosk');
   };
 
-  const handleSignedUp = (jwt: string, slug: string) => {
+  const handleSignedUp = (jwt: string, _slug: string) => {
     sessionStorage.setItem(JWT_KEY, jwt);
     const claims = decodeJwt(jwt);
     setJwtToken(jwt);
     setJwtClaims(claims);
+    setJustSignedUp(true);
     setScreen('admin');
   };
 
@@ -210,6 +218,7 @@ function Root() {
     return (
       <AdminDashboard
         jwtToken={jwtToken}
+        justSignedUp={justSignedUp}
         onLogout={handleLogout}
         onNavigateToKiosk={() => setScreen('kiosk')}
         onNavigateToDashboard={() => setScreen('dashboard')}

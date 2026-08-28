@@ -1,4 +1,23 @@
 -- ─────────────────────────────────────────────────────────────────────────────
+-- SUPERSEDED BY migrations/017_payment_tx_paddle.sql — DO NOT RUN THIS FILE.
+--
+-- This migration was never applied: verified against the live database, where
+-- neither payment_transactions nor payment_ledger existed. 017 creates both with
+-- the same shapes, so nothing here is lost.
+--
+-- Do not run it now to "catch up". Its `orders` section is actively harmful
+-- against this database:
+--
+--   * `create table if not exists public.orders` is a silent no-op — the FastAPI
+--     service's orders table already exists with a different shape. That no-op is
+--     exactly why payment_ref and instructions had to be added later by 009.
+--   * It then ENABLES ROW LEVEL SECURITY on that shared table and adds a policy
+--     and a trigger to it. The FastAPI service reads and writes orders and has a
+--     documented silent fallback to the anon key; under that fallback, RLS on
+--     orders takes its order flow offline.
+--
+-- Kept in the tree for provenance only.
+--
 -- Payments — durable ledger (Supabase / Postgres)
 --
 -- Runtime today persists orders + payment transactions in Redis (hot path),

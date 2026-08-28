@@ -68,6 +68,16 @@ interface Props {
   initialName:      string;
   initialConfig?:   Record<string, any>;
   initialStep?:     number;
+  /**
+   * True only when this is a brand-new tenant's first run. Gates the plan
+   * paywall.
+   *
+   * Passed in rather than inferred from `!setupComplete`, because every tenant
+   * onboarded before billing existed also has setupComplete unset — inferring
+   * it would lock all of them out of their own configuration behind a payment
+   * they were never asked for.
+   */
+  firstTimeSetup?:  boolean;
   onComplete:       () => void;
   onExit:           () => void;
   onLogout:         () => void;
@@ -100,7 +110,7 @@ const STEPS = [
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function SetupWizard({ jwtToken, initialSlug, initialName, initialConfig, initialStep = 0, onComplete, onExit, onLogout }: Props) {
+export default function SetupWizard({ jwtToken, initialSlug, initialName, initialConfig, initialStep = 0, firstTimeSetup = false, onComplete, onExit, onLogout }: Props) {
   const [step,  setStep]  = useState(initialStep);
   const [error, setError] = useState('');
   const [busy,  setBusy]  = useState(false);
@@ -136,10 +146,19 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
       country:        'US',
       ...(initialConfig?.businessRules ?? {}),
     },
-    // Cash is the correct default: a tenant that has not chosen a gateway must
-    // never have the agent offer card, or the order is created with nothing to
-    // open (see PromptBuilder acceptsCard).
-    payments: initialConfig?.payments ?? { provider: 'cash' },
+    // A stored choice always wins. With none stored, a NEW tenant defaults to
+    // card when its currency supports it — otherwise a tenant who accepts the
+    // default country never touches the dropdown, `payments` is never set, and
+    // the agent tells every customer "cash only" (see PromptBuilder acceptsCard).
+    //
+    // Scoped to first-time setup on purpose: an existing tenant has no stored
+    // `payments` either, and silently switching it to card when it opens the
+    // wizard would start charging its customers' cards without anyone asking.
+    payments: initialConfig?.payments ?? (
+      firstTimeSetup && isPaddleCurrency(initialConfig?.businessRules?.currency ?? 'USD')
+        ? { provider: 'paddle' as const }
+        : { provider: 'cash' as const }
+    ),
     features: initialConfig?.features ?? { deliveryOrders: false, tableNumbers: false, transcriptScreen: false, loyaltyPoints: false },
   });
 
@@ -251,6 +270,12 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
   const selectCountry = (code: string) => {
     const country = countryByCode(code);
     if (!country) return;
+    // Card is opt-OUT for countries where it works, not opt-in. Choosing a
+    // supported country is itself the signal that the tenant wants card orders;
+    // leaving it off by default meant the toggle sat unnoticed on a later step
+    // and the agent kept telling customers "cash only". The toggle in Rules
+    // still turns it off for tenants that genuinely want cash at the counter.
+    const eligible = isPaddleCurrency(country.currency);
     setCfg(p => ({
       ...p,
       businessRules: {
@@ -259,6 +284,7 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
         currency:       country.currency,
         currencySymbol: country.symbol,
       },
+      payments: { provider: eligible ? 'paddle' : 'cash' },
     }));
   };
 
@@ -581,14 +607,9 @@ export default function SetupWizard({ jwtToken, initialSlug, initialName, initia
   };
 
   // A tenant setting up for the FIRST time must subscribe before continuing past
-  // the plan step — that is the point at which they start paying us.
-  //
-  // Deliberately scoped to first-time setup. SetupWizard is also how an existing
-  // tenant edits its configuration (AdminDashboard "Setup" button), and every
-  // tenant onboarded before billing existed has no subscription — gating them
-  // too would lock them out of their own settings entirely.
-  const firstTimeSetup = !initialConfig?.setupComplete;
-  const paywalled      = firstTimeSetup && step === 1 && !subscribed;
+  // the plan step — that is the point at which they start paying us. See the
+  // prop's doc comment for why this is not inferred from `setupComplete`.
+  const paywalled = firstTimeSetup && step === 1 && !subscribed;
 
   const next = () => {
     if (paywalled) {

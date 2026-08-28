@@ -52,6 +52,16 @@ export interface WireCartItem {
   unit_price:   string | number;
   summary?:     string;
   notes?:       string | null;
+  /**
+   * The dishes.id this line resolved to, when the upstream that matched it says
+   * so. Optional because not every upstream returns one.
+   *
+   * It is worth threading through: order_items.dish_id is what kitchen station
+   * routing joins on (see kdsRepo), so a line without it prints on no station's
+   * board. Both services read the same `dishes` table, so an id from either is
+   * valid in our ledger.
+   */
+  dish_id?:     number | null;
 }
 
 export interface ToolCallRecord {
