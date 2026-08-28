@@ -654,7 +654,13 @@ async function startServer() {
         res.json({ token: issueLegacyToken(loginId), jwtToken, role: user.role, slug: user.slug }); return;
       }
     } catch (err) {
+      // A lookup that FAILED is not a wrong password, and answering 401 here is
+      // how an unreachable database presents to every user as "your credentials
+      // are invalid" — with nothing on screen to suggest otherwise. 503 says
+      // retryable, and says it to the client as well as the log.
       console.error('[AUTH] user lookup failed:', err);
+      res.status(503).json({ error: 'Sign-in is temporarily unavailable. Please try again.' });
+      return;
     }
 
     res.status(401).json({ error: 'Invalid credentials' });

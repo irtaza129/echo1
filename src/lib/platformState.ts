@@ -242,9 +242,18 @@ interface LegacyUserRecord {
 export async function findUserByEmail(email: string): Promise<PlatformUser | null> {
   const addr = email.toLowerCase();
 
-  const row = await usersRepo.findByEmail(addr).catch(() => null);
+  // NOT `.catch(() => null)`. selectOne returns null when the row is absent and
+  // throws when it could not ask, and those two must not collapse into one
+  // answer: the caller turns null into "invalid credentials". Swallowing the
+  // error here meant an unreachable Postgres — a missing env var on a fresh
+  // deploy, or one of the intermittent link stalls — logged every real user out
+  // with a message telling them their password was wrong.
+  //
+  // The same conflation is why emailExists could report a taken address as free
+  // and let a duplicate registration through.
+  const row = await usersRepo.findByEmail(addr);
   if (row) {
-    const tenant = await tenantsRepo.findById(row.tenant_id).catch(() => null);
+    const tenant = await tenantsRepo.findById(row.tenant_id);
     return {
       email:        row.email,
       passwordHash: row.password_hash,

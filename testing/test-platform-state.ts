@@ -351,6 +351,22 @@ await check('the schema check does not invent mismatches from spelling', async (
   assert.notEqual(normaliseFormat('numeric'), normaliseFormat('bigint'));
 });
 
+await check('a failed lookup is never reported as a wrong password', async () => {
+  // selectOne returns null when the row is absent and THROWS when it could not
+  // ask. `.catch(() => null)` collapsed those into one answer, and the login
+  // route turns null into 401 — so an unreachable Postgres told every real user
+  // their credentials were invalid, with nothing on screen to say otherwise.
+  const body = code('src/lib/platformState.ts');
+  assert.ok(/const row = await usersRepo\.findByEmail\(addr\);/.test(body),
+    'the user lookup must be allowed to throw');
+  assert.ok(!/usersRepo\.findByEmail\(addr\)\.catch/.test(body),
+    'swallowing the failure is what made an outage look like a bad password');
+
+  const server = code('server.ts');
+  assert.ok(/\[AUTH\] user lookup failed[\s\S]{0,400}?res\.status\(503\)/.test(server),
+    'a lookup failure must answer 503 (retryable), never 401');
+});
+
 section('the dry run reports what the real run will do');
 
 await check('a dry run checks slug collisions, which need no writes', async () => {
