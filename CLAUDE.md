@@ -236,6 +236,12 @@ Honest list. None of these is secretly finished.
 - **Safepay is implemented but unwired.** `payments/SafepayProvider.ts` is complete
   and unreachable; Paddle rejects PKR, so PKR tenants are cash-only until it is wired.
 - **No inventory, no multi-branch.** `orders.branch_id` exists and is inert.
+- **Adding a menu item never worked for a native POS tenant** until migration 019.
+  `categories`, `sub_categories` and `dishes` are `int NOT NULL` with no default
+  — their ids are scraped values from the original import — so every INSERT in
+  `posMenuWrite.ts` failed. Renaming, repricing and retiring go through UPDATE
+  and were unaffected, which is why it looked like it worked. The same bug exists
+  in the FastAPI service's `POST /api/v1/admin/menu`; 019 fixes both.
 - **`public.payment_ledger` is still unwritten.** Migration 002 provisioned it as
   the double-entry journal for settlement reconciliation;
   `payment_transactions` is now populated but the ledger is not. Nothing reads it
@@ -277,6 +283,7 @@ Honest list. None of these is secretly finished.
 | Tenant 404s after working fine | Never backfilled; cache expired | `scripts/backfill-platform-state.ts` |
 | Admin can't save config / creds | Postgres write refused — now surfaced, not swallowed | server log `[DB] write FAILED` |
 | Every config save 500s | Migration 018 not applied (`updated_by` still uuid) | boot log `[SCHEMA] MISMATCH` |
+| New menu items silently don't appear | Migration 019 not applied — no id default | `posMenuWrite.ts` header |
 | Phone call is silent | Trunk negotiated G.729 | `telephony/sip/README-asterisk.md` |
 | First PTT press silent | WebSocket not open before audio | dual-flag connect in `App.tsx` |
 | Kitchen ticket shows money | Wrong builder | `buildKitchenTicket`, not `buildReceipt` |

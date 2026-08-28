@@ -15,17 +15,30 @@ import { normStr, type MenuData } from './localMenuUtils.js';
 //
 // A native POS tenant must not need an external service to know what it sells.
 //
-// Ids come from the database, not from us
-// ---------------------------------------
-// `categories`, `sub_categories` and `dishes` each own an identity sequence
-// (`categories_id_seq` and friends), verified against the live database. So we
-// insert without an id and let Postgres assign one.
+// Ids come from the database, not from us — but only since migration 019
+// ----------------------------------------------------------------------
+// REQUIRES migrations/019_menu_id_sequences.sql. Without it every insert below
+// fails and adding a menu item does nothing.
 //
-// This is deliberately NOT the `max(id)+1` approach scripts/backfill-pos.ts
-// uses. That script's header asserts these tables have no default, which is not
-// true of these three, and assigning ids by hand is actively harmful: an
-// explicit id does not advance the sequence, so every hand-assigned id brings a
-// later sequence-assigned one a step closer to colliding with it.
+// This header used to claim these tables "each own an identity sequence
+// (`categories_id_seq` and friends), verified against the live database". That
+// was wrong, and it had never been verified. The live columns were
+// `int4 NOT NULL` with NO default — their ids are large scraped values from the
+// original menu import (max dishes.id = 2468438), and no sequence existed.
+//
+// So every INSERT here failed on a not-null violation, for every tenant, for the
+// whole life of this module: ADDING a menu item never worked. Renaming,
+// repricing and retiring all go through UPDATE, which was unaffected — which is
+// exactly why it looked like a working feature.
+//
+// Migration 019 creates the sequences and sets each one past max(id), so the
+// insert-without-an-id below now does what this comment always claimed. It also
+// fixes the same bug in the FastAPI service, which never assigned an id either.
+//
+// The corollary the old comment got right, for the wrong reason: once a default
+// exists, an explicit id does NOT advance the sequence, so any caller that still
+// supplies one walks the sequence toward a collision. scripts/backfill-pos.ts
+// was that caller and no longer supplies ids.
 //
 // `dishes.sub_category_id` is NOT NULL while the admin panel's menu model has no
 // sub-category concept, so each category gets one catch-all sub-category, reused

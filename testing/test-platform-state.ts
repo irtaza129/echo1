@@ -222,5 +222,31 @@ await check('paddle is an accepted provider on the durable table', async () => {
   assert.ok(sql.includes("'paddle'"), 'the provider constraint must allow paddle');
 });
 
+// ── 5. Menu ids ──────────────────────────────────────────────────────────────
+
+section('menu inserts rely on a database default that had to be created');
+
+await check('no caller hand-allocates a menu id', async () => {
+  // categories/sub_categories/dishes are int NOT NULL with no default until
+  // migration 019. Once it exists, an explicit id does NOT advance the sequence,
+  // so a hand-allocated id walks it toward a collision that surfaces in the
+  // FastAPI service, not here.
+  for (const file of ['src/lib/posMenuWrite.ts', 'scripts/backfill-pos.ts']) {
+    const body = src(file);
+    assert.ok(!/\bid:\s*(dishId|catId|subId|newCatId|newSubId)/.test(body),
+      `${file} supplies an explicit menu id — let the sequence assign it`);
+  }
+  assert.ok(!src('scripts/backfill-pos.ts').includes('async function nextId'),
+    'the max(id)+1 allocator must not come back');
+});
+
+await check('the sequences migration exists and covers all five tables', async () => {
+  const sql = src('migrations/019_menu_id_sequences.sql');
+  for (const t of ['categories', 'sub_categories', 'dishes', 'dish_options', 'dish_sub_options']) {
+    assert.ok(sql.includes(`'${t}'`), `migration 019 must cover ${t}`);
+  }
+  assert.ok(sql.includes('setval'), 'each sequence must be set past the existing max(id)');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
